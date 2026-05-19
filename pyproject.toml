@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marvel-view"
+version = "0.1.0"
+description = "3-D visualisation of volumetric segmentations using VTK / vedo"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "scikit-image>=0.19",
+    "tifffile>=2022.8",
+    "vedo>=2023.4",
+    "vtk>=9.2",
+]
+
+[project.scripts]
+marvel-preprocess       = "marvel_view.scripts.preprocess_all:main"
+marvel-view             = "marvel_view.scripts.visualize_scene:main"
+marvel-export-html      = "marvel_view.scripts.export_html:main"
+marvel-roots-preprocess = "marvel_view.scripts.roots_preprocess:main"
+marvel-roots-view       = "marvel_view.scripts.roots_visualize:main"
+marvel-aerench-preprocess = "marvel_view.scripts.aerench_preprocess:main"
+marvel-aerench-view       = "marvel_view.scripts.aerench_visualize:main"
+marvel-water-conductance  = "marvel_view.scripts.water_conductance:main"
+marvel-water-conductance-build-meshes = "marvel_view.scripts.water_conductance_build_meshes:main"
+marvel-water-movie        = "marvel_view.scripts.water_movie:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["marvel_view*"]

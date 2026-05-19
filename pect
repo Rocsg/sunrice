@@ -1,0 +1,30 @@
+Help on function decimate in module vedo.mesh.core:
+
+ddeecciimmaattee(self, fraction=0.5, n=None, preserve_volume=True, regularization=0.0) -> 'Self'
+    Downsample the number of vertices in a mesh to `fraction`.
+
+    This filter preserves the `pointdata` of the input dataset. In previous versions
+    of vedo, this decimation algorithm was referred to as quadric decimation.
+
+    Arguments:
+        fraction : (float)
+            the desired target of reduction.
+        n : (int)
+            the desired number of final points
+            (`fraction` is recalculated based on it).
+        preserve_volume : (bool)
+            Decide whether to activate volume preservation which greatly
+            reduces errors in triangle normal direction.
+        regularization : (float)
+            regularize the point finding algorithm so as to have better quality
+            mesh elements at the cost of a slightly lower precision on the
+            geometry potentially (mostly at sharp edges).
+            Can be useful for decimating meshes that have been triangulated on noisy data.
+
+    Note:
+        Setting `fraction=0.1` leaves 10% of the original number of vertices.
+        Internally the VTK class
+        [vtkQuadricDecimation](https://vtk.org/doc/nightly/html/classvtkQuadricDecimation.html)
+        is used for this operation.
+
+    See also: `decimate_binned()` and `decimate_pro()`.

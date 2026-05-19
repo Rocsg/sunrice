@@ -1,0 +1,12 @@
+numpy>=1.23
+scipy>=1.9
+scikit-image>=0.19
+tifffile>=2022.8
+vedo>=2023.4
+vtk>=9.2
+imageio-ffmpeg>=0.4
+# Google spatial-media injector — used to tag VR MP4s as stereoscopic
+# equirectangular so they auto-detect on YouTube VR / Meta Quest / DeoVR.
+# Not on PyPI; install with:
+#   pip install "git+https://github.com/google/spatial-media.git"
+spatialmedia @ git+https://github.com/google/spatial-media.git

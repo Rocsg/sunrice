@@ -216,3 +216,35 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.venv/
+venv/
+
+# Données volumiques — trop grosses pour git, synchro via rsync
+*.tif
+*.tiff
+*.npy
+*.npz
+
+# Sorties calculées — maintenant dans /home/rfernandez/Data/Arize/Hollow_test/
+# (plus dans le repo, pas besoin de les ignorer)
+# Si des sous-dossiers de sortie réapparaissent localement, les ignorer aussi :
+marvel_output/
+aerench_output/
+
+# Éditeurs
+.vscode/
+*.swp
+*~
+.DS_Store
+marvel_view_light.html
+Data/

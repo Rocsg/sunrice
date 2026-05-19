@@ -445,6 +445,7 @@ def build_water_membranes(
     output_meta:     Path | None = None,
     iso_cache_dir:   Path | None = None,
     rebuild_iso_cache: bool = False,
+    iso_only:        bool  = False,
     n_seeds:         int   = DEFAULT_N_SEEDS,
     phase_factor:    int   = DEFAULT_PHASE_FACTOR,
     level_step:      float = DEFAULT_LEVEL_STEP,
@@ -613,12 +614,6 @@ def build_water_membranes(
                 d_min, d_max, NT, Nstep)
 
     # ── 5. Per-level marching cubes → decimate → filter + vote ─────
-    # Collect surviving triangles across all levels.
-    all_verts:   list[np.ndarray] = []
-    all_faces:   list[np.ndarray] = []   # face indices into THAT level's verts
-    all_levels:  list[np.ndarray] = []   # per-triangle T index
-    all_columns: list[np.ndarray] = []   # per-triangle column id
-
     # Per-column min/max time index (for Tstart phase).
     t0_per_col    = np.full(n_columns + 1, NT, dtype=np.int32)
     tlast_per_col = np.full(n_columns + 1, -1, dtype=np.int32)
@@ -646,85 +641,32 @@ def build_water_membranes(
         iso_cache_dir.mkdir(parents=True, exist_ok=True)
 
     n_workers_actual = _resolve_n_workers(n_workers)
-    logger.info(
-        "Per-level marching cubes + filter on %d thread(s) %s …",
-        n_workers_actual,
-        "(from ISO cache — MC skipped)" if _iso_valid else "(full recompute)",
-    )
 
-    def _process_level(ti: int, lvl: float):
-        if _iso_valid:
-            # Load pre-decimated geometry from cache; re-apply the
-            # bg/column filter (which may have changed parameters).
-            verts, faces = _iso_cache_load(iso_cache_dir, ti)
-            if verts is None:
-                return ti, lvl, -1, -1, None, None, None
-            column_id, keep = _triangle_labels_and_keep(
-                verts, faces, label_vol, bg_dist, bg_min_dist,
-            )
-            if not bool(keep.any()):
-                return ti, lvl, -1, int(faces.shape[0]), None, None, None
-            return ti, lvl, -1, int(faces.shape[0]), verts, faces[keep], column_id[keep]
-
-        # Full computation.
-        verts, faces = _marching_cubes_level(geoddist, object_mask, float(lvl))
-        if verts is None:
-            return ti, lvl, 0, 0, None, None, None
-        n_raw = int(faces.shape[0])
-        verts, faces = _decimate_mesh(verts, faces, target_tris_per_level)
-        n_dec = int(faces.shape[0])
-        # Save (verts, faces) BEFORE the bg/column filter so that future
-        # runs with different bg_min_dist / n_seeds can reuse this cache.
-        _iso_cache_save(iso_cache_dir, ti, verts, faces)
-        column_id, keep = _triangle_labels_and_keep(
-            verts, faces, label_vol, bg_dist, bg_min_dist,
-        )
-        if not bool(keep.any()):
-            return ti, lvl, n_raw, n_dec, None, None, None
-        return ti, lvl, n_raw, n_dec, verts, faces[keep], column_id[keep]
-
-    # Slots indexed by ti so we can later assemble in deterministic order.
-    slot_verts:   list[np.ndarray | None] = [None] * NT
-    slot_faces:   list[np.ndarray | None] = [None] * NT
-    slot_columns: list[np.ndarray | None] = [None] * NT
-
-    n_done = 0
-    with ThreadPoolExecutor(max_workers=n_workers_actual) as ex:
-        futures = [ex.submit(_process_level, ti, float(lvl))
-                   for ti, lvl in enumerate(levels)]
-        for fut in as_completed(futures):
-            ti, lvl, n_raw, n_dec, verts, kept_faces, kept_cols = fut.result()
-            n_done += 1
-            if kept_faces is None:
-                logger.info("  [%3d/%d done] T=%3d level=%6.3f  raw=%7d  dec=%7d  keep=      0",
-                            n_done, NT, ti, lvl, n_raw, n_dec)
-                continue
-            n_keep = int(kept_faces.shape[0])
-            slot_verts[ti]   = verts
-            slot_faces[ti]   = kept_faces
-            slot_columns[ti] = kept_cols
-            unique_cols = np.unique(kept_cols)
-            unique_cols = unique_cols[unique_cols > 0]
-            if unique_cols.size:
-                t0_per_col[unique_cols]    = np.minimum(t0_per_col[unique_cols],    ti)
-                tlast_per_col[unique_cols] = np.maximum(tlast_per_col[unique_cols], ti)
-            logger.info("  [%3d/%d done] T=%3d level=%6.3f  raw=%7d  dec=%7d  keep=%7d",
-                        n_done, NT, ti, lvl, n_raw, n_dec, n_keep)
-
-    # Assemble in ti order so downstream code sees deterministic results.
-    for ti in range(NT):
-        if slot_faces[ti] is None:
-            continue
-        all_verts.append(slot_verts[ti])
-        all_faces.append(slot_faces[ti])
-        all_levels.append(np.full(slot_faces[ti].shape[0], ti, dtype=np.int32))
-        all_columns.append(slot_columns[ti])
-
-    logger.info("Marching cubes + filter done in %.1f s",
-                time.perf_counter() - t0_total)
-
-    # Persist cache metadata so the next run can validate the cache.
+    # ── Phase 1a: parallel MC + decimation → ISO cache only ─────────
+    # Workers return only stats (3 ints); no geometry accumulates in
+    # the main process.  Peak RAM ≈ n_workers × one decimated mesh (~2 MB).
     if not _iso_valid:
+        def _build_level_cache(ti: int, lvl: float):
+            verts, faces = _marching_cubes_level(geoddist, object_mask, float(lvl))
+            if verts is None:
+                return ti, 0, 0
+            n_raw = int(faces.shape[0])
+            verts, faces = _decimate_mesh(verts, faces, target_tris_per_level)
+            n_dec = int(faces.shape[0])
+            _iso_cache_save(iso_cache_dir, ti, verts, faces)
+            return ti, n_raw, n_dec  # verts/faces freed when function returns
+
+        logger.info("Building ISO cache on %d thread(s) …", n_workers_actual)
+        n_done = 0
+        with ThreadPoolExecutor(max_workers=n_workers_actual) as ex:
+            futures = [ex.submit(_build_level_cache, ti, float(lvl))
+                       for ti, lvl in enumerate(levels)]
+            for fut in as_completed(futures):
+                ti, n_raw, n_dec = fut.result()
+                n_done += 1
+                logger.info("  [%3d/%d cached] T=%3d  raw=%7d  dec=%7d",
+                            n_done, NT, ti, n_raw, n_dec)
+
         _write_cache_meta(iso_cache_dir, {
             "level_step":            float(level_step),
             "target_tris_per_level": int(target_tris_per_level),
@@ -735,7 +677,43 @@ def build_water_membranes(
         })
         logger.info("ISO cache written: %s (%d levels)", iso_cache_dir, NT)
 
-    if not all_faces:
+    logger.info("MC + decimation done in %.1f s", time.perf_counter() - t0_total)
+
+    if iso_only:
+        logger.info("iso-only mode: stopping after Phase 1a (ISO cache built).")
+        return {}
+
+    # ── Phase 1b: sequential filter pass — sizes + t0/tlast ─────────
+    # Load each NPZ once, apply the bg/column filter, record surviving
+    # triangle counts and column time-range stats.  At most one level's
+    # geometry lives in RAM at a time (~2 MB).
+    tris_per_level  = np.zeros(NT, dtype=np.int32)
+    verts_per_level = np.zeros(NT, dtype=np.int32)
+
+    for ti in range(NT):
+        verts, faces = _iso_cache_load(iso_cache_dir, ti)
+        if verts is None:
+            logger.warning("ISO cache missing for T=%d; skipped.", ti)
+            continue
+        column_id, keep = _triangle_labels_and_keep(
+            verts, faces, label_vol, bg_dist, bg_min_dist,
+        )
+        n_keep = int(keep.sum())
+        if n_keep > 0:
+            tris_per_level[ti]  = n_keep
+            verts_per_level[ti] = int(verts.shape[0])
+            kept_cols = column_id[keep]
+            unique_cols = np.unique(kept_cols)
+            unique_cols = unique_cols[unique_cols > 0]
+            if unique_cols.size:
+                t0_per_col[unique_cols]    = np.minimum(t0_per_col[unique_cols],    ti)
+                tlast_per_col[unique_cols] = np.maximum(tlast_per_col[unique_cols], ti)
+        del verts, faces, column_id, keep
+        logger.info("  [filter %3d/%d] T=%3d  keep=%7d", ti + 1, NT, ti, n_keep)
+
+    total_tris  = int(tris_per_level.sum())
+    total_verts = int(verts_per_level.sum())
+    if total_tris == 0:
         raise RuntimeError("No triangles survived filtering; check inputs.")
 
     # ── 6. Phase-bin assignment ─────────────────────────────────────
@@ -750,10 +728,9 @@ def build_water_membranes(
     # Per-column RGB lookup table (gentle hue jitter).
     rgb_lut = _per_column_rgb(n_columns, rng)
 
-    # ── 7. Merge into a single packed PolyData ──────────────────────
-    # Offset face indices by the running vertex count.
-    total_verts = sum(v.shape[0] for v in all_verts)
-    total_tris  = sum(f.shape[0] for f in all_faces)
+    # ── 7. Merge (Pass 2): pre-allocate, fill one level at a time ───
+    # Re-load each NPZ and re-apply the filter.  Only the current
+    # level's geometry (~2 MB) coexists with the growing merged_* arrays.
     logger.info("Merging packed mesh: total verts=%d  total tris=%d",
                 total_verts, total_tris)
 
@@ -764,15 +741,24 @@ def build_water_membranes(
 
     voff = 0
     foff = 0
-    for v, f, t_arr, c_arr in zip(all_verts, all_faces, all_levels, all_columns):
-        n_v = v.shape[0]
-        n_f = f.shape[0]
-        merged_verts[voff:voff + n_v] = v
+    for ti in range(NT):
+        if tris_per_level[ti] == 0:
+            continue
+        verts, faces = _iso_cache_load(iso_cache_dir, ti)
+        column_id, keep = _triangle_labels_and_keep(
+            verts, faces, label_vol, bg_dist, bg_min_dist,
+        )
+        f    = faces[keep]
+        c    = column_id[keep]
+        n_v, n_f = verts.shape[0], f.shape[0]
+        merged_verts[voff:voff + n_v] = verts
         merged_faces[foff:foff + n_f] = f + voff
-        merged_time [foff:foff + n_f] = t_arr
-        merged_col  [foff:foff + n_f] = c_arr
+        merged_time [foff:foff + n_f] = ti
+        merged_col  [foff:foff + n_f] = c
         voff += n_v
         foff += n_f
+        del verts, faces, column_id, keep, f, c
+    del tris_per_level, verts_per_level
 
     # step_id = (Tstart[c] + (T - T0[c])) % Nstep
     t0_arr_per_tri = t0_per_col[merged_col]
@@ -790,6 +776,7 @@ def build_water_membranes(
     merged_col   = merged_col  [order]
     step_id      = step_id     [order]
     rgb_per_tri  = rgb_per_tri [order]
+    del order
 
     # Build the PolyData.
     pd = _polydata_from_vf(merged_verts, merged_faces)
@@ -815,6 +802,7 @@ def build_water_membranes(
     arr_rgb.SetName("rgb")
     arr_rgb.SetNumberOfComponents(3)
     cd.AddArray(arr_rgb)
+    del merged_verts, merged_faces, merged_time, merged_col, step_id, rgb_per_tri
 
     # ── 8. Write ────────────────────────────────────────────────────
     output_vtp.parent.mkdir(parents=True, exist_ok=True)

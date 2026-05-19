@@ -145,6 +145,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--pillars-level", type=float, default=DEFAULT_PILLARS_LEVEL,
                    help="Iso-value used to extract the Pillars isosurface.")
     # Water "membranes" descending animation.
+    p.add_argument("--membranes-only", action="store_true",
+                   help="Skip every step except the membranes build "
+                        "(equivalent to passing all --skip-* flags except "
+                        "--skip-membranes).  Combine with --iso-only to run "
+                        "only Phase 1a.")
     p.add_argument("--skip-membranes", action="store_true",
                    help="Don't build the water-membranes packed mesh.")
     p.add_argument("--membranes-output",
@@ -196,6 +201,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Force-rebuild the ISO-surface cache from scratch even "
                         "if it already exists.  Implies re-running marching "
                         "cubes for every iso-level.")
+    p.add_argument("--iso-only", action="store_true",
+                   help="Run only Phase 1a (marching cubes + decimation → ISO "
+                        "cache) and exit.  Subsequent phases (filter, merge, "
+                        "VTP write) are skipped.  Useful to pre-build the "
+                        "cache on a high-RAM machine before the lighter pass.")
     p.add_argument("--membrane-workers", type=int, default=None,
                    help="Thread count for the per-level marching-cubes pass.  "
                         "Default: auto-detect (cap=4 locally, 8 on server).  "
@@ -281,6 +291,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.membranes_only:
+        args.skip_mesh       = True
+        args.skip_all_mesh   = True
+        args.skip_arrows     = True
+        args.skip_overlay    = True
+        args.skip_pillars    = True
+        args.skip_dilatation = True
+        args.skip_tracks     = True
+        args.skip_density    = True
 
     input_path = Path(args.input).expanduser().resolve()
     out_path = Path(args.output).expanduser().resolve()
@@ -584,6 +604,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_labels=membranes_labels_out,
                 iso_cache_dir=Path(args.iso_cache_dir),
                 rebuild_iso_cache=args.rebuild_iso_cache,
+                iso_only=args.iso_only,
                 n_seeds=args.n_seeds,
                 phase_factor=args.phase_factor,
                 level_step=args.level_step,

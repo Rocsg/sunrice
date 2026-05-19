@@ -202,6 +202,30 @@ def _per_column_rgb(n_columns: int, rng: np.random.Generator) -> np.ndarray:
     return out
 
 
+def _marching_cubes_on_padded(padded: np.ndarray, level: float):
+    """Run marching cubes on a pre-padded volume at ``level``.
+
+    ``padded`` is assumed to already have non-object voxels set to a
+    sentinel value > max iso-level, and to be free of NaN/inf.  This
+    helper does NO additional allocations of the input volume — it is
+    safe to call concurrently on a shared read-only ``padded`` array.
+
+    Returns ``(verts, faces)`` or ``(None, None)``.
+    """
+    from skimage.measure import marching_cubes
+
+    try:
+        verts, faces, _normals, _values = marching_cubes(
+            padded, level=float(level), step_size=1, allow_degenerate=False,
+        )
+    except (ValueError, RuntimeError) as exc:
+        logger.debug("Marching cubes failed at level %.3f: %s", level, exc)
+        return None, None
+    if verts.size == 0 or faces.size == 0:
+        return None, None
+    return verts.astype(np.float32), faces.astype(np.int64)
+
+
 def _marching_cubes_level(
     geoddist:    np.ndarray,
     object_mask: np.ndarray,
@@ -643,11 +667,45 @@ def build_water_membranes(
     n_workers_actual = _resolve_n_workers(n_workers)
 
     # ── Phase 1a: parallel MC + decimation → ISO cache only ─────────
-    # Workers return only stats (3 ints); no geometry accumulates in
-    # the main process.  Peak RAM ≈ n_workers × one decimated mesh (~2 MB).
+    # Build ONE shared padded volume up-front (read-only across all
+    # workers): non-object voxels get a sentinel > max iso-level so the
+    # surface stays inside the object.  This avoids the two per-call
+    # full-volume np.where copies that previously inflated peak RAM by
+    # ~32× (2 copies × n_workers).  Workers return only 3 ints — no
+    # geometry accumulates in the main process.
     if not _iso_valid:
+        import gc
+        try:
+            import ctypes
+            _libc = ctypes.CDLL("libc.so.6")
+            def _malloc_trim() -> None:
+                _libc.malloc_trim(0)
+        except OSError:
+            def _malloc_trim() -> None:
+                return
+
+        inside = object_mask.astype(bool)
+        if not inside.any():
+            raise RuntimeError("object_mask is empty; nothing to mesh.")
+        _fill_val = float(max(float(levels.max()),
+                              float(geoddist[inside].max())) + 10.0)
+        padded_shared = np.where(
+            inside, geoddist, np.float32(_fill_val),
+        ).astype(np.float32)
+        del inside
+        logger.info(
+            "Shared padded volume built (%.1f MB, fill=%.3f).",
+            padded_shared.nbytes / 1e6, _fill_val,
+        )
+
+        # Process biggest surfaces (lowest iso) first so the heap
+        # high-water-mark is set early instead of growing incrementally.
+        _order_idx = np.argsort(levels)  # ascending iso = biggest first
+        ordered_levels = [(int(_order_idx[k]), float(levels[_order_idx[k]]))
+                          for k in range(NT)]
+
         def _build_level_cache(ti: int, lvl: float):
-            verts, faces = _marching_cubes_level(geoddist, object_mask, float(lvl))
+            verts, faces = _marching_cubes_on_padded(padded_shared, lvl)
             if verts is None:
                 return ti, 0, 0
             n_raw = int(faces.shape[0])
@@ -656,16 +714,29 @@ def build_water_membranes(
             _iso_cache_save(iso_cache_dir, ti, verts, faces)
             return ti, n_raw, n_dec  # verts/faces freed when function returns
 
-        logger.info("Building ISO cache on %d thread(s) …", n_workers_actual)
+        logger.info(
+            "Building ISO cache on %d thread(s) (batched, biggest first) …",
+            n_workers_actual,
+        )
         n_done = 0
+        BATCH = n_workers_actual
         with ThreadPoolExecutor(max_workers=n_workers_actual) as ex:
-            futures = [ex.submit(_build_level_cache, ti, float(lvl))
-                       for ti, lvl in enumerate(levels)]
-            for fut in as_completed(futures):
-                ti, n_raw, n_dec = fut.result()
-                n_done += 1
-                logger.info("  [%3d/%d cached] T=%3d  raw=%7d  dec=%7d",
-                            n_done, NT, ti, n_raw, n_dec)
+            for batch_start in range(0, NT, BATCH):
+                batch = ordered_levels[batch_start:batch_start + BATCH]
+                futures = [ex.submit(_build_level_cache, ti, lvl)
+                           for ti, lvl in batch]
+                for fut in as_completed(futures):
+                    ti, n_raw, n_dec = fut.result()
+                    n_done += 1
+                    logger.info("  [%3d/%d cached] T=%3d  raw=%7d  dec=%7d",
+                                n_done, NT, ti, n_raw, n_dec)
+                futures.clear()
+                gc.collect()
+                _malloc_trim()
+
+        del padded_shared
+        gc.collect()
+        _malloc_trim()
 
         _write_cache_meta(iso_cache_dir, {
             "level_step":            float(level_step),

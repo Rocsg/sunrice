@@ -3,8 +3,11 @@
 Visualisation 3-D de segmentations volumétriques (TIFF multi-pages) à partir de
 maillages de surface générés par marching cubes.  
 Stack : **tifffile · scikit-image · scipy · VTK · vedo**.
-
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia 
 ---
+
+
+export MARVEL_DATA_DIR="/home/rfernandez/Data/Arize/Hollow_test"
 
 ##  Quick-start — film VR360 (Meta Quest 3 Pro / YouTube VR)
 
@@ -18,13 +21,14 @@ marvel-water-conductance-build-meshes     # → ./marvel_output/water_conductanc
 
 # 1. Ouvrir le viewer (chargera les caches si présents), naviguer,
 #    cliquer plusieurs fois sur "Save pos"
-marvel-water-conductance        # → écrit ./positions/positions_<stamp>.json
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia marvel-water-conductance
+# → écrit ./positions/positions_<stamp>.json
 
 # 2. Rendre le film VR360 stéréo SBS, taggé Spherical-Video-V2
 #    Toutes les options haute qualité sont DÉJÀ les valeurs par défaut :
 #      résolution 8192×2048 SBS, h265 (HEVC) CRF 20 preset slow,
 #      cubemap 2048 px/face, IPD 5 %, metadata VR injectée.
-marvel-water-movie --vr vr360   # → ./mp4/positions_<stamp>_vr360.mp4
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia marvel-water-movie --vr vr360   # → ./mp4/positions_<stamp>_vr360.mp4
 ```
 
 Debug : burner l'index de keyframe (flottant, relatif aux clicks « Save

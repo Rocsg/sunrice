@@ -4687,19 +4687,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning("Could not load density scalar caches: %s", exc)
         density_scalars = None
 
-    # ── Water "membranes" descending animation (load-only) ─────────────
+    # ── Water "membranes" V1 removed (no longer loaded) ─────────────────
     membranes_data = None
-    if not args.no_membranes:
-        try:
-            membranes_data = _load_or_build_membranes(
-                Path(args.membranes_vtp_cache).expanduser().resolve(),
-                Path(args.membranes_meta_cache).expanduser().resolve(),
-            )
-            if membranes_data == (None, None):
-                membranes_data = None
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not load membranes cache: %s", exc)
-            membranes_data = None
 
     # ── Water "lames" (V2) descending animation (load-only) ─────────────
     lames_data = None

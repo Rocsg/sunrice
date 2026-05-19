@@ -281,6 +281,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="RNG seed for the lames build.")
     p.add_argument("--lames-workers", type=int, default=None,
                    help="Thread count for the per-label shell extraction.")
+    p.add_argument("--lames-debug", action="store_true",
+                   help="Debug mode: pick --lames-debug-n-cols random columns, "
+                        "write binary shell-mask TIFFs and a distance-map TIF "
+                        "to <lames-output-dir>/debug/. Does NOT build the full "
+                        "lames VTP.")
+    p.add_argument("--lames-debug-n-cols", type=int, default=3,
+                   help="Number of random columns to inspect in --lames-debug "
+                        "mode (default: 3).")
     p.add_argument("--geoddist", default=str(DEFAULT_GEODDIST_PATH),
                    help="Path to the geodesic distance-to-exterior TIFF "
                         "used to compute the arrow field.")
@@ -739,6 +747,8 @@ def main(argv: list[str] | None = None) -> int:
                 kmeans_iters=args.lames_kmeans_iters,
                 seed=args.lames_seed,
                 n_workers=args.lames_workers,
+                debug_only=args.lames_debug,
+                debug_n_cols=args.lames_debug_n_cols,
             )
     else:
         logger.info("Skipping lames build (--skip-lames).")

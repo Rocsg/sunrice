@@ -97,8 +97,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_N_SEEDS:               int   = 1000
 DEFAULT_PHASE_FACTOR:          int   = 5
 DEFAULT_N_LEVELS_MAX:          int   = 300
-DEFAULT_LAME_WIDTH:            float = 1.0
-DEFAULT_TARGET_TRIS_PER_SHELL: int   = 100
+DEFAULT_LAME_WIDTH:            float = 1.5
+DEFAULT_TARGET_TRIS_PER_SHELL: int   = 200
 DEFAULT_SMOOTH_ITER:           int   = 5
 DEFAULT_FADE_FRAMES:           int   = 5
 DEFAULT_KMEANS_ITERS:          int   = 50
@@ -470,6 +470,81 @@ def _glow_curve(s_local: np.ndarray, lifetime: int, fade: int) -> np.ndarray:
     return np.maximum(onset, offset)
 
 
+# ── Debug helper: per-column diagnostic TIFFs ────────────────────────────
+
+
+def _debug_lames(
+    *,
+    geoddist:      "np.ndarray",
+    label_vol:     "np.ndarray",
+    active_labels: list,
+    levels:        "np.ndarray",
+    alpha:         "np.ndarray",
+    lame_width:    float,
+    output_dir:    "Path",
+    n_debug:       int = 3,
+    rng:           "np.random.Generator",
+) -> None:
+    """Generate diagnostic TIFFs for *n_debug* random columns.
+
+    For each selected column:
+    * ``imagedistanceColonne<N>.tif`` – cropped distance map (0-255 uint8),
+      only voxels belonging to that column; others set to 0.
+    * ``colonne<N>/step_NNNN.tif``   – binary shell mask at each iso-level
+      (0 or 255 uint8), only non-empty steps are written.
+    """
+    import tifffile
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    n = min(int(n_debug), len(active_labels))
+    if n == 0:
+        logger.warning("Debug: no active labels — nothing to generate.")
+        return
+
+    chosen_idx = rng.choice(len(active_labels), size=n, replace=False)
+    selected   = [active_labels[int(i)] for i in chosen_idx]
+    NT         = int(levels.size)
+
+    for col_num, (label, bbox) in enumerate(selected, start=1):
+        pad = 1
+        z0 = max(0, bbox[0].start - pad); z1 = min(geoddist.shape[0], bbox[0].stop + pad)
+        y0 = max(0, bbox[1].start - pad); y1 = min(geoddist.shape[1], bbox[1].stop + pad)
+        x0 = max(0, bbox[2].start - pad); x1 = min(geoddist.shape[2], bbox[2].stop + pad)
+        D_sub = geoddist [z0:z1, y0:y1, x0:x1]
+        L_sub = label_vol[z0:z1, y0:y1, x0:x1]
+
+        # ── distance map ──────────────────────────────────────────
+        d_col = np.where(L_sub == label, D_sub, 0.0).astype(np.float32)
+        d_max = float(d_col.max())
+        d_u8  = (d_col / d_max * 255).clip(0, 255).astype(np.uint8) \
+                if d_max > 0 else np.zeros_like(d_col, dtype=np.uint8)
+        dist_path = output_dir / f"imagedistanceColonne{col_num}.tif"
+        tifffile.imwrite(str(dist_path), d_u8)
+        logger.info("debug colonne%d (L=%d): dist map %s → %s",
+                    col_num, label, d_u8.shape, dist_path)
+
+        # ── per-step binary masks ─────────────────────────────────
+        col_dir = output_dir / f"colonne{col_num}"
+        col_dir.mkdir(parents=True, exist_ok=True)
+        n_saved = 0
+        for ti in range(NT):
+            d   = float(levels[ti])
+            a_m = float(alpha[max(0, ti - 1)])
+            a_p = float(alpha[min(NT - 1, ti + 1)])
+            lo  = max(0.1, d - lame_width / max(1e-3, a_m))
+            hi  = max(lo + 0.1, d + lame_width / max(1e-3, a_p))
+            F   = (D_sub - lo) * (hi - D_sub)
+            mask = ((F > 0) & (L_sub == label)).astype(np.uint8) * 255
+            if mask.max() == 0:
+                continue
+            tifffile.imwrite(str(col_dir / f"step_{ti:04d}.tif"), mask)
+            n_saved += 1
+        logger.info("debug colonne%d (L=%d): %d step TIFFs → %s",
+                    col_num, label, n_saved, col_dir)
+
+
 # ── Per-label worker (a level loop, sequential within one label) ─────────
 
 
@@ -498,6 +573,17 @@ def _process_label(
     D_sub  = geoddist [z0:z1, y0:y1, x0:x1]
     L_sub  = label_vol[z0:z1, y0:y1, x0:x1]
 
+    # ── column-local distance range ───────────────────────────────────
+    d_col_vals = D_sub[L_sub == label]
+    d_col_vals = d_col_vals[(d_col_vals > 0) & np.isfinite(d_col_vals)]
+    if d_col_vals.size == 0:
+        return int(label), int(NT), -1, 0, 0.0, 0.0, 0
+    d_col_min = float(d_col_vals.min())
+    d_col_max = float(d_col_vals.max())
+    ti_lo = d_col_min + lame_width   # skip levels below this
+    ti_hi = d_col_max - lame_width   # skip levels above this
+    n_active_steps = int(np.sum((levels >= ti_lo) & (levels <= ti_hi)))
+
     NT = int(levels.size)
     t0 = NT
     tlast = -1
@@ -505,6 +591,8 @@ def _process_label(
 
     for ti in range(NT):
         d = float(levels[ti])
+        if d < ti_lo or d > ti_hi:
+            continue
         a_minus = float(alpha[max(0, ti - 1)])
         a_plus  = float(alpha[min(NT - 1, ti + 1)])
         lo = max(0.1, d - float(lame_width) / max(1e-3, a_minus))
@@ -525,7 +613,7 @@ def _process_label(
         if ti > tlast: tlast = ti
         n_geo += 1
 
-    return int(label), int(t0), int(tlast), int(n_geo)
+    return int(label), int(t0), int(tlast), int(n_geo), d_col_min, d_col_max, n_active_steps
 
 
 # ── Main entry point ─────────────────────────────────────────────────────
@@ -543,6 +631,8 @@ def build_water_lames(
     iso_cache_dir:   Path | None = None,
     rebuild_iso_cache: bool = False,
     iso_only:        bool  = False,
+    debug_only:      bool  = False,
+    debug_n_cols:    int   = 3,
     n_seeds:         int   = DEFAULT_N_SEEDS,
     phase_factor:    int   = DEFAULT_PHASE_FACTOR,
     n_levels_max:    int   = DEFAULT_N_LEVELS_MAX,
@@ -652,6 +742,21 @@ def build_water_lames(
     # ── 6. Thickening factor ────────────────────────────────────────
     alpha = _thickening_factor(geoddist, object_mask, levels, level_step)
 
+    # ── debug-only: generate diagnostic TIFFs and exit early ────────
+    if debug_only:
+        _debug_lames(
+            geoddist=geoddist,
+            label_vol=label_vol,
+            active_labels=active_labels,
+            levels=levels,
+            alpha=alpha,
+            lame_width=lame_width,
+            output_dir=Path(output_vtp).parent / "debug",
+            n_debug=debug_n_cols,
+            rng=rng,
+        )
+        return {}
+
     # ── 7. ISO cache validity check ─────────────────────────────────
     _iso_valid = (
         not rebuild_iso_cache
@@ -725,14 +830,14 @@ def build_water_lames(
                     for lb, bb in batch
                 ]
                 for fut in as_completed(futures):
-                    lb, lt0, ltl, ngeo = fut.result()
+                    lb, lt0, ltl, ngeo, dmin, dmax, nsteps = fut.result()
                     n_done += 1
                     if ngeo > 0:
                         t0_per_col[lb]    = lt0
                         tlast_per_col[lb] = ltl
                     logger.info(
-                        "  [%4d/%d] L=%4d  t0=%3d tlast=%3d  shells=%3d",
-                        n_done, len(active_labels), lb, lt0, ltl, ngeo,
+                        "  [%4d/%d] L=%4d  d=[%.2f, %.2f]  active=%3d  shells=%3d",
+                        n_done, len(active_labels), lb, dmin, dmax, nsteps, ngeo,
                     )
                 futures.clear()
                 gc.collect()

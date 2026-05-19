@@ -359,7 +359,7 @@ def _resolve_n_workers(requested: int | None) -> int:
     """Return the thread-pool size for the marching-cubes pass.
 
     Priority: explicit ``requested`` > ``MARVEL_MAX_WORKERS`` env var >
-    auto-detect (capped at 8 on server, 4 locally).
+    auto-detect (cpu_count // 2).
     """
     if requested is not None:
         return max(1, int(requested))
@@ -370,15 +370,7 @@ def _resolve_n_workers(requested: int | None) -> int:
         except ValueError:
             pass
     cpus = os.cpu_count() or 4
-    on_server = _SERVER_MARKER.exists()
-    cap = 8 if on_server else 4
-    n = min(max(1, cpus - 1), cap)
-    if on_server:
-        logger.info(
-            "Server detected (%s) \u2192 using up to %d MC worker threads.",
-            _SERVER_MARKER, cap,
-        )
-    return n
+    return max(1, cpus // 2)
 
 
 # ── ISO-surface cache helpers ─────────────────────────────────────────────

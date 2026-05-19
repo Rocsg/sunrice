@@ -33,12 +33,10 @@ DEFAULT_SEG_PATH: Path = DATA_DIR / "small_roots-2_Simple Segmentation.tiff"
 DEFAULT_SOURCE_PATH: Path = DATA_DIR / "small_roots-2.tif"
 
 # Where the per-label VTK meshes are written / read from.
-# Override with env var MARVEL_ROOTS_OUTPUT_DIR when running on a remote server.
-DEFAULT_OUTPUT_DIR: Path = Path(
-    os.environ.get(
-        "MARVEL_ROOTS_OUTPUT_DIR",
-        "/home/rfernandez/Data/Arize/Hollow_test/roots_output",
-    )
+# Répertoire racine des données. Seule variable à exporter dans ~/.bashrc.
+DEFAULT_OUTPUT_DIR: Path = (
+    Path(os.environ.get("MARVEL_DATA_DIR", "/home/rfernandez/Data/Arize/Hollow_test"))
+    / "roots_output"
 )
 
 # Default settings file (camera, sliders, visibility…).  Lives next to

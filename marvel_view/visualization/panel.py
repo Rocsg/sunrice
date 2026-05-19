@@ -316,11 +316,9 @@ def attach_panel(
     # Each click appends the current camera state to a JSON file in
     # ./positions/.  All saves of a single session go to the same file
     # so they can later be replayed as a fly-through / movie.
-    positions_dir = Path(
-        os.environ.get(
-            "MARVEL_POSITIONS_DIR",
-            "/home/rfernandez/Data/Arize/Hollow_test/positions",
-        )
+    positions_dir = (
+        Path(os.environ.get("MARVEL_DATA_DIR", "/home/rfernandez/Data/Arize/Hollow_test"))
+        / "positions"
     )
     positions_dir.mkdir(parents=True, exist_ok=True)
     session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

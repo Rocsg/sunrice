@@ -22,12 +22,10 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 # ──────────────────────────────── paths ───────────────────────────────────────
-# Override with env var MARVEL_INPUT_DIR when running on a remote server.
-DEFAULT_INPUT_DIR: Path = Path(
-    os.environ.get(
-        "MARVEL_INPUT_DIR",
-        "/home/rfernandez/Data/Arize/Hollow_test/1_Intermediate_computed_images",
-    )
+# Répertoire racine des données. Seule variable à exporter dans ~/.bashrc.
+DEFAULT_INPUT_DIR: Path = (
+    Path(os.environ.get("MARVEL_DATA_DIR", "/home/rfernandez/Data/Arize/Hollow_test"))
+    / "1_Intermediate_computed_images"
 )
 
 # 8-bit mask of the *outside* of the sample — voxels at 255 are excluded

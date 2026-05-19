@@ -319,11 +319,9 @@ class RootsViewer:
         # ── position-recording state ────────────────────────────────────
         # Each click on "Save pos" appends to one JSON file per session,
         # under ./positions/.  Created lazily on first save.
-        self._positions_dir: Path = Path(
-            os.environ.get(
-                "MARVEL_POSITIONS_DIR",
-                "/home/rfernandez/Data/Arize/Hollow_test/positions",
-            )
+        self._positions_dir: Path = (
+            Path(os.environ.get("MARVEL_DATA_DIR", "/home/rfernandez/Data/Arize/Hollow_test"))
+            / "positions"
         )
         self._positions_file: Optional[Path] = None
         self._positions_count: int = 0

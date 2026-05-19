@@ -60,32 +60,14 @@ DEFAULT_LEVEL: float = 0.2
 DEFAULT_SPACING = (1.0, 1.0, 1.0)
 DEFAULT_SMOOTH_ITER: int = 20  # gentle smoothing, keeps vertices dense
 
-# Root output directory for all water-conductance VTK / cache files.
-# Override with env var MARVEL_VTK_OUTPUT_DIR when running on a remote server.
-DEFAULT_VTK_OUTPUT_DIR: Path = Path(
-    os.environ.get(
-        "MARVEL_VTK_OUTPUT_DIR",
-        "/home/rfernandez/Data/Arize/Hollow_test/2_Vtk_files",
-    )
+# Répertoire racine des données. Seule variable à exporter dans ~/.bashrc.
+_DATA_BASE: Path = Path(
+    os.environ.get("MARVEL_DATA_DIR", "/home/rfernandez/Data/Arize/Hollow_test")
 )
 
-# Where the viewer writes camera positions (Save pos button).
-# Override with env var MARVEL_POSITIONS_DIR when running on a remote server.
-DEFAULT_POSITIONS_DIR: Path = Path(
-    os.environ.get(
-        "MARVEL_POSITIONS_DIR",
-        "/home/rfernandez/Data/Arize/Hollow_test/positions",
-    )
-)
-
-# Where the movie tool writes MP4 output.
-# Override with env var MARVEL_MP4_DIR when running on a remote server.
-DEFAULT_MP4_DIR: Path = Path(
-    os.environ.get(
-        "MARVEL_MP4_DIR",
-        "/home/rfernandez/Data/Arize/Hollow_test/mp4",
-    )
-)
+DEFAULT_VTK_OUTPUT_DIR: Path = _DATA_BASE / "2_Vtk_files"
+DEFAULT_POSITIONS_DIR:  Path = _DATA_BASE / "positions"
+DEFAULT_MP4_DIR:        Path = _DATA_BASE / "mp4"
 
 # Sub-directory holding the per-level ISO-surface cache (NPZ files).
 # Built once; reused across runs that only change phase/bg parameters.

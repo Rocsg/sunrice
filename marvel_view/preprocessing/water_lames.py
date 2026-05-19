@@ -201,21 +201,30 @@ def _kmeans_medoid_crown(
     crown_tree = cKDTree(coords)
     for it in range(int(n_iter)):
         tree = cKDTree(centroids)
-        _, assign = tree.query(coords, k=1)
-        new_centroids = np.empty_like(centroids)
-        moved = 0.0
-        for k in range(n_seeds):
-            members = coords[assign == k]
-            if members.size == 0:
-                # Empty cluster: reseed at the farthest crown voxel.
-                d_any, _ = tree.query(coords, k=1)
-                new_centroids[k] = coords[int(np.argmax(d_any))]
-                continue
-            mean = members.mean(axis=0)
-            # Medoid-included: snap mean to closest crown voxel.
-            _, j = crown_tree.query(mean, k=1)
-            new_centroids[k] = coords[int(j)]
-            moved += float(np.linalg.norm(centroids[k] - new_centroids[k]))
+        _, assign = tree.query(coords, k=1)      # O(N log K)
+
+        # Vectorised cluster means via bincount — O(N + K) instead of O(N*K)
+        counts  = np.bincount(assign, minlength=n_seeds)          # (K,)
+        sum_zyx = np.empty((n_seeds, 3), dtype=np.float64)
+        for dim in range(3):
+            sum_zyx[:, dim] = np.bincount(
+                assign, weights=coords[:, dim], minlength=n_seeds)
+        empty = counts == 0
+        means = np.empty_like(centroids)
+        means[~empty] = sum_zyx[~empty] / counts[~empty, np.newaxis]
+
+        # Empty clusters: reseed at the voxels farthest from any centroid.
+        if empty.any():
+            d_any, _ = tree.query(coords, k=1)
+            n_empty = int(empty.sum())
+            far_idx = np.argpartition(d_any, -n_empty)[-n_empty:]
+            means[empty] = coords[far_idx]
+
+        # Batch medoid snap: one KD-tree call for all K centroids — O(K log N)
+        _, snap_idx  = crown_tree.query(means, k=1)
+        new_centroids = coords[snap_idx]
+
+        moved = float(np.linalg.norm(centroids - new_centroids, axis=1).sum())
         centroids = new_centroids
         logger.info("  K-means iter %2d/%d  total drift=%.1f",
                     it + 1, n_iter, moved)
@@ -515,34 +524,60 @@ def _debug_lames(
         D_sub = geoddist [z0:z1, y0:y1, x0:x1]
         L_sub = label_vol[z0:z1, y0:y1, x0:x1]
 
-        # ── distance map ──────────────────────────────────────────
+        # ── distance map (float32, real values; 0 outside the column) ─
         d_col = np.where(L_sub == label, D_sub, 0.0).astype(np.float32)
-        d_max = float(d_col.max())
-        d_u8  = (d_col / d_max * 255).clip(0, 255).astype(np.uint8) \
-                if d_max > 0 else np.zeros_like(d_col, dtype=np.uint8)
         dist_path = output_dir / f"imagedistanceColonne{col_num}.tif"
-        tifffile.imwrite(str(dist_path), d_u8)
-        logger.info("debug colonne%d (L=%d): dist map %s → %s",
-                    col_num, label, d_u8.shape, dist_path)
+        tifffile.imwrite(str(dist_path), d_col)
+        logger.info("debug colonne%d (L=%d): dist map %s float32 → %s",
+                    col_num, label, d_col.shape, dist_path)
 
-        # ── per-step binary masks ─────────────────────────────────
-        col_dir = output_dir / f"colonne{col_num}"
+        # ── per-column distance range (same logic as _process_label) ──
+        d_col_vals = D_sub[L_sub == label]
+        d_col_vals = d_col_vals[(d_col_vals > 0) & np.isfinite(d_col_vals)]
+        if d_col_vals.size == 0:
+            logger.warning("debug colonne%d (L=%d): no positive distances",
+                           col_num, label)
+            continue
+        d_col_min = float(d_col_vals.min())
+        d_col_max = float(d_col_vals.max())
+        ti_lo = d_col_min + lame_width
+        ti_hi = d_col_max - lame_width
+
+        # monotonic lo/hi tracking
+        eps = float(levels[1] - levels[0]) * 0.5 if NT >= 2 else 0.1
+        lo_prev = -np.inf
+        hi_prev = -np.inf
+
+        # ── per-step binary masks + scalar field F ────────────────
+        col_dir  = output_dir / f"colonne{col_num}"
+        dist_dir = output_dir / f"distancecolonne{col_num}"
         col_dir.mkdir(parents=True, exist_ok=True)
+        dist_dir.mkdir(parents=True, exist_ok=True)
         n_saved = 0
         for ti in range(NT):
             d   = float(levels[ti])
+            if d < ti_lo or d > ti_hi:
+                continue
             a_m = float(alpha[max(0, ti - 1)])
             a_p = float(alpha[min(NT - 1, ti + 1)])
             lo  = max(0.1, d - lame_width / max(1e-3, a_m))
             hi  = max(lo + 0.1, d + lame_width / max(1e-3, a_p))
-            F   = (D_sub - lo) * (hi - D_sub)
-            mask = ((F > 0) & (L_sub == label)).astype(np.uint8) * 255
+            lo  = max(lo, lo_prev + eps)
+            hi  = max(hi, hi_prev + eps, lo + 0.1)
+            lo_prev = lo
+            hi_prev = hi
+            # scalar field F passed to marching cubes (iso = 0)
+            F = ((D_sub - lo) * (hi - D_sub)).astype(np.float32)
+            # restrict to the column (outside → negative so iso=0 won't catch it)
+            F = np.where(L_sub == label, F, -1.0).astype(np.float32)
+            tifffile.imwrite(str(dist_dir / f"step_{ti:04d}.tif"), F)
+            mask = (F > 0).astype(np.uint8) * 255
             if mask.max() == 0:
                 continue
             tifffile.imwrite(str(col_dir / f"step_{ti:04d}.tif"), mask)
             n_saved += 1
-        logger.info("debug colonne%d (L=%d): %d step TIFFs → %s",
-                    col_num, label, n_saved, col_dir)
+        logger.info("debug colonne%d (L=%d): d=[%.2f, %.2f]  %d step TIFFs → %s  (F field → %s)",
+                    col_num, label, d_col_min, d_col_max, n_saved, col_dir, dist_dir)
 
 
 # ── Per-label worker (a level loop, sequential within one label) ─────────
@@ -574,6 +609,7 @@ def _process_label(
     L_sub  = label_vol[z0:z1, y0:y1, x0:x1]
 
     # ── column-local distance range ───────────────────────────────────
+    NT = int(levels.size)
     d_col_vals = D_sub[L_sub == label]
     d_col_vals = d_col_vals[(d_col_vals > 0) & np.isfinite(d_col_vals)]
     if d_col_vals.size == 0:
@@ -584,7 +620,11 @@ def _process_label(
     ti_hi = d_col_max - lame_width   # skip levels above this
     n_active_steps = int(np.sum((levels >= ti_lo) & (levels <= ti_hi)))
 
-    NT = int(levels.size)
+    # monotonic step for lo/hi (prevents shell from receding when α dips)
+    eps = float(levels[1] - levels[0]) * 0.5 if NT >= 2 else 0.1
+    lo_prev = -np.inf
+    hi_prev = -np.inf
+
     t0 = NT
     tlast = -1
     n_geo = 0
@@ -597,6 +637,11 @@ def _process_label(
         a_plus  = float(alpha[min(NT - 1, ti + 1)])
         lo = max(0.1, d - float(lame_width) / max(1e-3, a_minus))
         hi = max(lo + 0.1, d + float(lame_width) / max(1e-3, a_plus))
+        # enforce strict monotonic growth
+        lo = max(lo, lo_prev + eps)
+        hi = max(hi, hi_prev + eps, lo + 0.1)
+        lo_prev = lo
+        hi_prev = hi
         logger.debug(
             "L=%4d  t=%3d  d=%.2f  lo=%.2f  hi=%.2f",
             label, ti, d, lo, hi,
@@ -812,36 +857,34 @@ def build_water_lames(
 
         t0_phase = time.perf_counter()
         n_done = 0
-        BATCH = n_workers_actual
+        GC_EVERY = n_workers_actual  # free memory every N completions
         with ThreadPoolExecutor(max_workers=n_workers_actual) as ex:
-            for batch_start in range(0, len(active_labels), BATCH):
-                batch = active_labels[batch_start:batch_start + BATCH]
-                futures = [
-                    ex.submit(
-                        _process_label,
-                        label=lb, bbox=bb,
-                        geoddist=geoddist, label_vol=label_vol,
-                        levels=levels, alpha=alpha,
-                        lame_width=lame_width,
-                        iso_cache_dir=iso_cache_dir,
-                        target_tris=target_tris_per_shell,
-                        smooth_iter=smooth_iter,
-                    )
-                    for lb, bb in batch
-                ]
-                for fut in as_completed(futures):
-                    lb, lt0, ltl, ngeo, dmin, dmax, nsteps = fut.result()
-                    n_done += 1
-                    if ngeo > 0:
-                        t0_per_col[lb]    = lt0
-                        tlast_per_col[lb] = ltl
-                    logger.info(
-                        "  [%4d/%d] L=%4d  d=[%.2f, %.2f]  active=%3d  shells=%3d",
-                        n_done, len(active_labels), lb, dmin, dmax, nsteps, ngeo,
-                    )
-                futures.clear()
-                gc.collect()
-                _malloc_trim()
+            futures = {
+                ex.submit(
+                    _process_label,
+                    label=lb, bbox=bb,
+                    geoddist=geoddist, label_vol=label_vol,
+                    levels=levels, alpha=alpha,
+                    lame_width=lame_width,
+                    iso_cache_dir=iso_cache_dir,
+                    target_tris=target_tris_per_shell,
+                    smooth_iter=smooth_iter,
+                ): lb
+                for lb, bb in active_labels
+            }
+            for fut in as_completed(futures):
+                lb, lt0, ltl, ngeo, dmin, dmax, nsteps = fut.result()
+                n_done += 1
+                if ngeo > 0:
+                    t0_per_col[lb]    = lt0
+                    tlast_per_col[lb] = ltl
+                logger.info(
+                    "  [%4d/%d] L=%4d  d=[%.2f, %.2f]  active=%3d  shells=%3d",
+                    n_done, len(active_labels), lb, dmin, dmax, nsteps, ngeo,
+                )
+                if n_done % GC_EVERY == 0:
+                    gc.collect()
+                    _malloc_trim()
         logger.info("Per-label phase done in %.1f s",
                     time.perf_counter() - t0_phase)
 

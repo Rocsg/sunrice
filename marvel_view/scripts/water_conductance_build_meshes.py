@@ -59,6 +59,11 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_MEMBRANES_META_CACHE,
     DEFAULT_MEMBRANES_VTP_CACHE,
     DEFAULT_MEMBRANES_ISO_CACHE_DIR,
+    DEFAULT_LAMES_BG_DIST_PATH,
+    DEFAULT_LAMES_LABELS_CACHE,
+    DEFAULT_LAMES_META_CACHE,
+    DEFAULT_LAMES_VTP_CACHE,
+    DEFAULT_LAMES_ISO_CACHE_DIR,
     DEFAULT_MESH_CACHE_PATH,
     DEFAULT_N_SOURCE_POINTS,
     DEFAULT_OVERLAY_CACHE_PATH,
@@ -88,6 +93,18 @@ from marvel_view.preprocessing.water_membranes import (  # noqa: E402
     DEFAULT_SEED as DEFAULT_MEMBRANE_SEED,
     DEFAULT_TARGET_TRIS_PER_LEVEL as DEFAULT_MEMBRANE_TARGET_TRIS,
     build_water_membranes,
+)
+from marvel_view.preprocessing.water_lames import (  # noqa: E402
+    DEFAULT_FADE_FRAMES        as DEFAULT_LAMES_FADE_FRAMES,
+    DEFAULT_KMEANS_ITERS       as DEFAULT_LAMES_KMEANS_ITERS,
+    DEFAULT_LAME_WIDTH         as DEFAULT_LAMES_LAME_WIDTH,
+    DEFAULT_N_LEVELS_MAX       as DEFAULT_LAMES_N_LEVELS_MAX,
+    DEFAULT_N_SEEDS            as DEFAULT_LAMES_N_SEEDS,
+    DEFAULT_PHASE_FACTOR       as DEFAULT_LAMES_PHASE_FACTOR,
+    DEFAULT_SEED               as DEFAULT_LAMES_SEED,
+    DEFAULT_SMOOTH_ITER        as DEFAULT_LAMES_SMOOTH_ITER,
+    DEFAULT_TARGET_TRIS_PER_SHELL as DEFAULT_LAMES_TARGET_TRIS,
+    build_water_lames,
 )
 
 logging.basicConfig(
@@ -210,6 +227,60 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Thread count for the per-level marching-cubes pass.  "
                         "Default: auto-detect (cap=4 locally, 8 on server).  "
                         "Override also via MARVEL_MAX_WORKERS env var.")
+    # ── Water "lames" (V2) descending animation ──
+    p.add_argument("--lames-only", action="store_true",
+                   help="Skip every step except the lames (V2) build "
+                        "(equivalent to all --skip-* flags except --skip-lames "
+                        "+ --skip-membranes).")
+    p.add_argument("--skip-lames", action="store_true",
+                   help="Don't build the V2 water-lames packed mesh.")
+    p.add_argument("--lames-output", default=str(DEFAULT_LAMES_VTP_CACHE),
+                   help="Where to write the cached water-lames .vtp.")
+    p.add_argument("--lames-meta-output",
+                   default=str(DEFAULT_LAMES_META_CACHE),
+                   help="Where to write the JSON sidecar for the lames.")
+    p.add_argument("--lames-labels-output",
+                   default=str(DEFAULT_LAMES_LABELS_CACHE),
+                   help="Where to write the lames watershed-labels TIFF.")
+    p.add_argument("--lames-bg-dist", default=str(DEFAULT_LAMES_BG_DIST_PATH),
+                   help="Distance-to-background TIFF for the lames build "
+                        "(same as the membranes one by default).")
+    p.add_argument("--lames-iso-cache-dir",
+                   default=str(DEFAULT_LAMES_ISO_CACHE_DIR),
+                   help="Directory for the per-(label, level) ISO-shell NPZ "
+                        "cache used by the lames pipeline.")
+    p.add_argument("--rebuild-lames-iso-cache", action="store_true",
+                   help="Force-rebuild the lames ISO cache from scratch.")
+    p.add_argument("--lames-iso-only", action="store_true",
+                   help="Run only Phase 1a of the lames build (per-shell "
+                        "marching cubes → ISO cache) and exit.")
+    p.add_argument("--n-lames-seeds", type=int, default=DEFAULT_LAMES_N_SEEDS,
+                   help="Number of K-means columns (water columns).")
+    p.add_argument("--lames-phase-factor", type=int,
+                   default=DEFAULT_LAMES_PHASE_FACTOR,
+                   help="Animation length multiplier: Nstep = phase × Nlevels.")
+    p.add_argument("--lames-n-levels-max", type=int,
+                   default=DEFAULT_LAMES_N_LEVELS_MAX,
+                   help="Maximum number of iso-distance levels (NT).")
+    p.add_argument("--lames-width", type=float,
+                   default=DEFAULT_LAMES_LAME_WIDTH,
+                   help="Base lame half-width before α-scaling.")
+    p.add_argument("--lames-target-tris-per-shell", type=int,
+                   default=DEFAULT_LAMES_TARGET_TRIS,
+                   help="Decimation budget per (label, level) shell.")
+    p.add_argument("--lames-smooth-iter", type=int,
+                   default=DEFAULT_LAMES_SMOOTH_ITER,
+                   help="Laplacian smoothing iterations per shell.")
+    p.add_argument("--lames-fade-frames", type=int,
+                   default=DEFAULT_LAMES_FADE_FRAMES,
+                   help="Glow envelope ramp length (in animation steps).")
+    p.add_argument("--lames-kmeans-iters", type=int,
+                   default=DEFAULT_LAMES_KMEANS_ITERS,
+                   help="Number of K-means (medoid) iterations.")
+    p.add_argument("--lames-seed", type=int, default=DEFAULT_LAMES_SEED,
+                   help="RNG seed for the lames build.")
+    p.add_argument("--lames-workers", type=int, default=None,
+                   help="Thread count for the per-label shell extraction.")
     p.add_argument("--geoddist", default=str(DEFAULT_GEODDIST_PATH),
                    help="Path to the geodesic distance-to-exterior TIFF "
                         "used to compute the arrow field.")
@@ -301,6 +372,18 @@ def main(argv: list[str] | None = None) -> int:
         args.skip_dilatation = True
         args.skip_tracks     = True
         args.skip_density    = True
+        args.skip_lames      = True
+
+    if args.lames_only:
+        args.skip_mesh       = True
+        args.skip_all_mesh   = True
+        args.skip_arrows     = True
+        args.skip_overlay    = True
+        args.skip_pillars    = True
+        args.skip_dilatation = True
+        args.skip_tracks     = True
+        args.skip_density    = True
+        args.skip_membranes  = True
 
     input_path = Path(args.input).expanduser().resolve()
     out_path = Path(args.output).expanduser().resolve()
@@ -616,6 +699,49 @@ def main(argv: list[str] | None = None) -> int:
             )
     else:
         logger.info("Skipping membranes build (--skip-membranes).")
+
+    # ── Water "lames" (V2) descending animation ─────────────────────────
+    if not args.skip_lames:
+        lames_out        = Path(args.lames_output).expanduser().resolve()
+        lames_meta_out   = Path(args.lames_meta_output).expanduser().resolve()
+        lames_labels_out = Path(args.lames_labels_output).expanduser().resolve()
+        lames_bg_dist    = Path(args.lames_bg_dist).expanduser().resolve()
+        object_path_l    = Path(args.paths_domain).expanduser().resolve()
+        crown_path_l     = Path(args.source_crown).expanduser().resolve()
+        geoddist_for_lames = Path(args.geoddist).expanduser().resolve()
+
+        missing = [str(p) for p in (geoddist_for_lames, lames_bg_dist,
+                                    object_path_l, crown_path_l)
+                   if not p.exists()]
+        if missing:
+            logger.warning(
+                "Lames (V2): missing input TIFFs %s -- skipping.", missing,
+            )
+        else:
+            build_water_lames(
+                geoddist_path=geoddist_for_lames,
+                bg_dist_path=lames_bg_dist,
+                object_path=object_path_l,
+                crown_path=crown_path_l,
+                output_vtp=lames_out,
+                output_meta=lames_meta_out,
+                output_labels=lames_labels_out,
+                iso_cache_dir=Path(args.lames_iso_cache_dir),
+                rebuild_iso_cache=args.rebuild_lames_iso_cache,
+                iso_only=args.lames_iso_only,
+                n_seeds=args.n_lames_seeds,
+                phase_factor=args.lames_phase_factor,
+                n_levels_max=args.lames_n_levels_max,
+                lame_width=args.lames_width,
+                target_tris_per_shell=args.lames_target_tris_per_shell,
+                smooth_iter=args.lames_smooth_iter,
+                fade_frames=args.lames_fade_frames,
+                kmeans_iters=args.lames_kmeans_iters,
+                seed=args.lames_seed,
+                n_workers=args.lames_workers,
+            )
+    else:
+        logger.info("Skipping lames build (--skip-lames).")
 
     # ── Crown Dijkstra tracks ────────────────────────────────────────────
     if not args.skip_tracks and not args.tracks_vtp_from_cache:

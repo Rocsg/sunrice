@@ -126,6 +126,28 @@ DEFAULT_MEMBRANES_ALPHA: float = 0.25
 # visible ``step_id`` slice by +1.
 MEMBRANE_TICK_MS: int = 60
 
+# ── Water "lames" (V2) descending animation ─────────────────────────────
+# Parallel V2 pipeline: thick adaptive iso-shells, one rendered actor per
+# step toggled with SetVisibility (no per-frame topology updates).  Built
+# by ``marvel-water-conductance-build-meshes`` via
+# ``marvel_view.preprocessing.water_lames``.
+DEFAULT_LAMES_ISO_CACHE_DIR: Path = DEFAULT_VTK_OUTPUT_DIR / "lames_iso_cache"
+DEFAULT_LAMES_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lames.vtp"
+)
+DEFAULT_LAMES_META_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lames_meta.json"
+)
+DEFAULT_LAMES_LABELS_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lames_labels.tif"
+)
+# Reuse the membranes BG-dist TIFF by default — same physical input.
+DEFAULT_LAMES_BG_DIST_PATH: Path = DEFAULT_MEMBRANES_BG_DIST_PATH
+DEFAULT_LAMES_COLOR: tuple[int, int, int] = (140, 195, 255)
+DEFAULT_LAMES_ALPHA: float = 0.30
+# Target ≈ 25 fps for the lames animation.
+LAMES_TICK_MS: int = 40
+
 # Status-line titles shown at the top-center on every rendering change.
 STATUS_TITLE_MESH_CORTEX = "Cortical bridges between sclerenchyma and stele"
 STATUS_TITLE_MESH_ALL    = "All watered tissues"
@@ -337,6 +359,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-membranes", action="store_true",
                    help="Don't load the water-membranes animation (hides the "
                         "Water ON/OFF toggle).")
+    # Water "lames" (V2) descending animation.
+    p.add_argument("--lames-vtp-cache",
+                   default=str(DEFAULT_LAMES_VTP_CACHE),
+                   help="Cached binary .vtp of the V2 water-lames packed mesh.")
+    p.add_argument("--lames-meta-cache",
+                   default=str(DEFAULT_LAMES_META_CACHE),
+                   help="Cached JSON sidecar for the V2 lames.")
+    p.add_argument("--no-lames", action="store_true",
+                   help="Don't load the V2 water-lames animation.  When BOTH "
+                        "lames and membranes are available, lames take over "
+                        "the Water ON/OFF toggle.")
     # Crown geodesic tracks (Arrows view #2) — built by build-meshes, loaded here.
     p.add_argument("--tracks-cache", default=str(DEFAULT_CROWN_TRACKS_CACHE),
                    help="Cached .npz of pre-computed Dijkstra track segments "
@@ -1551,6 +1584,100 @@ def _load_or_build_membranes(
     return pd, meta
 
 
+def _load_lames(vtp_path: Path, meta_path: Path):
+    """Return ``(polydata, meta)`` for the V2 lames animation, or
+    ``(None, None)`` if either file is missing."""
+    import vtk
+
+    if not vtp_path.exists() or not meta_path.exists():
+        logger.info(
+            "Water-lames (V2) cache not found (vtp=%s, meta=%s) — disabled.",
+            vtp_path, meta_path,
+        )
+        return None, None
+    try:
+        meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not parse lames meta %s: %s", meta_path, exc)
+        return None, None
+    try:
+        reader = vtk.vtkXMLPolyDataReader()
+        reader.SetFileName(str(vtp_path))
+        reader.Update()
+        pd = reader.GetOutput()
+        if pd is None or pd.GetNumberOfCells() == 0:
+            logger.warning("Lames VTP %s contains no cells.", vtp_path)
+            return None, None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not load lames VTP %s: %s", vtp_path, exc)
+        return None, None
+    logger.info(
+        "Water lames (V2) loaded: %d cells, n_steps=%d, n_columns=%d",
+        pd.GetNumberOfCells(),
+        int(meta.get("n_steps", 0)),
+        int(meta.get("n_columns", 0)),
+    )
+    return pd, meta
+
+
+def _build_lames_step_actors(packed_pd, n_steps: int):
+    """Split a packed PolyData (with cell-data ``step_id`` and ``rgb``)
+    into ``n_steps`` per-step ``vtkActor`` objects, all initially hidden.
+
+    Returns ``actors``: ``list[vtkActor]`` of length ``n_steps``
+    (entries may be ``None`` for empty steps)."""
+    import vtk
+
+    actors: list = [None] * int(n_steps)
+    for s in range(int(n_steps)):
+        thr = vtk.vtkThreshold()
+        thr.SetInputData(packed_pd)
+        thr.SetInputArrayToProcess(
+            0, 0, 0,
+            vtk.vtkDataObject.FIELD_ASSOCIATION_CELLS,
+            "step_id",
+        )
+        try:
+            thr.SetThresholdFunction(vtk.vtkThreshold.THRESHOLD_BETWEEN)
+        except AttributeError:
+            pass
+        thr.SetLowerThreshold(float(s))
+        thr.SetUpperThreshold(float(s))
+        thr.Update()
+
+        geo = vtk.vtkGeometryFilter()
+        geo.SetInputConnection(thr.GetOutputPort())
+        geo.Update()
+        step_pd = geo.GetOutput()
+        if step_pd is None or step_pd.GetNumberOfCells() == 0:
+            continue
+        # Deep-copy so we can drop the threshold/geom pipeline.
+        static = vtk.vtkPolyData()
+        static.DeepCopy(step_pd)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(static)
+        mapper.SetScalarModeToUseCellFieldData()
+        mapper.SelectColorArray("rgb")
+        mapper.SetColorModeToDirectScalars()
+        mapper.ScalarVisibilityOn()
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetOpacity(float(DEFAULT_LAMES_ALPHA))
+        prop.SetAmbient(0.85)
+        prop.SetDiffuse(0.10)
+        prop.SetSpecular(0.0)
+        prop.BackfaceCullingOff()
+        prop.FrontfaceCullingOff()
+        actor.SetVisibility(False)
+        actors[s] = actor
+    n_built = sum(1 for a in actors if a is not None)
+    logger.info("Lames: built %d / %d per-step actors", n_built, n_steps)
+    return actors
+
+
 def _set_lighting(mesh, ambient, diffuse, specular):
     """Apply Phong lighting with a fixed bluish specular tint."""
     try:
@@ -1622,6 +1749,7 @@ def _attach_controls(
     tracks_data=None,
     density_scalars=None,
     membranes_data=None,
+    lames_data=None,
 ) -> None:
     """Add shading button + opacity / lighting / hue sliders.
 
@@ -2638,6 +2766,138 @@ def _attach_controls(
     _ui_capturers.append(lambda: {
         "membranes_visible": bool(membranes_state["visible"]),
         "membranes_step":    int(membranes_state["step"]),
+    })
+
+    # ─── Water "lames" (V2) descending animation ────────────────────────
+    # Storage: ONE packed vtkPolyData with per-cell ``step_id`` and
+    # ``rgb`` arrays.  At load we split it into Nstep static per-step
+    # actors (each with its own PolyData) all initially hidden.  The
+    # animation tick flips ``SetVisibility`` on consecutive actors —
+    # O(1), no per-frame topology updates, no flicker.
+    lames_state = {
+        "visible":  False,
+        "step":     0,
+        "n_steps":  0,
+        "actors":   None,           # list[vtkActor | None]
+        "added":    False,
+        "timer_id": [None],
+    }
+    _lames_pd, _lames_meta = (None, None)
+    if lames_data is not None:
+        _lames_pd, _lames_meta = lames_data
+
+    if _lames_pd is not None and _lames_meta is not None:
+        try:
+            n_steps_l = int(_lames_meta.get("n_steps", 0))
+            actors_l = _build_lames_step_actors(_lames_pd, n_steps_l)
+            lames_state["n_steps"] = n_steps_l
+            lames_state["actors"]  = actors_l
+            logger.info(
+                "Water lames (V2) ready: n_steps=%d  (toggle via 'Lames' button)",
+                n_steps_l,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not initialise water lames (V2): %s", exc)
+            lames_state["actors"] = None
+
+    def _lames_apply_step() -> None:
+        actors = lames_state["actors"]
+        if actors is None or lames_state["n_steps"] <= 0:
+            return
+        cur = int(lames_state["step"]) % int(lames_state["n_steps"])
+        for i, a in enumerate(actors):
+            if a is None:
+                continue
+            a.SetVisibility(i == cur)
+
+    def _lames_tick(_obj=None, _ev=None) -> None:
+        if not lames_state["visible"] or lames_state["n_steps"] <= 0:
+            return
+        lames_state["step"] = (
+            (int(lames_state["step"]) + 1) % int(lames_state["n_steps"])
+        )
+        _lames_apply_step()
+        try:
+            plt.render()
+        except Exception:  # noqa: BLE001
+            pass
+
+    _iren_l = getattr(plt, "interactor", None)
+    if _iren_l is not None and lames_state["actors"] is not None:
+        try:
+            _iren_l.AddObserver("TimerEvent", _lames_tick)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lames timer observer could not attach: %s", exc)
+
+    def _lames_start_timer() -> None:
+        iren = getattr(plt, "interactor", None) or _iren_l
+        if (iren is None
+                or lames_state["timer_id"][0] is not None
+                or lames_state["actors"] is None):
+            return
+        try:
+            lames_state["timer_id"][0] = (
+                iren.CreateRepeatingTimer(int(LAMES_TICK_MS))
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lames timer could not start: %s", exc)
+
+    def _lames_stop_timer() -> None:
+        iren = getattr(plt, "interactor", None) or _iren_l
+        if iren is None or lames_state["timer_id"][0] is None:
+            return
+        try:
+            iren.DestroyTimer(lames_state["timer_id"][0])
+        except Exception:  # noqa: BLE001
+            pass
+        lames_state["timer_id"][0] = None
+
+    def _toggle_lames(*_args, **_kwargs) -> None:
+        if lames_state["actors"] is None:
+            logger.warning("_toggle_lames: actors unavailable — ignoring click")
+            return
+        want = not lames_state["visible"]
+        logger.info("_toggle_lames: want=%s", "ON" if want else "OFF")
+        if want:
+            try:
+                if not lames_state["added"]:
+                    for a in lames_state["actors"]:
+                        if a is not None:
+                            plt.renderer.AddActor(a)
+                    lames_state["added"] = True
+                lames_state["visible"] = True
+                _lames_apply_step()
+                _lames_start_timer()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Show lames failed: %s", exc)
+        else:
+            try:
+                _lames_stop_timer()
+                for a in lames_state["actors"]:
+                    if a is not None:
+                        a.SetVisibility(False)
+                lames_state["visible"] = False
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Hide lames failed: %s", exc)
+        try:
+            plt.render()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if lames_state["actors"] is not None:
+        plt.add_button(
+            _toggle_lames,
+            states=["Lames OFF", "Lames ON"],
+            c=["white", "white"],
+            bc=["#1a4f7a", "#4cc2ff"],
+            pos=(0.88, 0.46),
+            size=14,
+            bold=True,
+        )
+
+    _ui_capturers.append(lambda: {
+        "lames_visible": bool(lames_state["visible"]),
+        "lames_step":    int(lames_state["step"]),
     })
 
     def _make_arrows_actor(data):
@@ -4441,6 +4701,20 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning("Could not load membranes cache: %s", exc)
             membranes_data = None
 
+    # ── Water "lames" (V2) descending animation (load-only) ─────────────
+    lames_data = None
+    if not args.no_lames:
+        try:
+            lames_data = _load_lames(
+                Path(args.lames_vtp_cache).expanduser().resolve(),
+                Path(args.lames_meta_cache).expanduser().resolve(),
+            )
+            if lames_data == (None, None):
+                lames_data = None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load lames cache: %s", exc)
+            lames_data = None
+
     _attach_controls(
         plt, mesh,
         arrows_data=arrows_data,
@@ -4450,6 +4724,7 @@ def main(argv: list[str] | None = None) -> int:
         tracks_data=tracks_data,
         density_scalars=density_scalars,
         membranes_data=membranes_data,
+        lames_data=lames_data,
     )
     plt.interactive()
     plt.close()

@@ -97,7 +97,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_N_SEEDS:               int   = 1000
 DEFAULT_PHASE_FACTOR:          int   = 5
 DEFAULT_N_LEVELS_MAX:          int   = 200
-DEFAULT_LAME_WIDTH:            float = 1.5
+DEFAULT_LAME_WIDTH:            float = 15.0
 DEFAULT_TARGET_TRIS_PER_SHELL: int   = 500
 DEFAULT_SMOOTH_ITER:           int   = 5
 DEFAULT_FADE_FRAMES:           int   = 5
@@ -122,7 +122,7 @@ def _resolve_n_workers(requested: int | None) -> int:
             return max(1, int(env))
         except ValueError:
             pass
-    return max(1, os.cpu_count() or 4)
+    return max(1, int((os.cpu_count() or 4) * 2 // 3))
 
 
 # ── I/O helpers ──────────────────────────────────────────────────────────

@@ -1620,62 +1620,84 @@ def _load_lames(vtp_path: Path, meta_path: Path):
     return pd, meta
 
 
-def _build_lames_step_actors(packed_pd, n_steps: int):
-    """Split a packed PolyData (with cell-data ``step_id`` and ``rgb``)
-    into ``n_steps`` per-step ``vtkActor`` objects, all initially hidden.
+def _build_lames_step_polydatas(packed_pd, n_steps: int):
+    """Split a packed PolyData (cells **already sorted** by ``step_id``)
+    into per-step ``vtkPolyData`` objects using numpy slices — O(N) total,
+    no ``vtkThreshold`` scans.
 
-    Returns ``actors``: ``list[vtkActor]`` of length ``n_steps``
-    (entries may be ``None`` for empty steps)."""
+    Returns ``(step_pds, actor)``:
+      - ``step_pds``: list[vtkPolyData | None] of length ``n_steps``
+      - ``actor``:    single pre-configured ``vtkActor`` (hidden, no input)
+    """
     import vtk
+    from vtk.util import numpy_support as nps
+    import numpy as np
 
-    actors: list = [None] * int(n_steps)
+    # ── Pull cell-data + connectivity to numpy ONCE ─────────────────
+    step_arr = nps.vtk_to_numpy(
+        packed_pd.GetCellData().GetArray("step_id")
+    ).astype(np.int32)                                   # (N_tris,)
+    rgb_arr = nps.vtk_to_numpy(
+        packed_pd.GetCellData().GetArray("rgb")
+    )                                                     # (N_tris, 3) uint8
+    # Legacy flat connectivity [3,p0,p1,p2, 3,p3,p4,p5, ...]
+    conn = nps.vtk_to_numpy(
+        packed_pd.GetPolys().GetData()
+    ).reshape(-1, 4)                                     # (N_tris, 4)
+    pts_vtk = packed_pd.GetPoints()                       # shared, no copy
+
+    # ── Step boundaries (data is pre-sorted by step_id) ─────────────
+    lo_b = np.searchsorted(step_arr, np.arange(n_steps),       side="left")
+    hi_b = np.searchsorted(step_arr, np.arange(1, n_steps + 1), side="left")
+
+    step_pds: list = [None] * int(n_steps)
     for s in range(int(n_steps)):
-        thr = vtk.vtkThreshold()
-        thr.SetInputData(packed_pd)
-        thr.SetInputArrayToProcess(
-            0, 0, 0,
-            vtk.vtkDataObject.FIELD_ASSOCIATION_CELLS,
-            "step_id",
-        )
-        try:
-            thr.SetThresholdFunction(vtk.vtkThreshold.THRESHOLD_BETWEEN)
-        except AttributeError:
-            pass
-        thr.SetLowerThreshold(float(s))
-        thr.SetUpperThreshold(float(s))
-        thr.Update()
-
-        geo = vtk.vtkGeometryFilter()
-        geo.SetInputConnection(thr.GetOutputPort())
-        geo.Update()
-        step_pd = geo.GetOutput()
-        if step_pd is None or step_pd.GetNumberOfCells() == 0:
+        a, b = int(lo_b[s]), int(hi_b[s])
+        if a >= b:
             continue
-        # Deep-copy so we can drop the threshold/geom pipeline.
-        static = vtk.vtkPolyData()
-        static.DeepCopy(step_pd)
+        n_s      = b - a
+        sub_conn = np.ascontiguousarray(conn[a:b].ravel(), dtype=np.int64)
+        sub_rgb  = np.ascontiguousarray(rgb_arr[a:b])
 
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(static)
-        mapper.SetScalarModeToUseCellFieldData()
-        mapper.SelectColorArray("rgb")
-        mapper.SetColorModeToDirectScalars()
-        mapper.ScalarVisibilityOn()
+        cells = vtk.vtkCellArray()
+        cells.SetCells(
+            n_s,
+            nps.numpy_to_vtkIdTypeArray(sub_conn, deep=True),
+        )
+        step_pd = vtk.vtkPolyData()
+        step_pd.SetPoints(pts_vtk)                       # shared reference
+        step_pd.SetPolys(cells)
 
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        prop = actor.GetProperty()
-        prop.SetOpacity(float(DEFAULT_LAMES_ALPHA))
-        prop.SetAmbient(0.85)
-        prop.SetDiffuse(0.10)
-        prop.SetSpecular(0.0)
-        prop.BackfaceCullingOff()
-        prop.FrontfaceCullingOff()
-        actor.SetVisibility(False)
-        actors[s] = actor
-    n_built = sum(1 for a in actors if a is not None)
-    logger.info("Lames: built %d / %d per-step actors", n_built, n_steps)
-    return actors
+        a_rgb = nps.numpy_to_vtk(
+            sub_rgb, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
+        a_rgb.SetName("rgb")
+        a_rgb.SetNumberOfComponents(3)
+        step_pd.GetCellData().AddArray(a_rgb)
+        step_pds[s] = step_pd
+
+    n_built = sum(1 for p in step_pds if p is not None)
+    logger.info("Lames: pre-split %d / %d steps (numpy, single actor)",
+                n_built, n_steps)
+
+    # ── Single actor — geometry swapped at each tick ────────────────
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetScalarModeToUseCellFieldData()
+    mapper.SelectColorArray("rgb")
+    mapper.SetColorModeToDirectScalars()
+    mapper.ScalarVisibilityOn()
+
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    prop = actor.GetProperty()
+    prop.SetOpacity(float(DEFAULT_LAMES_ALPHA))
+    prop.SetAmbient(0.85)
+    prop.SetDiffuse(0.10)
+    prop.SetSpecular(0.0)
+    prop.BackfaceCullingOff()
+    prop.FrontfaceCullingOff()
+    actor.SetVisibility(False)
+
+    return step_pds, actor
 
 
 def _set_lighting(mesh, ambient, diffuse, specular):
@@ -2772,13 +2794,13 @@ def _attach_controls(
     # Storage: ONE packed vtkPolyData with per-cell ``step_id`` and
     # ``rgb`` arrays.  At load we split it into Nstep static per-step
     # actors (each with its own PolyData) all initially hidden.  The
-    # animation tick flips ``SetVisibility`` on consecutive actors —
-    # O(1), no per-frame topology updates, no flicker.
+    # Single actor whose PolyData is swapped at each tick — O(1) render.
     lames_state = {
         "visible":  False,
         "step":     0,
         "n_steps":  0,
-        "actors":   None,           # list[vtkActor | None]
+        "step_pds": None,           # list[vtkPolyData | None]
+        "actor":    None,           # single vtkActor
         "added":    False,
         "timer_id": [None],
     }
@@ -2789,26 +2811,30 @@ def _attach_controls(
     if _lames_pd is not None and _lames_meta is not None:
         try:
             n_steps_l = int(_lames_meta.get("n_steps", 0))
-            actors_l = _build_lames_step_actors(_lames_pd, n_steps_l)
-            lames_state["n_steps"] = n_steps_l
-            lames_state["actors"]  = actors_l
+            step_pds_l, actor_l = _build_lames_step_polydatas(
+                _lames_pd, n_steps_l)
+            lames_state["n_steps"]  = n_steps_l
+            lames_state["step_pds"] = step_pds_l
+            lames_state["actor"]    = actor_l
             logger.info(
                 "Water lames (V2) ready: n_steps=%d  (toggle via 'Lames' button)",
                 n_steps_l,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not initialise water lames (V2): %s", exc)
-            lames_state["actors"] = None
 
     def _lames_apply_step() -> None:
-        actors = lames_state["actors"]
-        if actors is None or lames_state["n_steps"] <= 0:
+        step_pds = lames_state["step_pds"]
+        actor    = lames_state["actor"]
+        if actor is None or not step_pds or lames_state["n_steps"] <= 0:
             return
         cur = int(lames_state["step"]) % int(lames_state["n_steps"])
-        for i, a in enumerate(actors):
-            if a is None:
-                continue
-            a.SetVisibility(i == cur)
+        pd  = step_pds[cur]
+        if pd is not None:
+            actor.GetMapper().SetInputData(pd)
+            actor.SetVisibility(True)
+        else:
+            actor.SetVisibility(False)
 
     def _lames_tick(_obj=None, _ev=None) -> None:
         if not lames_state["visible"] or lames_state["n_steps"] <= 0:
@@ -2823,7 +2849,7 @@ def _attach_controls(
             pass
 
     _iren_l = getattr(plt, "interactor", None)
-    if _iren_l is not None and lames_state["actors"] is not None:
+    if _iren_l is not None and lames_state["actor"] is not None:
         try:
             _iren_l.AddObserver("TimerEvent", _lames_tick)
         except Exception as exc:  # noqa: BLE001
@@ -2833,7 +2859,7 @@ def _attach_controls(
         iren = getattr(plt, "interactor", None) or _iren_l
         if (iren is None
                 or lames_state["timer_id"][0] is not None
-                or lames_state["actors"] is None):
+                or lames_state["actor"] is None):
             return
         try:
             lames_state["timer_id"][0] = (
@@ -2853,17 +2879,16 @@ def _attach_controls(
         lames_state["timer_id"][0] = None
 
     def _toggle_lames(*_args, **_kwargs) -> None:
-        if lames_state["actors"] is None:
-            logger.warning("_toggle_lames: actors unavailable — ignoring click")
+        actor = lames_state["actor"]
+        if actor is None:
+            logger.warning("_toggle_lames: actor unavailable — ignoring click")
             return
         want = not lames_state["visible"]
         logger.info("_toggle_lames: want=%s", "ON" if want else "OFF")
         if want:
             try:
                 if not lames_state["added"]:
-                    for a in lames_state["actors"]:
-                        if a is not None:
-                            plt.renderer.AddActor(a)
+                    plt.renderer.AddActor(actor)
                     lames_state["added"] = True
                 lames_state["visible"] = True
                 _lames_apply_step()
@@ -2873,9 +2898,7 @@ def _attach_controls(
         else:
             try:
                 _lames_stop_timer()
-                for a in lames_state["actors"]:
-                    if a is not None:
-                        a.SetVisibility(False)
+                actor.SetVisibility(False)
                 lames_state["visible"] = False
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Hide lames failed: %s", exc)
@@ -2884,7 +2907,7 @@ def _attach_controls(
         except Exception:  # noqa: BLE001
             pass
 
-    if lames_state["actors"] is not None:
+    if lames_state["actor"] is not None:
         plt.add_button(
             _toggle_lames,
             states=["Lames OFF", "Lames ON"],

@@ -928,7 +928,8 @@ def main(argv: list[str] | None = None) -> int:
                     level=_iso_level,
                     smooth_iter=DEFAULT_SMOOTH_ITER,
                     spacing=DEFAULT_SPACING,
-                    step_size=1,
+                    step_size=2,
+                    target_faces=500_000,
                 )
                 if _mesh is None:
                     logger.warning(

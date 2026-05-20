@@ -64,6 +64,11 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_LAMES_META_CACHE,
     DEFAULT_LAMES_VTP_CACHE,
     DEFAULT_LAMES_ISO_CACHE_DIR,
+    DEFAULT_LAME2_BG_DIST_PATH,
+    DEFAULT_LAME2_LABELS_CACHE,
+    DEFAULT_LAME2_META_CACHE,
+    DEFAULT_LAME2_VTP_CACHE,
+    DEFAULT_LAME2_ISO_CACHE_DIR,
     DEFAULT_MESH_CACHE_PATH,
     DEFAULT_N_SOURCE_POINTS,
     DEFAULT_OVERLAY_CACHE_PATH,
@@ -105,6 +110,18 @@ from marvel_view.preprocessing.water_lames import (  # noqa: E402
     DEFAULT_SMOOTH_ITER        as DEFAULT_LAMES_SMOOTH_ITER,
     DEFAULT_TARGET_TRIS_PER_SHELL as DEFAULT_LAMES_TARGET_TRIS,
     build_water_lames,
+)
+from marvel_view.preprocessing.water_lames2 import (  # noqa: E402
+    DEFAULT_FADE_FRAMES        as DEFAULT_LAME2_FADE_FRAMES,
+    DEFAULT_HOLD_RATIO         as DEFAULT_LAME2_HOLD_RATIO,
+    DEFAULT_KMEANS_ITERS       as DEFAULT_LAME2_KMEANS_ITERS,
+    DEFAULT_N_SEEDS            as DEFAULT_LAME2_N_SEEDS,
+    DEFAULT_PHASE_FACTOR       as DEFAULT_LAME2_PHASE_FACTOR,
+    DEFAULT_SEED               as DEFAULT_LAME2_SEED,
+    DEFAULT_SMOOTH_ITER        as DEFAULT_LAME2_SMOOTH_ITER,
+    DEFAULT_STEP_GROWTH        as DEFAULT_LAME2_STEP_GROWTH,
+    DEFAULT_TARGET_TRIS_PER_SHELL as DEFAULT_LAME2_TARGET_TRIS,
+    build_water_lame2,
 )
 
 logging.basicConfig(
@@ -289,6 +306,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--lames-debug-n-cols", type=int, default=3,
                    help="Number of random columns to inspect in --lames-debug "
                         "mode (default: 3).")
+    # ── Water "lame2" (V3) descending animation ──
+    p.add_argument("--lame2-only", action="store_true",
+                   help="Skip every step except the lame2 (V3) build.")
+    p.add_argument("--skip-lame2", action="store_true",
+                   help="Don't build the V3 water-lame2 packed mesh.")
+    p.add_argument("--lame2-output", default=str(DEFAULT_LAME2_VTP_CACHE),
+                   help="Where to write the cached water-lame2 .vtp.")
+    p.add_argument("--lame2-meta-output",
+                   default=str(DEFAULT_LAME2_META_CACHE),
+                   help="Where to write the JSON sidecar for the lame2.")
+    p.add_argument("--lame2-labels-output",
+                   default=str(DEFAULT_LAME2_LABELS_CACHE),
+                   help="Where to write the lame2 watershed-labels TIFF.")
+    p.add_argument("--lame2-bg-dist", default=str(DEFAULT_LAME2_BG_DIST_PATH),
+                   help="Distance-to-background TIFF for the lame2 build.")
+    p.add_argument("--lame2-iso-cache-dir",
+                   default=str(DEFAULT_LAME2_ISO_CACHE_DIR),
+                   help="Directory for the per-(label, frame) ISO-shell NPZ "
+                        "cache used by the lame2 pipeline.")
+    p.add_argument("--rebuild-lame2-iso-cache", action="store_true",
+                   help="Force-rebuild the lame2 ISO cache from scratch.")
+    p.add_argument("--lame2-iso-only", action="store_true",
+                   help="Run only Phase 1a of the lame2 build.")
+    p.add_argument("--n-lame2-seeds", type=int, default=DEFAULT_LAME2_N_SEEDS,
+                   help="Number of K-means columns for lame2.")
+    p.add_argument("--lame2-phase-factor", type=int,
+                   default=DEFAULT_LAME2_PHASE_FACTOR,
+                   help="Animation length multiplier: Nstep = phase × max-lifetime.")
+    p.add_argument("--lame2-step-growth", type=float,
+                   default=DEFAULT_LAME2_STEP_GROWTH,
+                   help="Distance-unit increment between consecutive d1 (or "
+                        "d0) values during the growth phases (default 2.0).")
+    p.add_argument("--lame2-hold-ratio", type=float,
+                   default=DEFAULT_LAME2_HOLD_RATIO,
+                   help="Phase-B length as a fraction of (A + C) frame count.")
+    p.add_argument("--lame2-target-tris-per-shell", type=int,
+                   default=DEFAULT_LAME2_TARGET_TRIS,
+                   help="Decimation budget per (label, frame) shell.")
+    p.add_argument("--lame2-smooth-iter", type=int,
+                   default=DEFAULT_LAME2_SMOOTH_ITER,
+                   help="Laplacian smoothing iterations per shell.")
+    p.add_argument("--lame2-fade-frames", type=int,
+                   default=DEFAULT_LAME2_FADE_FRAMES,
+                   help="Glow envelope ramp length (frames).")
+    p.add_argument("--lame2-kmeans-iters", type=int,
+                   default=DEFAULT_LAME2_KMEANS_ITERS,
+                   help="Number of K-means (medoid) iterations for lame2.")
+    p.add_argument("--lame2-seed", type=int, default=DEFAULT_LAME2_SEED,
+                   help="RNG seed for the lame2 build.")
+    p.add_argument("--lame2-workers", type=int, default=None,
+                   help="Thread count for the per-label lame2 shell extraction.")
     p.add_argument("--geoddist", default=str(DEFAULT_GEODDIST_PATH),
                    help="Path to the geodesic distance-to-exterior TIFF "
                         "used to compute the arrow field.")
@@ -381,6 +449,7 @@ def main(argv: list[str] | None = None) -> int:
         args.skip_tracks     = True
         args.skip_density    = True
         args.skip_lames      = True
+        args.skip_lame2      = True
 
     if args.lames_only:
         args.skip_mesh       = True
@@ -392,6 +461,19 @@ def main(argv: list[str] | None = None) -> int:
         args.skip_tracks     = True
         args.skip_density    = True
         args.skip_membranes  = True
+        args.skip_lame2      = True
+
+    if args.lame2_only:
+        args.skip_mesh       = True
+        args.skip_all_mesh   = True
+        args.skip_arrows     = True
+        args.skip_overlay    = True
+        args.skip_pillars    = True
+        args.skip_dilatation = True
+        args.skip_tracks     = True
+        args.skip_density    = True
+        args.skip_membranes  = True
+        args.skip_lames      = True
 
     input_path = Path(args.input).expanduser().resolve()
     out_path = Path(args.output).expanduser().resolve()
@@ -752,6 +834,49 @@ def main(argv: list[str] | None = None) -> int:
             )
     else:
         logger.info("Skipping lames build (--skip-lames).")
+
+    # ── Water "lame2" (V3) descending animation ─────────────────────────
+    if not args.skip_lame2:
+        lame2_out        = Path(args.lame2_output).expanduser().resolve()
+        lame2_meta_out   = Path(args.lame2_meta_output).expanduser().resolve()
+        lame2_labels_out = Path(args.lame2_labels_output).expanduser().resolve()
+        lame2_bg_dist    = Path(args.lame2_bg_dist).expanduser().resolve()
+        object_path_l2   = Path(args.paths_domain).expanduser().resolve()
+        crown_path_l2    = Path(args.source_crown).expanduser().resolve()
+        geoddist_for_l2  = Path(args.geoddist).expanduser().resolve()
+
+        missing = [str(p) for p in (geoddist_for_l2, lame2_bg_dist,
+                                    object_path_l2, crown_path_l2)
+                   if not p.exists()]
+        if missing:
+            logger.warning(
+                "Lame2 (V3): missing input TIFFs %s -- skipping.", missing,
+            )
+        else:
+            build_water_lame2(
+                geoddist_path=geoddist_for_l2,
+                bg_dist_path=lame2_bg_dist,
+                object_path=object_path_l2,
+                crown_path=crown_path_l2,
+                output_vtp=lame2_out,
+                output_meta=lame2_meta_out,
+                output_labels=lame2_labels_out,
+                iso_cache_dir=Path(args.lame2_iso_cache_dir),
+                rebuild_iso_cache=args.rebuild_lame2_iso_cache,
+                iso_only=args.lame2_iso_only,
+                n_seeds=args.n_lame2_seeds,
+                phase_factor=args.lame2_phase_factor,
+                step_growth=args.lame2_step_growth,
+                hold_ratio=args.lame2_hold_ratio,
+                target_tris_per_shell=args.lame2_target_tris_per_shell,
+                smooth_iter=args.lame2_smooth_iter,
+                fade_frames=args.lame2_fade_frames,
+                kmeans_iters=args.lame2_kmeans_iters,
+                seed=args.lame2_seed,
+                n_workers=args.lame2_workers,
+            )
+    else:
+        logger.info("Skipping lame2 build (--skip-lame2).")
 
     # ── Crown Dijkstra tracks ────────────────────────────────────────────
     if not args.skip_tracks and not args.tracks_vtp_from_cache:

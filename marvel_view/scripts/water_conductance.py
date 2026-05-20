@@ -148,6 +148,24 @@ DEFAULT_LAMES_ALPHA: float = 0.30
 # Target ≈ 25 fps for the lames animation.
 LAMES_TICK_MS: int = 40
 
+# ── Water "lame2" (V3) descending animation ─────────────────────────────
+# Parallel V3 pipeline: per-column 3-phase (grow d1 / hold / grow d0)
+# schedule.  Outputs sit alongside the V2 lames cache and do NOT
+# overwrite it; the viewer loads V3 by default and falls back to V2.
+DEFAULT_LAME2_ISO_CACHE_DIR: Path = DEFAULT_VTK_OUTPUT_DIR / "lame2_iso_cache"
+DEFAULT_LAME2_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lame2.vtp"
+)
+DEFAULT_LAME2_META_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lame2_meta.json"
+)
+DEFAULT_LAME2_LABELS_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lame2_labels.tif"
+)
+DEFAULT_LAME2_BG_DIST_PATH: Path = DEFAULT_MEMBRANES_BG_DIST_PATH
+DEFAULT_LAME2_ALPHA: float = 0.30
+LAME2_TICK_MS: int = 40
+
 # Status-line titles shown at the top-center on every rendering change.
 STATUS_TITLE_MESH_CORTEX = "Cortical bridges between sclerenchyma and stele"
 STATUS_TITLE_MESH_ALL    = "All watered tissues"
@@ -370,6 +388,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Don't load the V2 water-lames animation.  When BOTH "
                         "lames and membranes are available, lames take over "
                         "the Water ON/OFF toggle.")
+    # Water "lame2" (V3) descending animation.
+    p.add_argument("--lame2-vtp-cache",
+                   default=str(DEFAULT_LAME2_VTP_CACHE),
+                   help="Cached binary .vtp of the V3 water-lame2 packed "
+                        "mesh.  When present it takes precedence over V2.")
+    p.add_argument("--lame2-meta-cache",
+                   default=str(DEFAULT_LAME2_META_CACHE),
+                   help="Cached JSON sidecar for the V3 lame2.")
+    p.add_argument("--no-lame2", action="store_true",
+                   help="Don't load the V3 water-lame2 animation.  Falls "
+                        "back to V2 lames when present.")
     # Crown geodesic tracks (Arrows view #2) — built by build-meshes, loaded here.
     p.add_argument("--tracks-cache", default=str(DEFAULT_CROWN_TRACKS_CACHE),
                    help="Cached .npz of pre-computed Dijkstra track segments "
@@ -4713,9 +4742,36 @@ def main(argv: list[str] | None = None) -> int:
     # ── Water "membranes" V1 removed (no longer loaded) ─────────────────
     membranes_data = None
 
-    # ── Water "lames" (V2) descending animation (load-only) ─────────────
+    # ── Water "lames" (V2 / V3) descending animation (load-only) ──────
+    # Prefer V3 (lame2.vtp) when present; fall back to V2 (lames.vtp).
     lames_data = None
-    if not args.no_lames:
+    loaded_v3 = False
+    if not getattr(args, "no_lame2", False):
+        try:
+            lame2_loaded = _load_lames(
+                Path(args.lame2_vtp_cache).expanduser().resolve(),
+                Path(args.lame2_meta_cache).expanduser().resolve(),
+            )
+            if lame2_loaded != (None, None):
+                lames_data = lame2_loaded
+                loaded_v3 = True
+                # Slight specular bump for the V3 (lame2) actor since the
+                # progression spends more time on screen and a touch of
+                # highlight reads nicely even on translucent surfaces.
+                try:
+                    _, _actor = lames_data
+                    prop = _actor.GetProperty()
+                    prop.SetSpecular(0.25)
+                    prop.SetSpecularPower(20)
+                    prop.SetSpecularColor(1.0, 1.0, 1.0)
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.info("Water-lame2 (V3) cache loaded — taking over.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load lame2 cache: %s", exc)
+            lames_data = None
+
+    if lames_data is None and not args.no_lames:
         try:
             lames_data = _load_lames(
                 Path(args.lames_vtp_cache).expanduser().resolve(),

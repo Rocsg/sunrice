@@ -62,12 +62,12 @@ logger = logging.getLogger(__name__)
 
 # ── defaults ─────────────────────────────────────────────────────────────
 
-DEFAULT_N_SEEDS:               int   = _v2.DEFAULT_N_SEEDS
+DEFAULT_N_SEEDS:               int   = 300
 # Doubled w.r.t. V2 to accommodate the longer per-column lifetime.
 DEFAULT_PHASE_FACTOR:          int   = 10
 DEFAULT_STEP_GROWTH:           float = 2.0
 DEFAULT_HOLD_RATIO:            float = 0.25       # B = 25 % of (A + C)
-DEFAULT_TARGET_TRIS_PER_SHELL: int   = _v2.DEFAULT_TARGET_TRIS_PER_SHELL
+DEFAULT_TARGET_TRIS_PER_SHELL: int   = 1500
 DEFAULT_SMOOTH_ITER:           int   = _v2.DEFAULT_SMOOTH_ITER
 # Short glow envelope: 3 frames at start of A and 3 frames at end of C.
 DEFAULT_FADE_FRAMES:           int   = 3

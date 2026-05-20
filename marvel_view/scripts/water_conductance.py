@@ -166,6 +166,15 @@ DEFAULT_LAME2_BG_DIST_PATH: Path = DEFAULT_MEMBRANES_BG_DIST_PATH
 DEFAULT_LAME2_ALPHA: float = 0.30
 LAME2_TICK_MS: int = 40
 
+# ── Mask overlays (Stele + Outside) ─────────────────────────────────────
+# Two binary 8-bit masks (0/255) iso-surfaced at 127.5 and displayed
+# as static translucent actors, toggled on/off with the lames button.
+DEFAULT_STELE_TIFF_PATH:    Path = acfg.DEFAULT_INPUT_DIR / "Stele_mask.tif"
+DEFAULT_OUTSIDE_TIFF_PATH:  Path = acfg.DEFAULT_INPUT_DIR / "Outside_mask.tif"
+DEFAULT_STELE_MASK_CACHE:   Path = DEFAULT_VTK_OUTPUT_DIR / "stele_mask_iso.vtk"
+DEFAULT_OUTSIDE_MASK_CACHE: Path = DEFAULT_VTK_OUTPUT_DIR / "outside_mask_iso.vtk"
+DEFAULT_MASK_ISO_LEVEL: float = 127.5
+
 # Status-line titles shown at the top-center on every rendering change.
 STATUS_TITLE_MESH_CORTEX = "Cortical bridges between sclerenchyma and stele"
 STATUS_TITLE_MESH_ALL    = "All watered tissues"
@@ -399,6 +408,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-lame2", action="store_true",
                    help="Don't load the V3 water-lame2 animation.  Falls "
                         "back to V2 lames when present.")
+    # Stele / Outside mask overlays (displayed alongside the lames).
+    p.add_argument("--stele-mask-cache",
+                   default=str(DEFAULT_STELE_MASK_CACHE),
+                   help="Cached .vtk isosurface of Stele_mask.tif (iso=127.5).")
+    p.add_argument("--outside-mask-cache",
+                   default=str(DEFAULT_OUTSIDE_MASK_CACHE),
+                   help="Cached .vtk isosurface of Outside_mask.tif (iso=127.5).")
+    p.add_argument("--no-mask-overlays", action="store_true",
+                   help="Don't load the Stele / Outside mask overlay meshes.")
     # Crown geodesic tracks (Arrows view #2) — built by build-meshes, loaded here.
     p.add_argument("--tracks-cache", default=str(DEFAULT_CROWN_TRACKS_CACHE),
                    help="Cached .npz of pre-computed Dijkstra track segments "
@@ -1801,6 +1819,7 @@ def _attach_controls(
     density_scalars=None,
     membranes_data=None,
     lames_data=None,
+    mask_overlay_meshes=None,
 ) -> None:
     """Add shading button + opacity / lighting / hue sliders.
 
@@ -2809,7 +2828,7 @@ def _attach_controls(
             states=["Water OFF", "Water ON"],
             c=["white", "white"],
             bc=["#22336e", "#3aa0ff"],
-            pos=(0.88, 0.53),
+            pos=(0.02, 0.10),
             size=14,
             bold=True,
         )
@@ -2907,6 +2926,10 @@ def _attach_controls(
             pass
         lames_state["timer_id"][0] = None
 
+    # Normalise mask_overlay_meshes to a list of vtkActor-compatible objects.
+    _mask_overlays: list = list(mask_overlay_meshes) if mask_overlay_meshes else []
+    _mask_overlay_added: list[bool] = [False] * len(_mask_overlays)
+
     def _toggle_lames(*_args, **_kwargs) -> None:
         actor = lames_state["actor"]
         if actor is None:
@@ -2924,6 +2947,16 @@ def _attach_controls(
                 _lames_start_timer()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Show lames failed: %s", exc)
+            # Show mask overlays alongside lames.
+            for _i, _ov in enumerate(_mask_overlays):
+                try:
+                    _vtk_actor = getattr(_ov, "actor", _ov)
+                    if not _mask_overlay_added[_i]:
+                        plt.renderer.AddActor(_vtk_actor)
+                        _mask_overlay_added[_i] = True
+                    _vtk_actor.SetVisibility(True)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Show mask overlay %d failed: %s", _i, exc)
         else:
             try:
                 _lames_stop_timer()
@@ -2931,6 +2964,12 @@ def _attach_controls(
                 lames_state["visible"] = False
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Hide lames failed: %s", exc)
+            # Hide mask overlays.
+            for _i, _ov in enumerate(_mask_overlays):
+                try:
+                    getattr(_ov, "actor", _ov).SetVisibility(False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Hide mask overlay %d failed: %s", _i, exc)
         try:
             plt.render()
         except Exception:  # noqa: BLE001
@@ -2942,7 +2981,7 @@ def _attach_controls(
             states=["Lames OFF", "Lames ON"],
             c=["white", "white"],
             bc=["#1a4f7a", "#4cc2ff"],
-            pos=(0.88, 0.46),
+            pos=(0.02, 0.04),
             size=14,
             bold=True,
         )
@@ -4783,6 +4822,31 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning("Could not load lames cache: %s", exc)
             lames_data = None
 
+    # ── Stele / Outside mask overlays ───────────────────────────────────
+    mask_overlay_meshes: list = []
+    if not getattr(args, "no_mask_overlays", False):
+        import vedo as _vedo_masks
+        for _cache_arg, _label in (
+            (args.stele_mask_cache,   "stele"),
+            (args.outside_mask_cache, "outside"),
+        ):
+            _cpath = Path(_cache_arg).expanduser().resolve()
+            if _cpath.exists():
+                try:
+                    _m = _vedo_masks.Mesh(str(_cpath))
+                    _m.alpha(DEFAULT_LAMES_ALPHA)
+                    _m.color([c / 255.0 for c in DEFAULT_LAMES_COLOR])
+                    _m.lighting("off")
+                    _m.name = f"{_label}_mask_overlay"
+                    mask_overlay_meshes.append(_m)
+                    logger.info("Mask overlay '%s' loaded from %s", _label, _cpath)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not load mask overlay %s: %s",
+                                   _cpath, exc)
+            else:
+                logger.info("Mask overlay '%s' cache not found: %s — skipped.",
+                            _label, _cpath)
+
     _attach_controls(
         plt, mesh,
         arrows_data=arrows_data,
@@ -4793,6 +4857,7 @@ def main(argv: list[str] | None = None) -> int:
         density_scalars=density_scalars,
         membranes_data=membranes_data,
         lames_data=lames_data,
+        mask_overlay_meshes=mask_overlay_meshes,
     )
     plt.interactive()
     plt.close()

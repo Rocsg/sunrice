@@ -69,6 +69,11 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_LAME2_META_CACHE,
     DEFAULT_LAME2_VTP_CACHE,
     DEFAULT_LAME2_ISO_CACHE_DIR,
+    DEFAULT_MASK_ISO_LEVEL,
+    DEFAULT_OUTSIDE_MASK_CACHE,
+    DEFAULT_OUTSIDE_TIFF_PATH,
+    DEFAULT_STELE_MASK_CACHE,
+    DEFAULT_STELE_TIFF_PATH,
     DEFAULT_MESH_CACHE_PATH,
     DEFAULT_N_SOURCE_POINTS,
     DEFAULT_OVERLAY_CACHE_PATH,
@@ -357,6 +362,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="RNG seed for the lame2 build.")
     p.add_argument("--lame2-workers", type=int, default=None,
                    help="Thread count for the per-label lame2 shell extraction.")
+    # ── Stele / Outside mask isosurfaces (bundled with lame2) ──
+    p.add_argument("--stele-tiff", default=str(DEFAULT_STELE_TIFF_PATH),
+                   help="Stele_mask.tif: 8-bit binary mask for the stele.")
+    p.add_argument("--stele-output", default=str(DEFAULT_STELE_MASK_CACHE),
+                   help="Where to write the stele isosurface .vtk cache.")
+    p.add_argument("--outside-tiff", default=str(DEFAULT_OUTSIDE_TIFF_PATH),
+                   help="Outside_mask.tif: 8-bit binary mask for the outside.")
+    p.add_argument("--outside-output", default=str(DEFAULT_OUTSIDE_MASK_CACHE),
+                   help="Where to write the outside isosurface .vtk cache.")
+    p.add_argument("--mask-iso-level", type=float, default=DEFAULT_MASK_ISO_LEVEL,
+                   help="Iso-level for the stele/outside marching cubes "
+                        "(default: 127.5).")
+    p.add_argument("--skip-mask-overlays", action="store_true",
+                   help="Don't build the Stele/Outside mask isosurface caches.")
     p.add_argument("--geoddist", default=str(DEFAULT_GEODDIST_PATH),
                    help="Path to the geodesic distance-to-exterior TIFF "
                         "used to compute the arrow field.")
@@ -878,7 +897,52 @@ def main(argv: list[str] | None = None) -> int:
     else:
         logger.info("Skipping lame2 build (--skip-lame2).")
 
-    # ── Crown Dijkstra tracks ────────────────────────────────────────────
+    # ── Stele / Outside mask isosurfaces ─────────────────────────────────
+    if not args.skip_mask_overlays:
+        _iso_level = float(args.mask_iso_level)
+        for _tiff_arg, _out_arg, _name in (
+            (args.stele_tiff,   args.stele_output,   "stele"),
+            (args.outside_tiff, args.outside_output, "outside"),
+        ):
+            _tiff_p = Path(_tiff_arg).expanduser().resolve()
+            _out_p  = Path(_out_arg).expanduser().resolve()
+            if not _tiff_p.exists():
+                logger.warning(
+                    "Mask overlay '%s': TIFF not found at %s — skipping.",
+                    _name, _tiff_p,
+                )
+                continue
+            if _out_p.exists() and not args.force:
+                logger.info(
+                    "Mask overlay '%s' already built at %s  (--force to rebuild).",
+                    _name, _out_p,
+                )
+                continue
+            logger.info("Building '%s' isosurface (iso=%.1f) from %s …",
+                        _name, _iso_level, _tiff_p)
+            try:
+                from marvel_view.preprocessing import load_float_volume, mask_to_mesh
+                _vol  = load_float_volume(_tiff_p)
+                _mesh = mask_to_mesh(
+                    _vol,
+                    level=_iso_level,
+                    smooth_iter=DEFAULT_SMOOTH_ITER,
+                    spacing=DEFAULT_SPACING,
+                    step_size=1,
+                )
+                if _mesh is None:
+                    logger.warning(
+                        "mask_to_mesh returned None for '%s' — skipping.", _name)
+                    continue
+                _out_p.parent.mkdir(parents=True, exist_ok=True)
+                _mesh.write(str(_out_p))
+                logger.info("Mask overlay '%s' written to %s  (%d faces)",
+                            _name, _out_p, _mesh.ncells)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not build mask overlay '%s': %s",
+                               _name, exc)
+    else:
+        logger.info("Skipping mask-overlay build (--skip-mask-overlays).")
     if not args.skip_tracks and not args.tracks_vtp_from_cache:
         import numpy as np
         tracks_path = Path(args.tracks_output).expanduser().resolve()

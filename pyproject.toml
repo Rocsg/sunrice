@@ -27,6 +27,7 @@ marvel-aerench-preprocess = "marvel_view.scripts.aerench_preprocess:main"
 marvel-aerench-view       = "marvel_view.scripts.aerench_visualize:main"
 marvel-water-conductance  = "marvel_view.scripts.water_conductance:main"
 marvel-water-conductance-build-meshes = "marvel_view.scripts.water_conductance_build_meshes:main"
+marvel-wind-field-build   = "marvel_view.scripts.wind_field_build:main"
 marvel-water-movie        = "marvel_view.scripts.water_movie:main"
 
 [tool.setuptools.packages.find]

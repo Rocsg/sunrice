@@ -5,6 +5,10 @@ tifffile>=2022.8
 vedo>=2023.4
 vtk>=9.2
 imageio-ffmpeg>=0.4
+# Optional but recommended on Linux/X11: enables physical-key polling
+# (XQueryKeymap) for the Avion navigation mode, bypassing OS keyboard
+# autorepeat latency.  The code falls back gracefully if absent.
+python-xlib>=0.33; sys_platform == "linux"
 # Google spatial-media injector — used to tag VR MP4s as stereoscopic
 # equirectangular so they auto-detect on YouTube VR / Meta Quest / DeoVR.
 # Not on PyPI; install with:

@@ -124,7 +124,7 @@ DEFAULT_MEMBRANES_COLOR: tuple[int, int, int] = (140, 195, 255)
 DEFAULT_MEMBRANES_ALPHA: float = 0.25
 # Animation tick in milliseconds (~16 fps).  Each tick advances the
 # visible ``step_id`` slice by +1.
-MEMBRANE_TICK_MS: int = 60
+MEMBRANE_TICK_MS: int = 40
 
 # ── Water "lames" (V2) descending animation ─────────────────────────────
 # Parallel V2 pipeline: thick adaptive iso-shells, one rendered actor per
@@ -166,6 +166,39 @@ DEFAULT_LAME2_BG_DIST_PATH: Path = DEFAULT_MEMBRANES_BG_DIST_PATH
 DEFAULT_LAME2_ALPHA: float = 0.30
 LAME2_TICK_MS: int = 40
 
+# ── Wind / gas particles (O₂ + CH₄) ─────────────────────────────────────
+# Two toggles drive small "Shadow-of-Colossus" particles that flow
+# through the aerenchyma along the gradient of a *harmonic potential*
+# solved in the air mask (Dirichlet at high-X / low-X faces, Neumann on
+# walls).  Source masks, the field and the per-frame particle positions
+# are all pre-computed by ``marvel-wind-field-build``.
+#
+# Convention: numpy axis-0 = the long axis of the cylinder.  Source mask
+# (``wind_source.tif``) lives at axis-0 = high X (cylinder end "A");
+# target mask (``wind_target.tif``) lives at axis-0 = low X (end "B").
+# O₂ flows A → B (decreasing X, +∇u direction).
+# CH₄ flows B → A (increasing X, -∇u direction).
+DEFAULT_WIND_AREA_PATH:   Path = acfg.DEFAULT_INPUT_DIR / "wind_area.tif"
+DEFAULT_WIND_SOURCE_PATH: Path = acfg.DEFAULT_INPUT_DIR / "wind_source.tif"
+DEFAULT_WIND_TARGET_PATH: Path = acfg.DEFAULT_INPUT_DIR / "wind_target.tif"
+DEFAULT_WIND_FIELD_CACHE: Path = DEFAULT_VTK_OUTPUT_DIR / "wind_field.npz"
+DEFAULT_WIND_O2_CACHE:    Path = DEFAULT_VTK_OUTPUT_DIR / "wind_o2.npz"
+DEFAULT_WIND_CH4_CACHE:   Path = DEFAULT_VTK_OUTPUT_DIR / "wind_ch4.npz"
+# Number of *displayed* particles per species — must be ≥ n_templates in
+# the cache file; templates are reused at different phase offsets so we
+# can render many more concurrent particles than we precompute.
+DEFAULT_WIND_O2_DISPLAY:  int = 50_000
+DEFAULT_WIND_CH4_DISPLAY: int = 20_000
+# Point sizes (pixels) — capped by GPU; particles further from the camera
+# stay small in screen space, so distant flecks naturally fade.
+DEFAULT_WIND_O2_POINT_SIZE:  float = 4.0
+DEFAULT_WIND_CH4_POINT_SIZE: float = 5.0
+# Soft colours.
+DEFAULT_WIND_O2_COLOR  = (245, 250, 255)   # near-white
+DEFAULT_WIND_CH4_COLOR = (180, 168,  80)   # khaki / olive
+# Runtime tick (~25 fps to match the precomputed sequence).
+WIND_TICK_MS: int = 40
+
 # ── Mask overlays (Stele + Outside) ─────────────────────────────────────
 # Two binary 8-bit masks (0/255) iso-surfaced at 127.5 and displayed
 # as static translucent actors, toggled on/off with the lames button.
@@ -179,7 +212,7 @@ DEFAULT_MASK_ISO_LEVEL: float = 127.5
 STATUS_TITLE_MESH_CORTEX = "Cortical bridges between sclerenchyma and stele"
 STATUS_TITLE_MESH_ALL    = "All watered tissues"
 STATUS_TITLE_ARROWS_GRID = "Vector field on regular grid"
-STATUS_TITLE_ARROWS_TRACKS = "Vector field track from sclerenchyma to surface"
+STATUS_TITLE_ARROWS_TRACKS = "Conduction shorter paths (Dijkstra)"
 STATUS_DURATION_S: float = 5.0
 
 # Crown geodesic tracks (Arrows view #2) — Dijkstra shortest-paths from
@@ -229,7 +262,7 @@ DEFAULT_DILATATION_TIFF_PATH: Path = (
 DEFAULT_ARROW_STRIDE: int = 8          # draw stride on perpendicular axes (voxels)
 DEFAULT_LONG_AXIS_STRIDE: int = 15     # draw stride on the long volume axis
 DEFAULT_FINE_STRIDE: int = 3           # analyse field (∇, div) at this finer resolution
-DEFAULT_ARROW_LENGTH: float = 7.0      # world units (≈ 7 voxels at spacing=1)
+DEFAULT_ARROW_LENGTH: float = 7.0 / 3  # world units – default 3× smaller than the original 7.0
 DEFAULT_ARROW_THICKNESS: float = 6.3   # vedo.Arrows `thickness=` base multiplier
 # Optional translucent "shadow" mesh that is overlaid on every view.
 DEFAULT_OVERLAY_TIFF_PATH: Path = (
@@ -417,6 +450,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Cached .vtk isosurface of Outside_mask.tif (iso=127.5).")
     p.add_argument("--no-mask-overlays", action="store_true",
                    help="Don't load the Stele / Outside mask overlay meshes.")
+    # Wind / gas particles (built by marvel-wind-field-build).
+    p.add_argument("--wind-o2-cache",  default=str(DEFAULT_WIND_O2_CACHE),
+                   help="Cached .npz of O₂ particle trajectory templates "
+                        "(produced by marvel-wind-field-build).")
+    p.add_argument("--wind-ch4-cache", default=str(DEFAULT_WIND_CH4_CACHE),
+                   help="Cached .npz of CH₄ particle trajectory templates "
+                        "(produced by marvel-wind-field-build).")
+    p.add_argument("--wind-o2-display",  type=int,
+                   default=DEFAULT_WIND_O2_DISPLAY,
+                   help="Number of O₂ particles displayed simultaneously "
+                        "(templates are reused at random phase offsets).")
+    p.add_argument("--wind-ch4-display", type=int,
+                   default=DEFAULT_WIND_CH4_DISPLAY,
+                   help="Number of CH₄ particles displayed simultaneously.")
+    p.add_argument("--no-wind", action="store_true",
+                   help="Don't load the wind / gas particle caches "
+                        "(hides the O₂ and CH₄ toggle buttons).")
     # Crown geodesic tracks (Arrows view #2) — built by build-meshes, loaded here.
     p.add_argument("--tracks-cache", default=str(DEFAULT_CROWN_TRACKS_CACHE),
                    help="Cached .npz of pre-computed Dijkstra track segments "
@@ -434,7 +484,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "in _make_tracks_actor_curves.")
     p.add_argument("--no-tracks", action="store_true",
                    help="Disable the crown-tracks view.")
-    p.add_argument("--tracks-stride", type=int, default=1,
+    p.add_argument("--tracks-stride", type=int, default=4,
                    help="Keep only every Nth track segment from the cache "
                         "(display sub-sampling -- doesn't recompute anything). "
                         "Use e.g. 100 to render 1%% of the segments.")
@@ -1004,29 +1054,47 @@ def _build_crown_dijkstra_tracks(
                        "with Source_Target_Possible_Paths.")
         return None
 
-    # ── Uniform spatial sampling ─────────────────────────────────────────
-    # Divide the bounding box into a grid of cells of edge length
-    # `cell_size` voxels; keep one random voxel per occupied cell.
+    # ── Source-point selection: random init + fast k-medoids ─────────────
+    # Random initialisation followed by a small number of Lloyd iterations
+    # with medoid snap (same strategy as the column seeding in
+    # _kmeans_medoid_crown / water_lames.py).  Produces a much better
+    # spatial spread than the previous spatial-grid approach and avoids
+    # the clustering artefacts that appeared near voxel-grid boundaries.
     n_desired = min(int(n_source_points), n_att)
     if n_att <= n_desired:
         selected = att_coords
     else:
-        cell_size = max(1, int(np.ceil(n_att ** (1 / 3) /
-                                       n_desired ** (1 / 3))))
-        bk = att_coords // cell_size
-        _, first_idx = np.unique(
-            bk[:, 0] * 100_000_000 + bk[:, 1] * 10_000 + bk[:, 2],
-            return_index=True,
-        )
-        if len(first_idx) > n_desired:
-            rng = np.random.default_rng(42)
-            first_idx = rng.choice(first_idx, size=n_desired, replace=False)
-        selected = att_coords[first_idx]
+        from scipy.spatial import cKDTree as _cKDTree
+        _rng = np.random.default_rng(42)
+        coords_f = att_coords.astype(np.float64)
+        # Random initialisation
+        init_idx = _rng.choice(n_att, size=n_desired, replace=False)
+        centroids = coords_f[init_idx].copy()
+        # Fast k-medoids: 5 Lloyd iterations + medoid snap
+        crown_tree = _cKDTree(coords_f)
+        for _ki in range(5):
+            tree = _cKDTree(centroids)
+            _, assign = tree.query(coords_f, k=1)
+            counts = np.bincount(assign, minlength=n_desired)
+            sum_c = np.empty((n_desired, 3), dtype=np.float64)
+            for _d in range(3):
+                sum_c[:, _d] = np.bincount(
+                    assign, weights=coords_f[:, _d], minlength=n_desired,
+                )
+            empty = counts == 0
+            means = np.empty_like(centroids)
+            means[~empty] = sum_c[~empty] / counts[~empty, np.newaxis]
+            if empty.any():
+                d_any, _ = tree.query(coords_f, k=1)
+                n_emp = int(empty.sum())
+                far_idx = np.argpartition(d_any, -n_emp)[-n_emp:]
+                means[empty] = coords_f[far_idx]
+            _, snap_idx = crown_tree.query(means, k=1)
+            centroids = coords_f[snap_idx]
+        selected = centroids.astype(np.int64)
     logger.info(
-        "Tracing %d Dijkstra paths (cell_size=%d) …",
+        "Tracing %d Dijkstra paths (k-medoids, random init) …",
         len(selected),
-        max(1, int(np.ceil(n_att ** (1 / 3) / n_desired ** (1 / 3))))
-        if n_att > n_desired else 1,
     )
 
     # ── Traceback each path ───────────────────────────────────────────────
@@ -1820,6 +1888,7 @@ def _attach_controls(
     membranes_data=None,
     lames_data=None,
     mask_overlay_meshes=None,
+    wind_data=None,
 ) -> None:
     """Add shading button + opacity / lighting / hue sliders.
 
@@ -1875,7 +1944,7 @@ def _attach_controls(
     }
     try:
         status_state["text2d"] = _vedo_mod.Text2D(
-            "", pos="top-center", s=1.1, c="white", bg="black", alpha=0.65,
+            "", pos=(0.52, 0.972), s=1.1, c="white", bg="black", alpha=0.65,
         )
         plt.add(status_state["text2d"])
     except Exception as exc:  # noqa: BLE001
@@ -1913,9 +1982,18 @@ def _attach_controls(
         plt.render()
 
     def _timer_cb(_obj=None, _event=None):
-        # Only clear if no newer status message superseded this timer
+        now = _time.time()
+        # Clear FPS display if no tick has fired for more than 2 s.
+        if now - _fps_state["last_update"] > 2.0:
+            _fps_t = _fps_state["text2d"]
+            if _fps_t is not None:
+                try:
+                    _fps_t.text("")
+                except Exception:  # noqa: BLE001
+                    pass
+        # Only clear status if no newer status message superseded this timer
         # and the expiry has actually passed.
-        if _time.time() + 0.05 < status_state["expire_at"]:
+        if now + 0.05 < status_state["expire_at"]:
             return
         _hide_status()
         try:
@@ -1929,6 +2007,220 @@ def _attach_controls(
             _iren_for_timer.AddObserver("TimerEvent", _timer_cb)
         except Exception:  # noqa: BLE001
             pass
+
+    # ── FPS counter (top-left) — updated at most once per second ────────
+    _fps_state = {
+        "text2d":      None,
+        "last_t":      0.0,
+        "n_frames":    0,
+        "last_update": 0.0,
+    }
+    try:
+        _fps_state["text2d"] = _vedo_mod.Text2D(
+            "", pos=(0.36, 0.972), s=1.0, c="yellow", bg="black", alpha=0.65,
+        )
+        plt.add(_fps_state["text2d"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not create FPS Text2D: %s", exc)
+
+    def _fps_tick() -> None:
+        """Lightweight FPS counter; call once per animation tick."""
+        _fps_state["n_frames"] += 1
+        now = _time.time()
+        dt = now - _fps_state["last_t"]
+        if dt < 1.0:
+            return
+        fps = _fps_state["n_frames"] / dt
+        _fps_state["n_frames"] = 0
+        _fps_state["last_t"] = now
+        _fps_state["last_update"] = now
+        t = _fps_state["text2d"]
+        if t is None:
+            return
+        try:
+            t.text(f"▶ {fps:.1f} fps")
+        except Exception:  # noqa: BLE001
+            pass
+        # Schedule auto-clear after 2.5 s of silence.
+        _iren_fps = getattr(plt, "interactor", None)
+        if _iren_fps is not None:
+            try:
+                _iren_fps.CreateOneShotTimer(2500)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ── Render coalescer ───────────────────────────────────────────────
+    # Several subsystems (membranes, lames, wind O2/CH4, plane, ship)
+    # used to call ``plt.render()`` directly from their own repeating
+    # TimerEvent observers.  When two or more were active in parallel,
+    # multiple renders happened per ~40 ms slot:
+    #
+    #   * Reported FPS inflated (25 → 37, 50, ...)  — each render bumped
+    #     the same shared FPS counter, regardless of which timer caused it.
+    #   * CPU/GPU burned doing duplicate work.
+    #   * The interactor's event loop was starved of time to process
+    #     mouse / keyboard events → laggy controls.
+    #
+    # Now every subsystem tick only updates its state and calls
+    # ``_request_render()``.  A single low-priority TimerEvent observer
+    # flushes ONE ``plt.render()`` per ``_FRAME_INTERVAL_S`` (40 ms ≈
+    # 25 fps), regardless of how many subsystem timers fire.
+    _FRAME_INTERVAL_S: float = 0.016  # ~60 fps render cap; machine adapts
+                                       # (slow renders naturally lower fps)
+
+    _render_state = {
+        "dirty":  False,
+        "last_t": 0.0,
+    }
+
+    def _request_render() -> None:
+        """Mark the scene dirty; the master tick will render at most once
+        per :data:`_FRAME_INTERVAL_S`."""
+        _render_state["dirty"] = True
+
+    def _coalesce_render_tick() -> None:
+        if not _render_state["dirty"]:
+            return
+        now = _time.time()
+        if now - _render_state["last_t"] < _FRAME_INTERVAL_S:
+            return
+        _render_state["dirty"] = False
+        _render_state["last_t"] = now
+        _fps_tick()
+        try:
+            plt.render()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── Master scheduler ───────────────────────────────────────────────
+    # Single repeating timer (16 ms) drives every periodic subsystem
+    # (plane input + integration, ship integration, lames / membranes /
+    # wind frame swaps, render flush).  Subsystems are plain Python
+    # callables registered via ``_master_register``; their cadence is
+    # honoured via per-sub accumulators.
+    #
+    # Why one timer instead of N:
+    #   * Eliminates cross-subsystem TimerEvent priority races (every
+    #     observer used to fire on every other timer's events, hence
+    #     the per-tick ``GetTimerId()`` guards).
+    #   * Makes ordering deterministic (input → sim → render every tick).
+    #   * Lets the plane subsystem poll keyboard state at a fixed
+    #     cadence regardless of which other subsystem is also active.
+    #   * Mirrors the standard game-loop architecture.
+    #
+    # Why on-demand (start/stop) rather than permanent:
+    #   * ``vtkInteractorStyleTrackballCamera`` reapplies the last
+    #     mouse delta on every TimerEvent, producing a visible
+    #     "inertia" feel during click-drag.  Stopping the timer when
+    #     no subsystem needs it restores the vanilla trackball feel
+    #     in Spaceship / Custom modes.
+    _MASTER_TICK_MS: int = 16
+    _master = {
+        "iren":     None,
+        "timer_id": None,
+        "subs":     [],   # list[dict]
+    }
+
+    def _master_register(name: str, fn, period_ms: int,
+                         enabled: bool = False) -> dict:
+        sub = {
+            "name":     str(name),
+            "fn":       fn,
+            "period_s": max(0.001, float(period_ms) / 1000.0),
+            "accum_s":  0.0,
+            "enabled":  bool(enabled),
+            "last_t":   None,
+        }
+        _master["subs"].append(sub)
+        return sub
+
+    def _master_refresh_timer() -> None:
+        """Start the master timer if any sub is enabled; stop it when all
+        are idle (preserves trackball feel in non-Avion modes)."""
+        iren = _master["iren"]
+        if iren is None:
+            return
+        any_on = any(s["enabled"] for s in _master["subs"])
+        if any_on and _master["timer_id"] is None:
+            try:
+                _master["timer_id"] = iren.CreateRepeatingTimer(
+                    int(_MASTER_TICK_MS)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Master timer could not start: %s", exc)
+        elif (not any_on) and _master["timer_id"] is not None:
+            try:
+                iren.DestroyTimer(_master["timer_id"])
+            except Exception:  # noqa: BLE001
+                pass
+            _master["timer_id"] = None
+
+    def _master_set_enabled(sub: dict, on: bool) -> None:
+        was = sub["enabled"]
+        sub["enabled"] = bool(on)
+        if on:
+            sub["last_t"] = None
+            sub["accum_s"] = 0.0
+        if was != sub["enabled"]:
+            _master_refresh_timer()
+
+    def _master_tick(obj=None, _ev=None) -> None:
+        # Only react to *our* timer (other observers — status hide,
+        # FPS one-shot — share the iren's TimerEvent stream).
+        _exp = _master["timer_id"]
+        if _exp is not None and obj is not None:
+            try:
+                if obj.GetTimerId() != _exp:
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+        now = _time.time()
+        for sub in _master["subs"]:
+            if not sub["enabled"]:
+                sub["last_t"] = None
+                sub["accum_s"] = 0.0
+                continue
+            if sub["last_t"] is None:
+                sub["last_t"] = now
+                sub["accum_s"] = 0.0
+                # Run once on (re-)enable so the first frame is reactive.
+                try:
+                    sub["fn"]()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Master sub '%s' first-call failed: %s",
+                                   sub["name"], exc)
+                continue
+            dt = now - sub["last_t"]
+            sub["last_t"] = now
+            if dt < 0.0 or dt > 1.0:
+                sub["accum_s"] = 0.0
+                continue
+            sub["accum_s"] += dt
+            if sub["accum_s"] + 1e-9 >= sub["period_s"]:
+                # Cap credit at one period so a long stall doesn't
+                # cause a burst of catch-up calls.
+                sub["accum_s"] = min(
+                    sub["accum_s"] - sub["period_s"], sub["period_s"]
+                )
+                try:
+                    sub["fn"]()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Master sub '%s' failed: %s",
+                                   sub["name"], exc)
+        # Render coalesce always at end (cheap if !dirty).
+        _coalesce_render_tick()
+
+    _master["iren"] = getattr(plt, "interactor", None)
+    if _master["iren"] is not None:
+        try:
+            _master["iren"].AddObserver("TimerEvent", _master_tick)
+            logger.info(
+                "Master scheduler attached (%d ms tick, on demand).",
+                _MASTER_TICK_MS,
+            )
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("Master scheduler observer could not attach: %s",
+                           _exc)
 
     def _apply_hue():
         for _m in all_meshes:
@@ -1970,7 +2262,7 @@ def _attach_controls(
             vmin, vmax, value=state[key],
             pos=((x1, y), (x2, y)),
             title=key,
-            title_size=0.7,
+            title_size=0.4,
             show_value=True,
         )
         mesh_sliders.append(sw)
@@ -2029,14 +2321,23 @@ def _attach_controls(
     #    movement panel below is the only way to move the camera.
     import vtk
     _INTERACTION_STYLES = [
-        ("Trackball Cam",    vtk.vtkInteractorStyleTrackballCamera),
-        ("Custom (buttons)", vtk.vtkInteractorStyleUser),
+        ("Trackball Cam",        vtk.vtkInteractorStyleTrackballCamera),
+        ("Navigation (buttons)", vtk.vtkInteractorStyleUser),
     ]
     style_state = {
-        "idx": 0,
+        "idx": 1,   # default: Navigation (buttons) — Avion mode
         "instances": [cls() for _, cls in _INTERACTION_STYLES],
         "custom_idx": len(_INTERACTION_STYLES) - 1,
     }
+
+    # ── Navigation sub-mode: 0=Avion (default), 1=Spaceship, 2=Custom ───
+    _nav_mode: list = [0]
+    _avion_buttons: list = []         # airplane mode buttons (left panel)
+    _ship_buttons: list = []          # spaceship mode buttons (left panel)
+    _nav_mode_btn_ref: list = [None]  # forward ref; filled after spaceship section
+    _restart_nav_btn_ref: list = [None]
+    _keyboard_btn_ref: list = [None]  # "Keys ▸ off/on" toggle (avion keys)
+    _keyboard_on: list = [False]      # is keyboard navigation armed? (armed after first render)
 
     def _apply_style(i: int) -> None:
         iren = getattr(plt, "interactor", None)
@@ -2044,7 +2345,7 @@ def _attach_controls(
             return
         iren.SetInteractorStyle(style_state["instances"][i])
 
-    _apply_style(0)
+    _apply_style(1)   # start in Navigation (buttons) mode
 
     def _cycle_style_cb(*_a, **_kw):
         style_state["idx"] = (style_state["idx"] + 1) % len(_INTERACTION_STYLES)
@@ -2159,7 +2460,7 @@ def _attach_controls(
                 direction = direction / n
             else:
                 direction = np.array([0.0, 0.0, -1.0])
-            logger.info(
+            logger.debug(
                 "_refresh_ortho  cam.pos=(%.2f, %.2f, %.2f)  cam.foc=(%.2f, %.2f, %.2f)",
                 pos[0], pos[1], pos[2], foc[0], foc[1], foc[2],
             )
@@ -2292,15 +2593,36 @@ def _attach_controls(
             )
 
     def _refresh_nav_panel_visibility():
-        show = (style_state["idx"] == style_state["custom_idx"])
-        for b in _nav_buttons:
-            actor = getattr(b, "actor", None)
-            if actor is None:
+        is_nav = (style_state["idx"] == style_state["custom_idx"])
+        mode = _nav_mode[0]  # 0=Avion, 1=Spaceship, 2=Custom
+
+        def _set_vis(btn_list, visible: bool) -> None:
+            for b in btn_list:
+                actor = getattr(b, "actor", None)
+                if actor is None:
+                    continue
+                try:
+                    actor.SetVisibility(1 if visible else 0)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        _set_vis(_nav_buttons,   is_nav and mode == 2)  # Custom panel (right)
+        _set_vis(_ship_buttons,  is_nav and mode == 1)  # Spaceship  (left)
+        _set_vis(_avion_buttons, is_nav and mode == 0)  # Airplane   (left)
+
+        # Nav mode switch + Restart + Keys: always visible when in
+        # Navigation mode.
+        for _ref in (_nav_mode_btn_ref, _restart_nav_btn_ref,
+                     _keyboard_btn_ref):
+            _b = _ref[0]
+            if _b is None:
                 continue
-            try:
-                actor.SetVisibility(1 if show else 0)
-            except Exception:  # noqa: BLE001
-                pass
+            actor = getattr(_b, "actor", None)
+            if actor is not None:
+                try:
+                    actor.SetVisibility(1 if is_nav else 0)
+                except Exception:  # noqa: BLE001
+                    pass
 
     _refresh_nav_panel_visibility()
 
@@ -2578,6 +2900,9 @@ def _attach_controls(
     tracks_actor = None          # may be a list [lines_act, path_arrows_act]
     _track_cam_obs_tag = [None]  # mutable container for camera observer tag
     arrow_sliders: list = []
+    # Whether the bottom gauge sliders are visible.  Toggled by the
+    # "Gauges" button placed next to the keyboard-navigation toggle.
+    _gauge_state = {"on": True}
 
     # ── Density colormap (per-cell scalars) ──────────────────────────────
     _density_btn = None  # populated below if scalars are present
@@ -2747,66 +3072,44 @@ def _attach_controls(
         except Exception as exc:  # noqa: BLE001
             logger.debug("Membranes threshold update failed: %s", exc)
 
-    def _membrane_tick(_obj=None, _ev=None) -> None:
+    def _membrane_tick() -> None:
         if not membranes_state["visible"] or membranes_state["n_steps"] <= 0:
             return
         membranes_state["step"] = (
             (int(membranes_state["step"]) + 1) % int(membranes_state["n_steps"])
         )
         _membrane_apply_step()
-        try:
-            plt.render()
-        except Exception:  # noqa: BLE001
-            pass
+        _request_render()
 
-    if (_iren_mem is not None
-            and membranes_state["actor"] is not None):
-        try:
-            _iren_mem.AddObserver("TimerEvent", _membrane_tick)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Membranes timer observer could not attach: %s", exc)
+    _membrane_sub = _master_register(
+        "membranes", _membrane_tick, int(MEMBRANE_TICK_MS), enabled=False,
+    )
 
     def _membrane_start_timer() -> None:
-        iren = getattr(plt, "interactor", None) or _iren_mem
-        if (iren is None
-                or membranes_state["timer_id"][0] is not None
-                or membranes_state["actor"] is None):
+        if membranes_state["actor"] is None:
             return
-        try:
-            membranes_state["timer_id"][0] = (
-                iren.CreateRepeatingTimer(int(MEMBRANE_TICK_MS))
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Membranes timer could not start: %s", exc)
+        _master_set_enabled(_membrane_sub, True)
+        # Keep the legacy slot so other code paths can still detect
+        # "timer running" via a non-None value.
+        membranes_state["timer_id"][0] = 1
 
     def _membrane_stop_timer() -> None:
-        iren = getattr(plt, "interactor", None) or _iren_mem
-        if iren is None or membranes_state["timer_id"][0] is None:
-            return
-        try:
-            iren.DestroyTimer(membranes_state["timer_id"][0])
-        except Exception:  # noqa: BLE001
-            pass
+        _master_set_enabled(_membrane_sub, False)
         membranes_state["timer_id"][0] = None
 
+    _membranes_btn: list = [None]
+
     def _toggle_membranes(*_args, **_kwargs) -> None:
-        logger.info("_toggle_membranes called (actor=%s, visible=%s)",
-                    membranes_state["actor"], membranes_state["visible"])
         if membranes_state["actor"] is None:
             logger.warning("_toggle_membranes: actor is None — ignoring click")
             return
         want = not membranes_state["visible"]
-        logger.info("_toggle_membranes: want=%s", "ON" if want else "OFF")
         if want:
             try:
-                # Add the actor FIRST (mirrors the pillars trick: vedo /
-                # vtk may reset mapper state on add, so style after add).
                 plt.renderer.AddActor(membranes_state["actor"])
                 membranes_state["visible"] = True
                 _membrane_apply_step()
                 _membrane_start_timer()
-                logger.info("_toggle_membranes: Water ON — actor added, step=%d, timer=%s",
-                            membranes_state["step"], membranes_state["timer_id"][0])
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Show membranes failed: %s", exc)
         else:
@@ -2814,16 +3117,20 @@ def _attach_controls(
                 _membrane_stop_timer()
                 plt.renderer.RemoveActor(membranes_state["actor"])
                 membranes_state["visible"] = False
-                logger.info("_toggle_membranes: Water OFF — actor removed")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Hide membranes failed: %s", exc)
+        if _membranes_btn[0] is not None:
+            try:
+                _membranes_btn[0].switch()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             plt.render()
         except Exception:  # noqa: BLE001
             pass
 
     if membranes_state["actor"] is not None:
-        plt.add_button(
+        _membranes_btn[0] = plt.add_button(
             _toggle_membranes,
             states=["Water OFF", "Water ON"],
             c=["white", "white"],
@@ -2884,51 +3191,34 @@ def _attach_controls(
         else:
             actor.SetVisibility(False)
 
-    def _lames_tick(_obj=None, _ev=None) -> None:
+    def _lames_tick() -> None:
         if not lames_state["visible"] or lames_state["n_steps"] <= 0:
             return
         lames_state["step"] = (
             (int(lames_state["step"]) + 1) % int(lames_state["n_steps"])
         )
         _lames_apply_step()
-        try:
-            plt.render()
-        except Exception:  # noqa: BLE001
-            pass
+        _request_render()
 
-    _iren_l = getattr(plt, "interactor", None)
-    if _iren_l is not None and lames_state["actor"] is not None:
-        try:
-            _iren_l.AddObserver("TimerEvent", _lames_tick)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Lames timer observer could not attach: %s", exc)
+    _lames_sub = _master_register(
+        "lames", _lames_tick, int(LAMES_TICK_MS), enabled=False,
+    )
 
     def _lames_start_timer() -> None:
-        iren = getattr(plt, "interactor", None) or _iren_l
-        if (iren is None
-                or lames_state["timer_id"][0] is not None
-                or lames_state["actor"] is None):
+        if lames_state["actor"] is None:
             return
-        try:
-            lames_state["timer_id"][0] = (
-                iren.CreateRepeatingTimer(int(LAMES_TICK_MS))
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Lames timer could not start: %s", exc)
+        _master_set_enabled(_lames_sub, True)
+        lames_state["timer_id"][0] = 1
 
     def _lames_stop_timer() -> None:
-        iren = getattr(plt, "interactor", None) or _iren_l
-        if iren is None or lames_state["timer_id"][0] is None:
-            return
-        try:
-            iren.DestroyTimer(lames_state["timer_id"][0])
-        except Exception:  # noqa: BLE001
-            pass
+        _master_set_enabled(_lames_sub, False)
         lames_state["timer_id"][0] = None
 
     # Normalise mask_overlay_meshes to a list of vtkActor-compatible objects.
     _mask_overlays: list = list(mask_overlay_meshes) if mask_overlay_meshes else []
     _mask_overlay_added: list[bool] = [False] * len(_mask_overlays)
+
+    _lames_btn: list = [None]
 
     def _toggle_lames(*_args, **_kwargs) -> None:
         actor = lames_state["actor"]
@@ -2970,13 +3260,18 @@ def _attach_controls(
                     getattr(_ov, "actor", _ov).SetVisibility(False)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Hide mask overlay %d failed: %s", _i, exc)
+        if _lames_btn[0] is not None:
+            try:
+                _lames_btn[0].switch()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             plt.render()
         except Exception:  # noqa: BLE001
             pass
 
     if lames_state["actor"] is not None:
-        plt.add_button(
+        _lames_btn[0] = plt.add_button(
             _toggle_lames,
             states=["Lames OFF", "Lames ON"],
             c=["white", "white"],
@@ -2989,6 +3284,295 @@ def _attach_controls(
     _ui_capturers.append(lambda: {
         "lames_visible": bool(lames_state["visible"]),
         "lames_step":    int(lames_state["step"]),
+    })
+
+    # ── Wind / gas particles (O₂ + CH₄) ─────────────────────────────────
+    # Two independent toggle buttons placed to the right of "Lames".  Each
+    # species owns:
+    #   • a vedo.Points actor (created lazily on first toggle-ON),
+    #   • a state dict with timer / animation cursor / per-particle phase,
+    #   • a TimerEvent observer that no-ops while the species is hidden.
+    _wind_data: dict = dict(wind_data) if wind_data else {}
+    wind_states: dict[str, dict] = {}
+
+    def _wind_make_actor(species: str) -> "object | None":  # noqa: F821
+        """Build the vedo.Points actor for ``species`` on first toggle-ON.
+
+        Picks ``display`` random (template, phase) pairs from the cached
+        trajectory pool, seeds the actor with the corresponding frame-0
+        positions, and registers an alpha LUT so each particle fades in
+        at birth and out at death (triangular ramp on its lifespan)."""
+        cfg = _wind_data.get(species)
+        if cfg is None:
+            return None
+        try:
+            import numpy as np
+            import vedo as _vedo_w
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Wind %s: vedo/numpy import failed: %s",
+                           species.upper(), exc)
+            return None
+
+        tpl        = cfg["tpl"]
+        positions  = np.ascontiguousarray(tpl["positions"], dtype=np.float32)
+        alive      = np.ascontiguousarray(tpl["alive"], dtype=bool)
+        n_tpl      = int(tpl["n_templates"])
+        n_frames   = int(tpl["n_frames"])
+        life_frm   = int(tpl["life_frames"])
+        n_disp     = int(cfg["display"])
+        if n_disp <= 0 or n_tpl <= 0 or n_frames <= 0:
+            return None
+
+        rng = np.random.default_rng(0xC0DE if species == "o2" else 0xBEEF)
+        template_idx = rng.integers(0, n_tpl, size=n_disp, dtype=np.int64)
+        phase        = rng.integers(0, n_frames, size=n_disp, dtype=np.int64)
+
+        # Birth offsets — each particle's birth frame inside its template
+        # is the start of its trajectory (frame 0 of that template), but
+        # the *display* phase is randomised so deaths/births don't pulse.
+        # Triangular life ramp peaks at lifespan/2.
+        if life_frm > 0:
+            life_t = np.arange(life_frm, dtype=np.float32) / float(life_frm)
+            life_alpha = (1.0 - np.abs(2.0 * life_t - 1.0)).astype(np.float32)
+        else:
+            life_alpha = np.ones(1, dtype=np.float32)
+
+        # Seed actor with frame-0 positions of the chosen templates.
+        pts0 = positions[template_idx, 0, :].copy()
+        col = cfg["color"]
+        col01 = (col[0] / 255.0, col[1] / 255.0, col[2] / 255.0)
+        try:
+            actor = _vedo_w.Points(pts0, r=float(cfg["point_size"]), c=col01)
+            actor.lighting("off")
+            actor.name = f"wind_{species}_particles"
+            # Configure the VTK mapper for direct RGBA so per-point alpha works.
+            # actor.alpha() must NOT be called with 0 — Property.Opacity is a
+            # global multiplier that would zero out all per-point alpha values.
+            _vtk_m = actor.actor.GetMapper()
+            _vtk_m.SetColorModeToDirectScalars()
+            _vtk_m.SetScalarModeToUsePointData()
+            _vtk_m.ScalarVisibilityOn()
+            actor.actor.GetProperty().SetOpacity(1.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Wind %s: Points actor creation failed: %s",
+                           species.upper(), exc)
+            return None
+
+        # Per-frame RGBA buffer (uint8) for fast point-color uploads.
+        rgba = np.empty((n_disp, 4), dtype=np.uint8)
+        rgba[:, 0] = col[0]
+        rgba[:, 1] = col[1]
+        rgba[:, 2] = col[2]
+        rgba[:, 3] = 0
+
+        wind_states[species]["positions"]    = positions
+        wind_states[species]["alive"]        = alive
+        wind_states[species]["template_idx"] = template_idx
+        wind_states[species]["phase"]        = phase
+        wind_states[species]["life_alpha"]   = life_alpha
+        wind_states[species]["rgba"]         = rgba
+        wind_states[species]["n_frames"]     = n_frames
+        wind_states[species]["life_frames"]  = max(life_frm, 1)
+        wind_states[species]["n_display"]    = n_disp
+        wind_states[species]["actor"]        = actor
+        logger.info(
+            "Wind %s actor built: %d particles, %d templates, "
+            "%d frames, life=%d frm, point_r=%.1f, color=(%d,%d,%d)",
+            species.upper(), n_disp, n_tpl, n_frames, max(life_frm, 1),
+            float(cfg["point_size"]), col[0], col[1], col[2],
+        )
+        try:
+            flat = positions.reshape(-1, 3)
+            bb_min = flat.min(axis=0)
+            bb_max = flat.max(axis=0)
+            vol = float(np.prod(bb_max - bb_min))
+            density = n_tpl / vol if vol > 1.0 else float("inf")
+            displ = np.linalg.norm(np.diff(positions, axis=1), axis=2)
+            mean_spd_frm = float(displ.mean())
+            fps_tpl = int(tpl.get("fps", 25))
+            mean_spd_s = mean_spd_frm * fps_tpl
+            alive_frac = 100.0 * float(alive.mean())
+            logger.info(
+                "Wind %s stats: bbox X=[%.1f,%.1f] Y=[%.1f,%.1f] Z=[%.1f,%.1f]  "
+                "vol=%.0f vox\u00b3  density=%.2e tpl/vox\u00b3  "
+                "speed=%.3f vox/frm = %.2f vox/s  "
+                "point_r=%.1f px  alive=%.1f%%",
+                species.upper(),
+                bb_min[0], bb_max[0], bb_min[1], bb_max[1], bb_min[2], bb_max[2],
+                vol, density,
+                mean_spd_frm, mean_spd_s,
+                float(cfg["point_size"]),
+                alive_frac,
+            )
+        except Exception as _se:  # noqa: BLE001
+            logger.warning("Wind %s: stats failed: %s", species.upper(), _se)
+        return actor
+
+    def _wind_apply_frame(species: str) -> None:
+        st = wind_states.get(species)
+        if st is None or st.get("actor") is None or not st["visible"]:
+            return
+        try:
+            import numpy as np
+            positions    = st["positions"]
+            alive        = st["alive"]
+            template_idx = st["template_idx"]
+            phase        = st["phase"]
+            life_alpha   = st["life_alpha"]
+            rgba         = st["rgba"]
+            n_frames     = st["n_frames"]
+            life_frames  = st["life_frames"]
+            frame        = int(st["frame"])
+
+            # Frame index along each particle's own trajectory.
+            tframe = (frame + phase) % n_frames
+            pts  = positions[template_idx, tframe, :]
+            aliv = alive[template_idx, tframe]
+            # Alpha = triangular life ramp evaluated at (tframe % life_frames).
+            life_idx = (tframe % life_frames).astype(np.int64, copy=False)
+            a = (life_alpha[life_idx] * aliv.astype(np.float32) * 255.0)
+            rgba[:, 3] = np.clip(a, 0, 255).astype(np.uint8)
+
+            actor = st["actor"]
+            actor.points = pts
+            try:
+                actor.pointcolors = rgba
+            except Exception:
+                # VTK direct fallback: write RGBA as point scalars.
+                try:
+                    from vtk.util.numpy_support import numpy_to_vtk as _n2v
+                    _arr = _n2v(rgba, deep=False, array_type=3)  # VTK_UNSIGNED_CHAR
+                    _arr.SetName("RGBA")
+                    _arr.SetNumberOfComponents(4)
+                    _vtk_pd = actor.actor.GetMapper().GetInput()
+                    _vtk_pd.GetPointData().SetScalars(_arr)
+                    _vtk_pd.GetPointData().Modified()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Wind %s frame apply failed: %s",
+                           species.upper(), exc)
+
+    def _wind_tick_factory(species: str):
+        def _tick() -> None:
+            st = wind_states.get(species)
+            if st is None or not st["visible"]:
+                return
+            st["frame"] = (int(st["frame"]) + 1) % int(st["n_frames"])
+            _wind_apply_frame(species)
+            _request_render()
+        return _tick
+
+    _iren_w = getattr(plt, "interactor", None)
+
+    def _wind_start_timer(species: str) -> None:
+        st = wind_states.get(species)
+        if st is None:
+            return
+        sub = st.get("master_sub")
+        if sub is None:
+            return
+        _master_set_enabled(sub, True)
+        st["timer_id"][0] = 1
+
+    def _wind_stop_timer(species: str) -> None:
+        st = wind_states.get(species)
+        if st is None:
+            return
+        sub = st.get("master_sub")
+        if sub is not None:
+            _master_set_enabled(sub, False)
+        st["timer_id"][0] = None
+
+    def _wind_toggle_factory(species: str):
+        def _toggle(*_a, **_kw) -> None:
+            st = wind_states[species]
+            want = not st["visible"]
+            logger.info("_wind_toggle[%s]: want=%s",
+                        species.upper(), "ON" if want else "OFF")
+            if want:
+                actor = st.get("actor")
+                if actor is None:
+                    actor = _wind_make_actor(species)
+                    if actor is None:
+                        logger.warning("Wind %s: actor unavailable.",
+                                       species.upper())
+                        return
+                try:
+                    _vtk_actor = getattr(actor, "actor", actor)
+                    if not st["added"]:
+                        plt.renderer.AddActor(_vtk_actor)
+                        st["added"] = True
+                    _vtk_actor.SetVisibility(True)
+                    st["visible"] = True
+                    _wind_apply_frame(species)
+                    _wind_start_timer(species)
+                    logger.info(
+                        "Wind %s ON: %d particles visible, timer_id=%s",
+                        species.upper(), st.get("n_display", 0),
+                        st["timer_id"][0],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Show wind %s failed: %s",
+                                   species.upper(), exc)
+            else:
+                try:
+                    _wind_stop_timer(species)
+                    st["visible"] = False
+                    actor = st.get("actor")
+                    if actor is not None:
+                        getattr(actor, "actor", actor).SetVisibility(False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Hide wind %s failed: %s",
+                                   species.upper(), exc)
+            if st.get("btn") and st["btn"][0] is not None:
+                try:
+                    st["btn"][0].switch()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                plt.render()
+            except Exception:  # noqa: BLE001
+                pass
+        return _toggle
+
+    # Initialise per-species state and register one TimerEvent observer
+    # per loaded species (no-ops while the species is hidden).
+    _wind_button_layout = {
+        "o2":  {"pos": (0.12, 0.04), "labels": ["O₂ OFF",  "O₂ ON"],
+                "bc":  ["#1a4f7a", "#e8f4ff"]},
+        "ch4": {"pos": (0.22, 0.04), "labels": ["CH₄ OFF", "CH₄ ON"],
+                "bc":  ["#4f3a1a", "#ffd470"]},
+    }
+    for _sp in ("o2", "ch4"):
+        if _sp not in _wind_data:
+            continue
+        wind_states[_sp] = {
+            "actor":    None,
+            "visible":  False,
+            "added":    False,
+            "frame":    0,
+            "timer_id": [None],
+            "btn":      [None],
+        }
+        _tick_cb = _wind_tick_factory(_sp)
+        wind_states[_sp]["master_sub"] = _master_register(
+            f"wind_{_sp}", _tick_cb, int(WIND_TICK_MS), enabled=False,
+        )
+        _layout = _wind_button_layout[_sp]
+        wind_states[_sp]["btn"][0] = plt.add_button(
+            _wind_toggle_factory(_sp),
+            states=_layout["labels"],
+            c=["white", "black"],
+            bc=_layout["bc"],
+            pos=_layout["pos"],
+            size=14,
+            bold=True,
+        )
+
+    _ui_capturers.append(lambda: {
+        f"wind_{_sp}_visible": bool(wind_states.get(_sp, {}).get("visible", False))
+        for _sp in ("o2", "ch4") if _sp in wind_states
     })
 
     def _make_arrows_actor(data):
@@ -3647,7 +4231,7 @@ def _attach_controls(
                 vmin, vmax, value=astate[key],
                 pos=((x1, y), (x2, y)),
                 title=f"arr·{key}",
-                title_size=0.7,
+                title_size=0.4,
                 show_value=True,
             )
             arrow_sliders.append(sw)
@@ -3669,7 +4253,7 @@ def _attach_controls(
                 0.0, 1.0, value=pillars_state["hue_shift"],
                 pos=((x1, 0.10), (x2, 0.10)),
                 title="pillars·hue",
-                title_size=0.7,
+                title_size=0.4,
                 show_value=True,
             )
             arrow_sliders.append(_pillars_hue_slider)
@@ -3731,9 +4315,9 @@ def _attach_controls(
             _refresh_pillars_visibility()
             in_arrows = _is_arrows_mode(new_mode)
             for s in mesh_sliders:
-                _set_widget_visible(s, not in_arrows)
+                _set_widget_visible(s, not in_arrows and _gauge_state["on"])
             for s in arrow_sliders:
-                _set_widget_visible(s, in_arrows)
+                _set_widget_visible(s, in_arrows and _gauge_state["on"])
             _set_button_visible(_cmap_btn, in_arrows)
             if _density_btn is not None:
                 _set_button_visible(
@@ -3771,7 +4355,7 @@ def _attach_controls(
             "mesh_bridges":  "Mesh ▸ Cortical bridges",
             "mesh_all":      "Mesh ▸ All watered tissues",
             "arrows_grid":   "Arrows ▸ grid",
-            "arrows_tracks": "Arrows ▸ tracks",
+            "arrows_tracks": "Conduction ▸ shorter paths",
         }
 
         def _refresh_view_buttons():
@@ -4088,13 +4672,15 @@ def _attach_controls(
         if not _ship_any_active():
             _stop_ship_timer()
 
-    def _ship_tick(_obj=None, _ev=None) -> None:
+    def _ship_tick() -> None:
+        # Ignore ticks when not in Spaceship sub-mode.
+        if _nav_mode[0] != 1:
+            return
         if not _ship_any_active():
             _ship["last_t"] = None
-            # Kill the repeating timer when idle so VTK's trackball
-            # interactor stops receiving TimerEvents (which would
-            # otherwise re-apply the last rotate/pan delta and feel
-            # like inertia during a click-and-drag).
+            # Disable the master sub when idle so the master timer
+            # itself can stop — needed to restore the vanilla,
+            # inertia-free trackball feel during click-and-drag.
             _stop_ship_timer()
             return
         now = _time_ship.perf_counter()
@@ -4146,55 +4732,40 @@ def _attach_controls(
                     plt.renderer.ResetCameraClippingRange()
                 except Exception:  # noqa: BLE001
                     pass
-
-        try:
-            plt.render()
-        except Exception:  # noqa: BLE001
-            pass
+            _request_render()
 
     _iren_ship = getattr(plt, "interactor", None)
     _ship_timer_id: list = [None]
+    _ship_sub = _master_register("ship", _ship_tick, _MASTER_TICK_MS,
+                                 enabled=False)
 
     def _ensure_ship_timer() -> None:
-        """Create the repeating timer on demand.
+        """Enable the ship subsystem in the master scheduler.
 
-        We *only* keep the timer alive while the ship is actually
-        moving, because VTK's ``vtkInteractorStyleTrackballCamera``
-        responds to every ``TimerEvent`` by re-applying the last
-        rotate/pan/zoom delta when a mouse button is held — which
-        makes the trackball feel like it has inertia.  Killing the
-        timer when v ≡ 0 restores the vanilla trackball behaviour.
+        We *only* keep the subsystem (and therefore the master timer)
+        active while the ship is actually moving, because VTK's
+        ``vtkInteractorStyleTrackballCamera`` responds to every
+        ``TimerEvent`` by re-applying the last rotate/pan/zoom delta
+        when a mouse button is held — which makes the trackball feel
+        like it has inertia.  Disabling the sub when v ≡ 0 lets the
+        master timer stop and restores the vanilla trackball behaviour.
         """
-        if _iren_ship is None or _ship_timer_id[0] is not None:
+        if _iren_ship is None:
             return
-        try:
-            _ship_timer_id[0] = _iren_ship.CreateRepeatingTimer(40)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Navigating-observer-thrust timer could not start: %s", exc,
-            )
+        _master_set_enabled(_ship_sub, True)
+        _ship_timer_id[0] = 1
 
     def _stop_ship_timer() -> None:
-        if _iren_ship is None or _ship_timer_id[0] is None:
+        if _iren_ship is None:
             return
-        try:
-            _iren_ship.DestroyTimer(_ship_timer_id[0])
-        except Exception:  # noqa: BLE001
-            pass
+        _master_set_enabled(_ship_sub, False)
         _ship_timer_id[0] = None
 
     if _iren_ship is not None:
-        try:
-            _iren_ship.AddObserver("TimerEvent", _ship_tick)
-            logger.info(
-                "Navigating-observer-thrust observer attached "
-                "(timer created on demand)."
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Navigating-observer-thrust observer could not attach: %s",
-                exc,
-            )
+        logger.info(
+            "Navigating-observer-thrust sub registered "
+            "(master scheduler, on demand)."
+        )
 
     # Button factories (vedo passes (button, event) -- accept *args).
     def _mk_bump(kind, axis, sign):
@@ -4226,34 +4797,41 @@ def _attach_controls(
     #       [ ↓ ]
     # [FWD][STOP][BCK]
     _t_rows = [0.40, 0.36, 0.32, 0.28]
-    plt.add_button(_mk_bump("t", 2, +1), states=["▲"],
-                   pos=(_SHIP_X_C, _t_rows[0]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_T_FG], bc=[_SHIP_T_BG])
-    plt.add_button(_mk_bump("t", 1, -1), states=["◀"],
-                   pos=(_SHIP_X_L, _t_rows[1]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_T_FG], bc=[_SHIP_T_BG])
-    plt.add_button(_mk_bump("t", 1, +1), states=["▶"],
-                   pos=(_SHIP_X_R, _t_rows[1]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_T_FG], bc=[_SHIP_T_BG])
-    plt.add_button(_mk_bump("t", 2, -1), states=["▼"],
-                   pos=(_SHIP_X_C, _t_rows[2]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_T_FG], bc=[_SHIP_T_BG])
-    plt.add_button(_mk_bump("t", 0, +1), states=["FWD"],
-                   pos=(_SHIP_X_L, _t_rows[3]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_T_FG], bc=[_SHIP_T_BG])
-    plt.add_button(_mk_stop("t"),        states=["STOP"],
-                   pos=(_SHIP_X_C, _t_rows[3]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_STOP_FG], bc=[_SHIP_STOP_BG])
-    plt.add_button(_mk_bump("t", 0, -1), states=["BCK"],
-                   pos=(_SHIP_X_R, _t_rows[3]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_T_FG], bc=[_SHIP_T_BG])
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("t", 2, +1), states=["▲"],
+        pos=(_SHIP_X_C, _t_rows[0]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("t", 1, -1), states=["◀"],
+        pos=(_SHIP_X_L, _t_rows[1]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("t", 1, +1), states=["▶"],
+        pos=(_SHIP_X_R, _t_rows[1]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("t", 2, -1), states=["▼"],
+        pos=(_SHIP_X_C, _t_rows[2]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("t", 0, +1), states=["FWD"],
+        pos=(_SHIP_X_L, _t_rows[3]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_stop("t"), states=["STOP"],
+        pos=(_SHIP_X_C, _t_rows[3]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_STOP_FG], bc=[_SHIP_STOP_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("t", 0, -1), states=["BCK"],
+        pos=(_SHIP_X_R, _t_rows[3]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
 
     # Rotation panel (lower).
     #       [ P↑ ]
@@ -4261,36 +4839,43 @@ def _attach_controls(
     #       [ P↓ ]
     # [R⟲ ][STOP ][ R⟳]
     _r_rows = [0.20, 0.16, 0.12, 0.08]
-    plt.add_button(_mk_bump("r", 1, +1), states=["P▲"],
-                   pos=(_SHIP_X_C, _r_rows[0]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_R_FG], bc=[_SHIP_R_BG])
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("r", 1, +1), states=["P▲"],
+        pos=(_SHIP_X_C, _r_rows[0]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
     # Yaw signs flipped so that the arrow direction matches the
     # actual rotation of the view (cam.Yaw(+deg) swings view left).
-    plt.add_button(_mk_bump("r", 0, +1), states=["Y◀"],
-                   pos=(_SHIP_X_L, _r_rows[1]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_R_FG], bc=[_SHIP_R_BG])
-    plt.add_button(_mk_bump("r", 0, -1), states=["Y▶"],
-                   pos=(_SHIP_X_R, _r_rows[1]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_R_FG], bc=[_SHIP_R_BG])
-    plt.add_button(_mk_bump("r", 1, -1), states=["P▼"],
-                   pos=(_SHIP_X_C, _r_rows[2]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_R_FG], bc=[_SHIP_R_BG])
-    plt.add_button(_mk_bump("r", 2, -1), states=["R↺"],
-                   pos=(_SHIP_X_L, _r_rows[3]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_R_FG], bc=[_SHIP_R_BG])
-    plt.add_button(_mk_stop("r"),        states=["STOP"],
-                   pos=(_SHIP_X_C, _r_rows[3]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_STOP_FG], bc=[_SHIP_STOP_BG])
-    plt.add_button(_mk_bump("r", 2, +1), states=["R↻"],
-                   pos=(_SHIP_X_R, _r_rows[3]),
-                   size=_SHIP_SIZE, bold=True,
-                   c=[_SHIP_R_FG], bc=[_SHIP_R_BG])
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("r", 0, +1), states=["Y◀"],
+        pos=(_SHIP_X_L, _r_rows[1]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("r", 0, -1), states=["Y▶"],
+        pos=(_SHIP_X_R, _r_rows[1]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("r", 1, -1), states=["P▼"],
+        pos=(_SHIP_X_C, _r_rows[2]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("r", 2, -1), states=["R↺"],
+        pos=(_SHIP_X_L, _r_rows[3]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_stop("r"), states=["STOP"],
+        pos=(_SHIP_X_C, _r_rows[3]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_STOP_FG], bc=[_SHIP_STOP_BG]))
+    _ship_buttons.append(plt.add_button(
+        _mk_bump("r", 2, +1), states=["R↻"],
+        pos=(_SHIP_X_R, _r_rows[3]),
+        size=_SHIP_SIZE, bold=True,
+        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
 
     # ─── Restart navigation ────────────────────────────────────────────
     # Zeroes all thrust velocities and restores the initial camera
@@ -4308,6 +4893,22 @@ def _attach_controls(
         # vanilla, inertia-free feel immediately.
         try:
             _stop_ship_timer()
+        except Exception:  # noqa: BLE001
+            pass
+        # Reset airplane mode state (intents + velocities + timer).
+        try:
+            for _k in list(_plane_held.keys()):
+                _plane_held[_k] = False
+                _plane_release_at[_k] = None
+                _plane_kbd_held[_k] = False
+                _plane_intent_until[_k] = 0.0
+            _plane["fwd_v"] = 0.0
+            _plane["fwd_a"] = 0.0
+            _plane["v_yaw"] = 0.0
+            _plane["v_pitch"] = 0.0
+            _plane["v_roll"] = 0.0
+            _plane["last_t"] = None
+            _stop_plane_timer()
         except Exception:  # noqa: BLE001
             pass
         # Restore the initial camera.
@@ -4338,15 +4939,872 @@ def _attach_controls(
         except Exception:  # noqa: BLE001
             pass
 
-    plt.add_button(
+    _restart_nav_btn_ref[0] = plt.add_button(
         _restart_nav_cb,
-        states=["Restart navigation"],
+        states=["Restart ↺"],
         c=["white"],
         bc=["#4527a0"],   # deep indigo, distinct from the STOP red
-        pos=(_SHIP_X_C, 0.44),   # just above the translation panel
+        pos=(_SHIP_X_C, 0.44),   # just above the movement panels
         size=14,
         bold=True,
     )
+
+    # ─── Nav mode switch (Avion / Spaceship / Custom) ───────────────────
+    # Single button in the left panel to cycle between the three
+    # navigation sub-modes.  Visible whenever the interaction style is
+    # "Navigation (buttons)".
+    _NAV_MODE_NAMES = ["Avion", "Spaceship", "Custom"]
+
+    def _cycle_nav_mode_cb(*_a, **_kw):
+        old_mode = _nav_mode[0]
+        new_mode = (old_mode + 1) % len(_NAV_MODE_NAMES)
+        _nav_mode[0] = new_mode
+        # Stop any ongoing motion from the previous mode.
+        if old_mode == 0:   # leaving Avion
+            try:
+                for _k in list(_plane_held.keys()):
+                    _plane_held[_k] = False
+                    _plane_release_at[_k] = None
+                    _plane_kbd_held[_k] = False
+                    _plane_intent_until[_k] = 0.0
+                _plane["fwd_v"] = 0.0
+                _plane["fwd_a"] = 0.0
+                _plane["v_yaw"] = 0.0
+                _plane["v_pitch"] = 0.0
+                _plane["v_roll"] = 0.0
+                _plane["last_t"] = None
+                _stop_plane_timer()
+            except Exception:  # noqa: BLE001
+                pass
+        elif old_mode == 1:  # leaving Spaceship
+            try:
+                _ship["v_world"] = _np_ship.zeros(3, dtype=_np_ship.float64)
+                for _i in range(3):
+                    _ship["v_r"][_i] = 0.0
+                _ship["last_t"] = None
+                _stop_ship_timer()
+            except Exception:  # noqa: BLE001
+                pass
+        _nav_mode_btn_ref[0].switch()
+        _refresh_nav_panel_visibility()
+        _show_status(f"Navigation mode: {_NAV_MODE_NAMES[new_mode]}")
+        plt.render()
+
+    _nav_mode_btn_ref[0] = plt.add_button(
+        _cycle_nav_mode_cb,
+        states=[f"Nav ▸ {n}" for n in _NAV_MODE_NAMES],
+        c=["white"] * len(_NAV_MODE_NAMES),
+        bc=["#1565c0", "#0d47a1", "#455a64"],
+        pos=(_SHIP_X_C, 0.48),
+        size=14,
+        bold=True,
+    )
+
+    # ─── Airplane mode physics ───────────────────────────────────────────
+    # See the "Airplane control model (state-based)" block below for the
+    # full description.  In short: held key / clicked button refreshes
+    # an intent; per-tick integrator drives forward and per-axis
+    # angular velocities toward the corresponding target asymptotes.
+    try:
+        _xmn2, _xmx2, _ymn2, _ymx2, _zmn2, _zmx2 = mesh.bounds()
+        _scene_diag_plane = float(
+            ((_xmx2 - _xmn2) ** 2 + (_ymx2 - _ymn2) ** 2 + (_zmx2 - _zmn2) ** 2) ** 0.5
+        )
+        _scene_max_side_plane = float(
+            max(_xmx2 - _xmn2, _ymx2 - _ymn2, _zmx2 - _zmn2)
+        )
+    except Exception:  # noqa: BLE001
+        _scene_diag_plane = _scene_diag_ship
+        _scene_max_side_plane = _scene_diag_ship
+
+    # ─── Airplane control model (state-based) ───────────────────────────
+    # Replaces the previous Hamming-window queue approach with a
+    # continuous-state integrator inspired by classic action-game flight
+    # controls:
+    #
+    #   * Per-axis angular velocity (deg/s) and a scalar forward
+    #     velocity (units/s) are stored in ``_plane``.  Each tick they
+    #     exponentially approach a target value derived from the
+    #     "intents" currently active.
+    #   * An "intent" is a (timestamped) request to move in some
+    #     direction.  A KeyPress refreshes the intent for that
+    #     direction; subsequent KeyRelease (filtered via a short
+    #     grace period to ignore X11 autorepeat fake-releases) clears
+    #     it.  An on-screen button click refreshes the same intent
+    #     for ``_BUTTON_HOLD_S`` seconds, so a single click feels like
+    #     a brief tap on the equivalent key.
+    #
+    # Consequences:
+    #   * Tap a key  → velocity rises a little then decays back to 0.
+    #   * Hold a key → velocity exponentially approaches the asymptote
+    #     (MAX_FWD or ±MAX_DPS).
+    #   * Release    → velocity decays to 0 over ~tau_release seconds.
+    #   * Tap + hold give the same "logarithmic" throttle feel: short
+    #     presses for micro-tissue precision, longer holds for fast
+    #     scene traversal, with a hard cap at MAX_FWD = one X-axis
+    #     length per second.
+    import math as _math_plane
+
+    # Caps.
+    _PLANE_MAX_FWD = float(_scene_max_side_plane)   # units/s (≈ X-length / s)
+    _PLANE_MAX_DPS = 10.0                            # deg/s, per the user spec
+    _PLANE_ROT_DEG = 2.0  # button-click micro-impulse magnitude (legacy)
+
+    # ── Forward: acceleration-control model ──────────────────────────────
+    # The pilot controls acceleration, not velocity directly.
+    #   * PgUp held  → fwd_a ramps toward MAX_ACCEL (tau_a_atk).
+    #   * PgUp released → fwd_a decays quickly to 0 (tau_a_rel);
+    #     fwd_v is NOT touched — achieved speed is maintained.
+    #   * PgDown held → hard brake: fwd_a zeroed, fwd_v decays toward 0
+    #     at tau_brake rate.  Braking is intentionally faster than accel.
+    #   * PgDown released → velocity holds at its current (lower) value.
+    # This gives the "logarithmic" range: a tap adds a tiny velocity
+    # increment (great for micro-tissue), a long hold lets speed grow
+    # toward MAX_FWD (good for scene traversal).
+    _PLANE_MAX_ACCEL    = _PLANE_MAX_FWD / 3.0  # reach MAX_FWD in ≈3 s continuous hold
+    _PLANE_TAU_FWD_A_ATK = 0.50   # s — accel ramps up while PgUp held
+    _PLANE_TAU_FWD_A_REL = 0.08   # s — accel snaps to 0 on release (vel holds)
+    _PLANE_TAU_BRAKE     = 0.22   # s — velocity kill while PgDown held
+
+    # ── Rotation ──────────────────────────────────────────────────────────
+    _PLANE_TAU_ROT_ATK = 0.15   # s — held → ramp up to ±MAX_DPS
+    _PLANE_TAU_ROT_REL = 0.06   # s — released → snap to 0 quickly
+
+    # ── Press / release tracking (replaces the previous timeout model) ─
+    # The old model relied on OS keyboard autorepeat to *refresh* an
+    # intent every ~30-50ms.  That assumption is wrong on every modern
+    # desktop OS: the keyboard autorepeat *initial delay* is ~500ms,
+    # not ~50ms.  Symptom: a key press caused a tiny initial motion,
+    # then ~500ms of stillness, then continuous motion once autorepeat
+    # kicked in.  In addition, when other heavy timers (lames, wind,
+    # membranes) stalled the event loop, queued autorepeat KeyPress
+    # events kept refreshing the intent long after the user released
+    # the key — producing seconds-long "phantom" motion.
+    #
+    # The current model tracks press/release explicitly:
+    #   * KeyPress  → set held=True (cancel any pending release).
+    #   * KeyRelease → schedule release after _KEY_RELEASE_GRACE_S to
+    #                   filter X11's fake releases between autorepeat
+    #                   presses (X11 sends a Release immediately
+    #                   followed by a Press when autorepeating).
+    #   * Button click → set held=True with a short auto-release
+    #                   timer (acts like a brief tap).
+    # An on-screen button click acts like a brief tap via a scheduled
+    # auto-release at now + _BUTTON_HOLD_S.
+    _KEY_RELEASE_GRACE_S = 0.030  # 30ms: filters X11 fake-releases (gap ≪ 5ms); 1 tick   # ≥ typical X11 autorepeat interval (~30-50 ms)
+    _BUTTON_HOLD_S       = 0.20
+
+    # Threshold below which velocity / accel are snapped to zero.
+    _PLANE_V_EPS = _PLANE_MAX_FWD / 5000.0
+    _PLANE_A_EPS = _PLANE_MAX_ACCEL / 1000.0
+
+    _plane = {
+        "fwd_v":   0.0,   # forward velocity (units/s)  — persists on release
+        "fwd_a":   0.0,   # forward acceleration (units/s²) — pilot's control lever
+        "v_yaw":   0.0,   # angular velocities (deg/s)
+        "v_pitch": 0.0,
+        "v_roll":  0.0,
+        "last_t":  None,
+    }
+
+    # Per-intent "currently held" flag (True while the user is actively
+    # commanding that direction).  Updated by press / release callbacks
+    # and consumed by ``_plane_tick``.
+    _plane_held: dict[str, bool] = {
+        "fwd": False, "bck": False,
+        "yaw_l": False, "yaw_r": False,
+        "pitch_u": False, "pitch_d": False,
+        "roll_l": False, "roll_r": False,
+    }
+    # Per-intent scheduled release timestamp (None = no pending release).
+    # ``_plane_tick`` flips ``_plane_held[k]`` to False once now ≥ this
+    # value.  Used both for the X11 grace period after KeyRelease and
+    # for the auto-release timer of button taps.
+    _plane_release_at: dict[str, float | None] = {k: None for k in _plane_held}
+    # Fallback "KeyPress without matching KeyRelease yet" flags. Only
+    # consulted when X11 polling is unavailable.
+    _plane_kbd_held: dict[str, bool] = {k: False for k in _plane_held}
+    # Per-intent button-tap auto-release deadline (0.0 = inactive).
+    _plane_intent_until: dict[str, float] = {k: 0.0 for k in _plane_held}
+
+    _iren_plane = getattr(plt, "interactor", None)
+
+    # ── X11 keyboard polling (primary input source) ──────────────────
+    # Polling avoids OS autorepeat latency (~500ms initial delay) and
+    # dropped-release races: we ask the X server every tick which keys
+    # are physically down right now.
+    _AVION_KEYCODES: dict[str, list[int]] = {}
+    try:
+        from Xlib import display as _x_display_mod, XK as _x_XK_mod
+        _x_disp_plane = _x_display_mod.Display()
+        logger.info("X11 keyboard polling available for Avion mode.")
+    except Exception as _exc:  # noqa: BLE001
+        _x_disp_plane = None
+        _x_XK_mod = None
+        logger.info(
+            "X11 keyboard polling unavailable (%s); "
+            "falling back to event-driven press/release.",
+            _exc,
+        )
+
+    def _x11_resolve_keycodes(keysym_names) -> list[int]:
+        """Resolve a set of X11 keysym names to a list of keycodes."""
+        if _x_disp_plane is None or _x_XK_mod is None:
+            return []
+        out: list[int] = []
+        for name in keysym_names:
+            try:
+                ks = _x_XK_mod.string_to_keysym(name)
+                if not ks:
+                    continue
+                kc = _x_disp_plane.keysym_to_keycode(ks)
+                if kc:
+                    out.append(int(kc))
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _poll_plane_keys():
+        """Return {intent: is_physically_down} or None if X11 polling
+        is unavailable."""
+        if _x_disp_plane is None:
+            return None
+        try:
+            keymap = _x_disp_plane.query_keymap()
+        except Exception:  # noqa: BLE001
+            return None
+        out: dict[str, bool] = {}
+        for intent, kcs in _AVION_KEYCODES.items():
+            down = False
+            for kc in kcs:
+                if 0 <= kc < 256 and (keymap[kc >> 3] >> (kc & 7)) & 1:
+                    down = True
+                    break
+            out[intent] = down
+        return out
+
+    # Master-scheduler subscription; populated after _plane_tick is
+    # defined.  Legacy slot kept for code that checks "is running".
+    _plane_sub_ref: list = [None]
+    _plane_timer_id: list = [None]
+
+    def _ensure_plane_timer() -> None:
+        sub = _plane_sub_ref[0]
+        if sub is not None:
+            _master_set_enabled(sub, True)
+            _plane_timer_id[0] = 1
+
+    def _stop_plane_timer() -> None:
+        sub = _plane_sub_ref[0]
+        if sub is not None:
+            _master_set_enabled(sub, False)
+            _plane_timer_id[0] = None
+
+    def _plane_key_press(intent: str) -> None:
+        """Keyboard press fallback (used when X11 polling is
+        unavailable; ignored when polling is active)."""
+        _plane_kbd_held[intent] = True
+        _plane_release_at[intent] = None
+        _ensure_plane_timer()
+
+    def _plane_key_release(intent: str) -> None:
+        """Keyboard release fallback: schedule a release after a short
+        grace period to filter X11 fake-releases from autorepeat."""
+        _plane_release_at[intent] = (
+            _time_ship.perf_counter() + _KEY_RELEASE_GRACE_S
+        )
+        _ensure_plane_timer()
+
+    def _plane_button_tap(intent: str) -> None:
+        """On-screen button click: set an auto-release deadline so the
+        click behaves like a brief key tap."""
+        _plane_intent_until[intent] = (
+            _time_ship.perf_counter() + _BUTTON_HOLD_S
+        )
+        _ensure_plane_timer()
+
+    def _plane_tick() -> None:
+        """Integrate plane velocities toward the held-intent targets and
+        translate / rotate the camera accordingly.
+
+        Dispatched by the master scheduler (no obj/event params)."""
+        if _nav_mode[0] != 0:
+            return
+
+        now = _time_ship.perf_counter()
+
+        # Primary input: poll the X server for physically-held keys.
+        polled = _poll_plane_keys()
+
+        # Apply pending fallback releases (X11 grace + button auto-release).
+        for _k, _rel_t in list(_plane_release_at.items()):
+            if _rel_t is not None and now >= _rel_t:
+                _plane_kbd_held[_k] = False
+                _plane_release_at[_k] = None
+
+        # Compose final per-intent held state from all sources.
+        for _k in _plane_held:
+            poll_down = bool(polled.get(_k, False)) if polled is not None else False
+            kbd_down = _plane_kbd_held[_k]
+            btn_down = _plane_intent_until[_k] > now
+            _plane_held[_k] = poll_down or kbd_down or btn_down
+
+
+        def _held(name: str) -> bool:
+            return _plane_held[name]
+
+        # ── 1. Resolve targets from current intents ─────────────────
+        fwd_h, bck_h = _held("fwd"), _held("bck")
+        any_fwd_intent = fwd_h or bck_h
+
+        yl, yr = _held("yaw_l"), _held("yaw_r")
+        target_yaw = (+_PLANE_MAX_DPS if yl and not yr
+                      else -_PLANE_MAX_DPS if yr and not yl
+                      else 0.0)
+        any_yaw_intent = yl or yr
+
+        pu, pd = _held("pitch_u"), _held("pitch_d")
+        target_pitch = (+_PLANE_MAX_DPS if pu and not pd
+                        else -_PLANE_MAX_DPS if pd and not pu
+                        else 0.0)
+        any_pitch_intent = pu or pd
+
+        rl, rr = _held("roll_l"), _held("roll_r")
+        target_roll = (+_PLANE_MAX_DPS if rl and not rr
+                       else -_PLANE_MAX_DPS if rr and not rl
+                       else 0.0)
+        any_roll_intent = rl or rr
+
+        # ── 2. Compute dt (skip the very first tick) ─────────────────
+        if _plane["last_t"] is None:
+            _plane["last_t"] = now
+            return
+        dt = now - _plane["last_t"]
+        _plane["last_t"] = now
+        if dt <= 0.0 or dt > 1.0:
+            return
+        # Cap dt so a delayed tick (blocked by heavy lames / wind tick)
+        # doesn’t cause a large camera lurch.
+        dt = min(dt, 0.100)
+
+        # ── 3. Integrate forward acceleration → velocity ─────────────
+        def _expd(cur: float, target: float, tau: float) -> float:
+            return cur + (target - cur) * (1.0 - _math_plane.exp(-dt / tau))
+
+        if bck_h:
+            # Hard brake: kill acceleration, exponentially decay velocity.
+            _plane["fwd_a"] = 0.0
+            _plane["fwd_v"] = _expd(_plane["fwd_v"], 0.0, _PLANE_TAU_BRAKE)
+        else:
+            # Acceleration lever: ramps up while fwd held, snaps to 0 on
+            # release — velocity is *not* touched, it holds at current value.
+            target_a = _PLANE_MAX_ACCEL if fwd_h else 0.0
+            tau_a    = _PLANE_TAU_FWD_A_ATK if fwd_h else _PLANE_TAU_FWD_A_REL
+            _plane["fwd_a"] = _expd(_plane["fwd_a"], target_a, tau_a)
+            _plane["fwd_v"] = max(
+                0.0,
+                min(_plane["fwd_v"] + _plane["fwd_a"] * dt, _PLANE_MAX_FWD),
+            )
+
+        # ── 4. Integrate rotation velocities ─────────────────────────
+        _plane["v_yaw"]   = _expd(_plane["v_yaw"],   target_yaw,
+                                   _PLANE_TAU_ROT_ATK if any_yaw_intent
+                                   else _PLANE_TAU_ROT_REL)
+        _plane["v_pitch"] = _expd(_plane["v_pitch"], target_pitch,
+                                   _PLANE_TAU_ROT_ATK if any_pitch_intent
+                                   else _PLANE_TAU_ROT_REL)
+        _plane["v_roll"]  = _expd(_plane["v_roll"],  target_roll,
+                                   _PLANE_TAU_ROT_ATK if any_roll_intent
+                                   else _PLANE_TAU_ROT_REL)
+
+        # Snap tiny residuals to zero so the timer can sleep.
+        if abs(_plane["fwd_a"]) < _PLANE_A_EPS and not fwd_h:
+            _plane["fwd_a"] = 0.0
+        if abs(_plane["fwd_v"]) < _PLANE_V_EPS and not any_fwd_intent:
+            _plane["fwd_v"] = 0.0
+        for k, intent_active in (("v_yaw",   any_yaw_intent),
+                                  ("v_pitch", any_pitch_intent),
+                                  ("v_roll",  any_roll_intent)):
+            if abs(_plane[k]) < 1e-3 and not intent_active:
+                _plane[k] = 0.0
+
+        # ── 5. Idle?  Stop the timer until the next intent. ──────────
+        any_motion = (
+            _plane["fwd_v"] != 0.0
+            or _plane["fwd_a"] != 0.0
+            or _plane["v_yaw"] != 0.0
+            or _plane["v_pitch"] != 0.0
+            or _plane["v_roll"] != 0.0
+        )
+        any_intent = (any_fwd_intent or any_yaw_intent
+                      or any_pitch_intent or any_roll_intent)
+        any_pending_release = any(
+            t is not None for t in _plane_release_at.values()
+        )
+        if not any_motion and not any_intent and not any_pending_release:
+            _plane["last_t"] = None
+            _stop_plane_timer()
+            return
+
+        # ── 6. Apply camera motion ───────────────────────────────────
+        # Clamp per-frame rotation to MAX_DPS * dt so step-size stays
+        # geometrically reasonable even if dt happens to be large.
+        rot_deg = {
+            "yaw":   _plane["v_yaw"]   * dt,
+            "pitch": _plane["v_pitch"] * dt,
+            "roll":  _plane["v_roll"]  * dt,
+        }
+        has_rot = any(abs(v) > 1e-9 for v in rot_deg.values())
+
+        cam = plt.camera
+        moved = False
+        try:
+            if has_rot:
+                fp  = np.asarray(cam.GetFocalPoint(), dtype=float)
+                pos = np.asarray(cam.GetPosition(),   dtype=float)
+                vu  = np.asarray(cam.GetViewUp(),     dtype=float)
+                fwd = fp - pos
+                dist = float(np.linalg.norm(fwd))
+                if dist < 1e-12:
+                    fwd = np.array([0., 0., -1.]); dist = 1.0
+                else:
+                    fwd /= dist
+                right = np.cross(fwd, vu)
+                rn = float(np.linalg.norm(right))
+                right = right / rn if rn > 1e-12 else np.array([1., 0., 0.])
+                up = np.cross(right, fwd)
+                un = float(np.linalg.norm(up))
+                up = up / un if un > 1e-12 else vu / max(float(np.linalg.norm(vu)), 1e-12)
+
+                def _rod(v, ax, rad):
+                    c, s = _math_plane.cos(rad), _math_plane.sin(rad)
+                    return v * c + np.cross(ax, v) * s + ax * float(np.dot(ax, v)) * (1.0 - c)
+
+                for _ax_name, _ax_vec in [("yaw", up), ("pitch", right), ("roll", fwd)]:
+                    _deg = rot_deg[_ax_name]
+                    if abs(_deg) > 1e-12:
+                        _rad = _math_plane.radians(_deg)
+                        fwd   = _rod(fwd,  _ax_vec, _rad)
+                        up    = _rod(up,   _ax_vec, _rad)
+                        right = np.cross(fwd, up)
+                        rn = float(np.linalg.norm(right))
+                        if rn > 1e-12:
+                            right /= rn
+                        up = np.cross(right, fwd)
+                        un = float(np.linalg.norm(up))
+                        if un > 1e-12:
+                            up /= un
+
+                cam.SetFocalPoint(*(pos + fwd * dist))
+                cam.SetViewUp(*up)
+                moved = True
+                _refresh_ortho()
+
+            if abs(_plane["fwd_v"]) > 0.0:
+                fwd_now = np.asarray(cam.GetDirectionOfProjection(),
+                                     dtype=float)
+                fn = float(np.linalg.norm(fwd_now))
+                if fn > 1e-12:
+                    fwd_now /= fn
+                    delta = fwd_now * _plane["fwd_v"] * dt
+                    cam.SetPosition(*(np.asarray(cam.GetPosition(),
+                                                 dtype=float) + delta))
+                    cam.SetFocalPoint(*(np.asarray(cam.GetFocalPoint(),
+                                                   dtype=float) + delta))
+                    moved = True
+
+            if moved:
+                try:
+                    for _ren in plt.renderers:
+                        _ren.ResetCameraClippingRange()
+                except Exception:  # noqa: BLE001
+                    try:
+                        plt.renderer.ResetCameraClippingRange()
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            return
+
+        if moved:
+            _request_render()
+
+    # Register the plane tick with the master scheduler.  The master
+    # timer is created on-demand the first time any subsystem enables
+    # its sub, so plane motion never pays for a permanently-running
+    # timer (which would also feed vtkInteractorStyleTrackballCamera
+    # inertia during mouse drags).
+    _plane_sub_ref[0] = _master_register(
+        "plane", _plane_tick, _MASTER_TICK_MS, enabled=False,
+    )
+
+    # Resolve X11 keycodes now that the _AVION_KEYS_* sets exist below;
+    # we populate _AVION_KEYCODES after their definition.
+
+    # ── Button callbacks (kept under the same names so the existing
+    #    button wiring below works untouched). Each click registers a
+    #    brief virtual press on the matching intent; the integrator
+    #    handles the actual ramp / decay.
+    def _plane_fwd(*_a, **_kw):
+        _plane_button_tap("fwd")
+        _show_status("Avion: ↑ avant")
+
+    def _plane_bck(*_a, **_kw):
+        _plane_button_tap("bck")
+        _show_status("Avion: ↓ arrière")
+
+    def _plane_stop(*_a, **_kw):
+        # Hard stop: zero all velocities + acceleration, clear intents, kill timer.
+        for k in list(_plane_held.keys()):
+            _plane_held[k] = False
+            _plane_release_at[k] = None
+            _plane_kbd_held[k] = False
+            _plane_intent_until[k] = 0.0
+        _plane["fwd_v"] = 0.0
+        _plane["fwd_a"] = 0.0
+        _plane["v_yaw"] = 0.0
+        _plane["v_pitch"] = 0.0
+        _plane["v_roll"] = 0.0
+        _plane["last_t"] = None
+        _stop_plane_timer()
+        _show_status("Avion: STOP")
+
+    # Maps a button-click ``(axis, sign)`` to the intent name the new
+    # state-based controller understands.
+    _PLANE_ROT_INTENT = {
+        ("yaw",   +1.0): "yaw_l",   ("yaw",   -1.0): "yaw_r",
+        ("pitch", +1.0): "pitch_u", ("pitch", -1.0): "pitch_d",
+        ("roll",  +1.0): "roll_l",  ("roll",  -1.0): "roll_r",
+    }
+
+    def _mk_plane_rot(axis: str, deg: float):
+        intent = _PLANE_ROT_INTENT[(axis, 1.0 if deg > 0 else -1.0)]
+
+        def _cb(*_a, **_kw):
+            _plane_button_tap(intent)
+        return _cb
+
+    # ─── Airplane buttons ────────────────────────────────────────────────
+    # Left panel, same column x-positions as the spaceship panel.
+    # Layout:
+    #        [  FWD  ]    y=0.40  (big)
+    #        [  STOP ]    y=0.35
+    #        [  BCK  ]    y=0.30  (big)
+    #           [P▲]      y=0.24  pitch up   (centre)
+    # [Y◀]             [Y▶]  y=0.20  yaw left / right
+    #           [P▼]      y=0.16  pitch down (centre)
+    # [R↺]             [R↻]  y=0.12  roll (below yaw, outer)
+    _AVION_FG       = "white"
+    _AVION_FWD_BG   = "#1b5e20"  # dark green
+    _AVION_STOP_BG  = "#b71c1c"  # red
+    _AVION_YAW_BG   = "#0d47a1"  # deep blue
+    _AVION_PITCH_BG = "#4a148c"  # deep purple
+    _AVION_ROLL_BG  = "#bf360c"  # deep orange
+    _AVION_BIG  = 22             # bigger font for FWD / BCK
+    _AVION_SIZE = 18
+
+    _avion_buttons.append(plt.add_button(
+        _plane_fwd, states=["FWD"],
+        c=[_AVION_FG], bc=[_AVION_FWD_BG],
+        pos=(_SHIP_X_C, 0.40), size=_AVION_BIG, bold=True,
+    ))
+    _avion_buttons.append(plt.add_button(
+        _plane_stop, states=["STOP"],
+        c=[_AVION_FG], bc=[_AVION_STOP_BG],
+        pos=(_SHIP_X_C, 0.35), size=_AVION_SIZE, bold=True,
+    ))
+    _avion_buttons.append(plt.add_button(
+        _plane_bck, states=["BCK"],
+        c=[_AVION_FG], bc=[_AVION_FWD_BG],
+        pos=(_SHIP_X_C, 0.30), size=_AVION_BIG, bold=True,
+    ))
+    _avion_buttons.append(plt.add_button(
+        _mk_plane_rot("pitch", +_PLANE_ROT_DEG), states=["P▲"],
+        c=[_AVION_FG], bc=[_AVION_PITCH_BG],
+        pos=(_SHIP_X_C, 0.24), size=_AVION_SIZE, bold=True,
+    ))
+    _avion_buttons.append(plt.add_button(
+        _mk_plane_rot("yaw", +_PLANE_ROT_DEG), states=["Y◀"],
+        c=[_AVION_FG], bc=[_AVION_YAW_BG],
+        pos=(_SHIP_X_L, 0.20), size=_AVION_SIZE, bold=True,
+    ))
+    _avion_buttons.append(plt.add_button(
+        _mk_plane_rot("yaw", -_PLANE_ROT_DEG), states=["Y▶"],
+        c=[_AVION_FG], bc=[_AVION_YAW_BG],
+        pos=(_SHIP_X_R, 0.20), size=_AVION_SIZE, bold=True,
+    ))
+    _avion_buttons.append(plt.add_button(
+        _mk_plane_rot("pitch", -_PLANE_ROT_DEG), states=["P▼"],
+        c=[_AVION_FG], bc=[_AVION_PITCH_BG],
+        pos=(_SHIP_X_C, 0.16), size=_AVION_SIZE, bold=True,
+    ))
+    _avion_buttons.append(plt.add_button(
+        _mk_plane_rot("roll", +_PLANE_ROT_DEG), states=["R↺"],
+        c=[_AVION_FG], bc=[_AVION_ROLL_BG],
+        pos=(_SHIP_X_L, 0.12), size=_AVION_SIZE, bold=True,
+    ))
+    _avion_buttons.append(plt.add_button(
+        _mk_plane_rot("roll", -_PLANE_ROT_DEG), states=["R↻"],
+        c=[_AVION_FG], bc=[_AVION_ROLL_BG],
+        pos=(_SHIP_X_R, 0.12), size=_AVION_SIZE, bold=True,
+    ))
+
+    # ─── Keyboard navigation toggle (Avion) ───────────────────
+    # Inactive by default. When ON *and* the current sub-mode is Avion,
+    # arrow keys / PageUp-Down / numpad 0 and . feed the same impulse
+    # queues as the on-screen buttons — so the existing timer-driven
+    # render path is reused (no extra render in the key callback, no
+    # flicker, no clipping-plane fight).
+    def _toggle_keyboard_cb(*_a, **_kw):
+        _keyboard_on[0] = not _keyboard_on[0]
+        try:
+            _keyboard_btn_ref[0].switch()
+        except Exception:  # noqa: BLE001
+            pass
+        _show_status(
+            "Keyboard navigation: "
+            + ("ON (Avion: ←→ yaw, ↑↓ pitch, PgUp/Dn speed, KP7/8 roll)"
+               if _keyboard_on[0] else "off")
+        )
+        try:
+            plt.render()
+        except Exception:  # noqa: BLE001
+            pass
+
+    _keyboard_btn_ref[0] = plt.add_button(
+        _toggle_keyboard_cb,
+        states=["Keys ▸ off", "Keys ▸ on"],
+        c=["#9e9e9e", "white"],
+        bc=["#263238", "#00695c"],
+        pos=(0.22, 0.48),
+        size=14,
+        bold=True,
+    )
+
+    # One-shot RenderEvent: activate keyboard after the first complete render
+    # (= window shown, all actors uploaded to GPU, panels painted).
+    _kbd_first_tag: list = [None]
+
+    def _kbd_activate_once(_obj, _event):
+        """Flip keyboard ON exactly once after the viewer is fully drawn."""
+        # Remove ourselves first to avoid re-entrancy if render() fires again.
+        try:
+            _iren_k = getattr(plt, "interactor", None)
+            if _iren_k is not None and _kbd_first_tag[0] is not None:
+                _iren_k.RemoveObserver(_kbd_first_tag[0])
+        except Exception:  # noqa: BLE001
+            pass
+        _kbd_first_tag[0] = None
+        if _keyboard_on[0]:
+            return  # already toggled manually before first render
+        _keyboard_on[0] = True
+        try:
+            _keyboard_btn_ref[0].switch()
+        except Exception:  # noqa: BLE001
+            pass
+        _show_status(
+            "Keyboard navigation: ON "
+            "(Avion: \u2190\u2192 yaw, \u2191\u2193 pitch, PgUp/Dn speed, KP7/8 roll)"
+        )
+
+    _iren_kbd = getattr(plt, "interactor", None)
+    if _iren_kbd is not None:
+        try:
+            _kbd_first_tag[0] = _iren_kbd.AddObserver("RenderEvent", _kbd_activate_once)
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("Could not attach keyboard-ready observer: %s", _exc)
+            # Fallback: arm immediately.
+            _keyboard_on[0] = True
+
+    # ─── Toggle gauges (bottom sliders) ─────────────────────────────────
+    # Hides / shows all bottom sliders (mesh lighting + arrow length) in
+    # every view.  Useful when the sliders obstruct the lower part of the
+    # scene.  Always visible, independent of the navigation sub-mode.
+    def _toggle_gauge_cb(*_a, **_kw):
+        _gauge_state["on"] = not _gauge_state["on"]
+        on = _gauge_state["on"]
+        in_arrows = view_mode.get("name") in ("arrows_grid", "arrows_tracks")
+        for s in mesh_sliders:
+            _set_widget_visible(s, on and not in_arrows)
+        for s in arrow_sliders:
+            _set_widget_visible(s, on and in_arrows)
+        _gauge_btn.switch()
+        plt.render()
+
+    _gauge_btn = plt.add_button(
+        _toggle_gauge_cb,
+        states=["Gauges ▸ on", "Gauges ▸ off"],
+        c=["white", "#9e9e9e"],
+        bc=["#00695c", "#263238"],
+        pos=(0.35, 0.48),
+        size=14,
+        bold=True,
+    )
+
+    # KeySym sets. We accept both NumLock-on and NumLock-off variants of
+    # the numpad keys so the roll bindings work either way.
+    _AVION_KEYS_YAW_LEFT   = {"Left"}
+    _AVION_KEYS_YAW_RIGHT  = {"Right"}
+    _AVION_KEYS_PITCH_UP   = {"Up"}
+    _AVION_KEYS_PITCH_DOWN = {"Down"}
+    _AVION_KEYS_ACCEL      = {"Prior",      "KP_Prior",      "KP_Page_Up"}
+    _AVION_KEYS_DECEL      = {"Next",       "KP_Next",       "KP_Page_Down"}
+    _AVION_KEYS_ROLL_LEFT  = {"KP_7", "KP_Home"}
+    _AVION_KEYS_ROLL_RIGHT = {"KP_8", "KP_Up"}
+
+    # Resolve keysym names to X11 keycodes for fast polling.
+    for _intent, _keysyms in (
+        ("yaw_l",   _AVION_KEYS_YAW_LEFT),
+        ("yaw_r",   _AVION_KEYS_YAW_RIGHT),
+        ("pitch_u", _AVION_KEYS_PITCH_UP),
+        ("pitch_d", _AVION_KEYS_PITCH_DOWN),
+        ("roll_l",  _AVION_KEYS_ROLL_LEFT),
+        ("roll_r",  _AVION_KEYS_ROLL_RIGHT),
+        ("fwd",     _AVION_KEYS_ACCEL),
+        ("bck",     _AVION_KEYS_DECEL),
+    ):
+        _AVION_KEYCODES[_intent] = _x11_resolve_keycodes(_keysyms)
+    if _x_disp_plane is not None:
+        logger.info("Avion keycodes resolved: %s",
+                    {k: len(v) for k, v in _AVION_KEYCODES.items()})
+
+    def _avion_keypress_cb(obj, _event):
+        # Bail out silently in every situation that is not strictly
+        # "Avion + keyboard armed + Navigation interaction style".
+        # That keeps VTK / vedo default key handling and all other
+        # interaction modes completely unaffected.
+        if not _keyboard_on[0]:
+            return
+        if style_state["idx"] != style_state["custom_idx"]:
+            return
+        if _nav_mode[0] != 0:
+            return
+        try:
+            key = obj.GetKeySym()
+        except Exception:  # noqa: BLE001
+            return
+        if not key:
+            return
+        if key in _AVION_KEYS_YAW_LEFT:
+            _plane_key_press("yaw_l")
+        elif key in _AVION_KEYS_YAW_RIGHT:
+            _plane_key_press("yaw_r")
+        elif key in _AVION_KEYS_PITCH_UP:
+            _plane_key_press("pitch_u")
+        elif key in _AVION_KEYS_PITCH_DOWN:
+            _plane_key_press("pitch_d")
+        elif key in _AVION_KEYS_ROLL_LEFT:
+            _plane_key_press("roll_l")
+        elif key in _AVION_KEYS_ROLL_RIGHT:
+            _plane_key_press("roll_r")
+        elif key in _AVION_KEYS_ACCEL:
+            _plane_key_press("fwd")
+        elif key in _AVION_KEYS_DECEL:
+            _plane_key_press("bck")
+        else:
+            return
+        # Intent refreshed; the integrator-driven timer is already armed
+        # by _plane_key_press().  No render here — the tick will request one.
+        logger.debug("KBD-PRESS:   key=%-10s  held=%s", key,
+                     {k: v for k, v in _plane_held.items() if v})
+        _consume_key(obj)
+
+    def _avion_keyrelease_cb(obj, _event):
+        # Mirror of _avion_keypress_cb: schedule a deferred release for
+        # the matching intent.  The grace period in _plane_key_release
+        # filters X11's autorepeat fake-releases.
+        if not _keyboard_on[0]:
+            return
+        if style_state["idx"] != style_state["custom_idx"]:
+            return
+        if _nav_mode[0] != 0:
+            return
+        try:
+            key = obj.GetKeySym()
+        except Exception:  # noqa: BLE001
+            return
+        if not key:
+            return
+        if key in _AVION_KEYS_YAW_LEFT:
+            _plane_key_release("yaw_l")
+        elif key in _AVION_KEYS_YAW_RIGHT:
+            _plane_key_release("yaw_r")
+        elif key in _AVION_KEYS_PITCH_UP:
+            _plane_key_release("pitch_u")
+        elif key in _AVION_KEYS_PITCH_DOWN:
+            _plane_key_release("pitch_d")
+        elif key in _AVION_KEYS_ROLL_LEFT:
+            _plane_key_release("roll_l")
+        elif key in _AVION_KEYS_ROLL_RIGHT:
+            _plane_key_release("roll_r")
+        elif key in _AVION_KEYS_ACCEL:
+            _plane_key_release("fwd")
+        elif key in _AVION_KEYS_DECEL:
+            _plane_key_release("bck")
+        else:
+            return
+        logger.debug("KBD-RELEASE: key=%-10s  release_at=%s",
+                     key,
+                     {k: f"{t:.3f}" for k, t in _plane_release_at.items()
+                      if t is not None})
+
+    def _consume_key(iren_obj, tag_ref=None) -> None:
+        """Prevent vedo / VTK default key handlers from also seeing this
+        keypress. Vedo binds `,` / `.` to opacity adjustments, `b` to
+        background colour, etc.; without consuming, our numpad `.` /
+        arrow keys would also trigger those side effects.
+
+        Two complementary mechanisms are used:
+        * Abort the current event invocation via the command's
+          AbortFlag, which short-circuits VTK's observer loop (our
+          observer is registered at priority 1.0, so it runs first).
+        * Clear the KeySym / KeyCode so any handler that survives the
+          abort sees no key at all.
+
+        ``tag_ref`` selects which observer's command to abort
+        (defaults to the KeyPress observer tag).
+        """
+        try:
+            tag = (tag_ref or _avion_kp_tag)[0]
+            if tag is not None:
+                cmd = iren_obj.GetCommand(tag)
+                if cmd is not None:
+                    cmd.AbortFlagOn()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            iren_obj.SetKeySym("")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            iren_obj.SetKeyCode("\0")
+        except Exception:  # noqa: BLE001
+            pass
+
+    _avion_kp_tag: list = [None]
+    _avion_kr_tag: list = [None]
+    if _iren_plane is not None:
+        try:
+            # Priority > 0 so our handler runs before vedo's default
+            # keypress handler; combined with AbortFlagOn() in
+            # _consume_key, vedo never sees the consumed keys.
+            _avion_kp_tag[0] = _iren_plane.AddObserver(
+                "KeyPressEvent", _avion_keypress_cb, 1.0,
+            )
+            _avion_kr_tag[0] = _iren_plane.AddObserver(
+                "KeyReleaseEvent", _avion_keyrelease_cb, 1.0,
+            )
+            logger.info(
+                "Avion keyboard observers (press + release) attached "
+                "(off by default)."
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Avion keyboard observers could not attach: %s", exc,
+            )
+
+    # Refresh visibility now that all button lists are populated:
+    # Avion is the default → avion buttons visible, ship + custom hidden.
+    _refresh_nav_panel_visibility()
 
     # ─── Fog (depth) + SSAO toggles ─────────────────────────────────────
     # Both are GPU effects driven from the bottom-right button column.
@@ -4847,6 +6305,48 @@ def main(argv: list[str] | None = None) -> int:
                 logger.info("Mask overlay '%s' cache not found: %s — skipped.",
                             _label, _cpath)
 
+    # ── Wind / gas particles (O₂ + CH₄) ─────────────────────────────────
+    wind_data: dict = {}
+    if not getattr(args, "no_wind", False):
+        try:
+            from marvel_view.preprocessing.wind_field import (
+                load_particle_templates as _load_wind_tpl,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("wind_field module unavailable: %s — wind disabled.", exc)
+            _load_wind_tpl = None  # type: ignore[assignment]
+
+        if _load_wind_tpl is not None:
+            for _species, _arg_cache, _display, _color, _psize in (
+                ("o2",  args.wind_o2_cache,  int(args.wind_o2_display),
+                 DEFAULT_WIND_O2_COLOR,  DEFAULT_WIND_O2_POINT_SIZE),
+                ("ch4", args.wind_ch4_cache, int(args.wind_ch4_display),
+                 DEFAULT_WIND_CH4_COLOR, DEFAULT_WIND_CH4_POINT_SIZE),
+            ):
+                _path = Path(_arg_cache).expanduser().resolve()
+                if not _path.exists():
+                    logger.info("Wind %s cache not found: %s — skipped.",
+                                _species.upper(), _path)
+                    continue
+                try:
+                    _tpl = _load_wind_tpl(_path)
+                    wind_data[_species] = {
+                        "tpl":        _tpl,
+                        "display":    _display,
+                        "color":      _color,
+                        "point_size": _psize,
+                    }
+                    logger.info(
+                        "Wind %s templates loaded: %d × %d frames @ %d fps "
+                        "(display=%d, size=%.1fpx)",
+                        _species.upper(),
+                        _tpl["n_templates"], _tpl["n_frames"], _tpl["fps"],
+                        _display, _psize,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not load wind %s cache (%s): %s",
+                                   _species.upper(), _path, exc)
+
     _attach_controls(
         plt, mesh,
         arrows_data=arrows_data,
@@ -4858,6 +6358,7 @@ def main(argv: list[str] | None = None) -> int:
         membranes_data=membranes_data,
         lames_data=lames_data,
         mask_overlay_meshes=mask_overlay_meshes,
+        wind_data=wind_data,
     )
     plt.interactive()
     plt.close()

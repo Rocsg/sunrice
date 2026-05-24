@@ -41,6 +41,8 @@ from .constants import (
     DEFAULT_RAW_PATH,
     DEFAULT_SMOOTH_ITER,
     DEFAULT_STELE_MASK_CACHE,
+    DEFAULT_AIR_DUAL_ARROWS_CACHE,
+    DEFAULT_WATER_DUAL_ARROWS_CACHE,
     DEFAULT_WIND_CH4_CACHE,
     DEFAULT_WIND_CH4_DISPLAY,
     DEFAULT_WIND_O2_CACHE,
@@ -206,6 +208,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "tangents and arc-length fractions (produced by "
                         "build-meshes).  When present, skips the Python for-loop "
                         "in _make_tracks_actor_curves.")
+    p.add_argument("--dual-water-cache",
+                   default=str(DEFAULT_WATER_DUAL_ARROWS_CACHE),
+                   help="Path to water_dual_arrows.npz (built by marvel-water-harmonic-build).")
+    p.add_argument("--dual-air-cache",
+                   default=str(DEFAULT_AIR_DUAL_ARROWS_CACHE),
+                   help="Path to air_dual_arrows.npz (built by marvel-water-harmonic-build).")
     p.add_argument("--no-tracks", action="store_true",
                    help="Disable the crown-tracks view.")
     p.add_argument("--tracks-stride", type=int, default=4,

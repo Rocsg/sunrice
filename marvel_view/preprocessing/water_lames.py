@@ -688,10 +688,21 @@ def build_water_lames(
     kmeans_iters:    int   = DEFAULT_KMEANS_ITERS,
     seed:            int   = DEFAULT_SEED,
     n_workers:       int | None = None,
+    field_volume:    "np.ndarray | None" = None,
 ) -> dict:
     """Build the lames (V2) cache.  Mirrors ``build_water_membranes`` but
     with the V2 geometry.  Returns the meta dict (or ``{}`` in
-    ``iso_only`` mode)."""
+    ``iso_only`` mode).
+
+    Parameters
+    ----------
+    field_volume : ndarray or None
+        Optional pre-computed distance/potential field to use *instead* of
+        loading and cleaning ``geoddist_path``.  Pass ``T_simple`` or
+        ``T_eikonal`` from ``water_harmonic.npz`` to drive the iso-shells
+        from the harmonic passage time rather than the geodesic distance.
+        If ``None`` (default), ``geoddist_path`` is loaded as before.
+    """
     import tifffile
     import vtk
     from vtk.util import numpy_support as nps  # type: ignore
@@ -732,7 +743,13 @@ def build_water_lames(
 
     # ── 1. Load + clean inputs ──────────────────────────────────────
     t0_all = time.perf_counter()
-    geoddist    = _clean_distance(_load_float32(geoddist_path), name="geoddist")
+    if field_volume is not None:
+        geoddist = _clean_distance(
+            np.asarray(field_volume, dtype=np.float32), name="field_volume"
+        )
+        logger.info("  Using provided field_volume instead of geoddist TIFF.")
+    else:
+        geoddist = _clean_distance(_load_float32(geoddist_path), name="geoddist")
     bg_dist     = _clean_distance(_load_float32(bg_dist_path),  name="bg_dist")
     object_mask = _load_uint8(object_path)
     crown_mask  = _load_uint8(crown_path)

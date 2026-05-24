@@ -75,6 +75,7 @@ from .pipeline import (  # noqa: F401
     _load_or_build_membranes,
     _load_lames,
     _build_lames_step_polydatas,
+    _load_or_build_dual_arrows,
 )
 from .styling import (  # noqa: F401
     _set_lighting,
@@ -106,6 +107,7 @@ def _attach_controls(
     lames_data=None,
     mask_overlay_meshes=None,
     wind_data=None,
+    dual_arrows_data=None,
 ) -> None:
     """Add shading button + opacity / lighting / hue sliders.
 
@@ -161,12 +163,51 @@ def _attach_controls(
     }
     try:
         status_state["text2d"] = _vedo_mod.Text2D(
-            "", pos=(0.52, 0.972), s=1.1, c="white", bg="black", alpha=0.65,
+            "", pos=(0.5, 0.942), s=1.0, c="white", bg="black", alpha=0.65,
+            justify="top-center",
         )
         plt.add(status_state["text2d"])
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not create status Text2D: %s", exc)
         status_state["text2d"] = None
+
+    # ── Title + subtitle info panel (top-centre, always visible) ────────────
+    _title_text2d = None
+    _subtitle_state = {"text2d": None}
+    _info_panel = None
+    try:
+        from marvel_view.visualization.ortho_panel import InfoPanelOverlay as _InfoPO
+        _info_panel = _InfoPO(
+            plt, PANEL_TITLE,
+            initial_subtitle=VIEW_MODE_SUBTITLES.get("mesh_bridges", ""),
+            opacity=0.72,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("InfoPanelOverlay unavailable (%s) — falling back to Text2D", exc)
+        try:
+            _title_text2d = _vedo_mod.Text2D(
+                PANEL_TITLE,
+                pos=(0.5, 0.978), s=1.2, c="white", bg="black", alpha=0.70,
+                justify="top-center",
+            )
+            plt.add(_title_text2d)
+            _subtitle_state["text2d"] = _vedo_mod.Text2D(
+                VIEW_MODE_SUBTITLES.get("mesh_bridges", ""),
+                pos=(0.5, 0.946), s=0.9, c="white", bg="black", alpha=0.70,
+                justify="top-center",
+            )
+            plt.add(_subtitle_state["text2d"])
+        except Exception as exc2:  # noqa: BLE001
+            logger.warning("Could not create title/subtitle Text2D: %s", exc2)
+
+    # Current view-mode subtitle (shared between _set_view_mode and _plane_tick).
+    _current_subtitle: list = [""]
+    try:
+        from marvel_view.scripts.water_conductance.constants import (
+            VOXEL_SIZE_UM as _VOXEL_SIZE_UM,
+        )
+    except ImportError:
+        _VOXEL_SIZE_UM = 6.71
 
     def _hide_status():
         t = status_state["text2d"]
@@ -200,14 +241,6 @@ def _attach_controls(
 
     def _timer_cb(_obj=None, _event=None):
         now = _time.time()
-        # Clear FPS display if no tick has fired for more than 2 s.
-        if now - _fps_state["last_update"] > 2.0:
-            _fps_t = _fps_state["text2d"]
-            if _fps_t is not None:
-                try:
-                    _fps_t.text("")
-                except Exception:  # noqa: BLE001
-                    pass
         # Only clear status if no newer status message superseded this timer
         # and the expiry has actually passed.
         if now + 0.05 < status_state["expire_at"]:
@@ -225,23 +258,37 @@ def _attach_controls(
         except Exception:  # noqa: BLE001
             pass
 
-    # ── FPS counter (top-left) — updated at most once per second ────────
+    # ── FPS + speed HUD (top right, 3/4 toward the right) ─────────────
+    # Always visible; never auto-cleared.
+    # FPS: updated at most once per second via a VTK EndEvent observer.
+    # Speed: 0 in trackball mode, fwd velocity in Avion, world-frame
+    # velocity magnitude in Spaceship.  Units are scene voxels / second.
     _fps_state = {
         "text2d":      None,
         "last_t":      0.0,
         "n_frames":    0,
         "last_update": 0.0,
     }
+    _speed_state = {"text2d": None}
     try:
         _fps_state["text2d"] = _vedo_mod.Text2D(
-            "", pos=(0.36, 0.972), s=1.0, c="yellow", bg="black", alpha=0.65,
+            "▶ -- fps", pos=(0.75, 0.975), s=1.0, c="yellow", bg="black", alpha=0.65,
+            justify="top-left",
         )
         plt.add(_fps_state["text2d"])
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not create FPS Text2D: %s", exc)
+    try:
+        _speed_state["text2d"] = _vedo_mod.Text2D(
+            "↦ 0.0 vox/s", pos=(0.75, 0.945), s=1.0, c="cyan", bg="black", alpha=0.65,
+            justify="top-left",
+        )
+        plt.add(_speed_state["text2d"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not create speed Text2D: %s", exc)
 
     def _fps_tick() -> None:
-        """Lightweight FPS counter; call once per animation tick."""
+        """Lightweight FPS + speed HUD; hooked to VTK EndEvent (every render)."""
         _fps_state["n_frames"] += 1
         now = _time.time()
         dt = now - _fps_state["last_t"]
@@ -252,17 +299,25 @@ def _attach_controls(
         _fps_state["last_t"] = now
         _fps_state["last_update"] = now
         t = _fps_state["text2d"]
-        if t is None:
-            return
-        try:
-            t.text(f"▶ {fps:.1f} fps")
-        except Exception:  # noqa: BLE001
-            pass
-        # Schedule auto-clear after 2.5 s of silence.
-        _iren_fps = getattr(plt, "interactor", None)
-        if _iren_fps is not None:
+        if t is not None:
             try:
-                _iren_fps.CreateOneShotTimer(2500)
+                t.text(f"▶ {fps:.1f} fps")
+            except Exception:  # noqa: BLE001
+                pass
+        ts = _speed_state["text2d"]
+        if ts is not None:
+            try:
+                is_trackball = (style_state["idx"] == 0)
+                if is_trackball:
+                    speed = 0.0
+                elif _nav_mode[0] == 1:  # Spaceship
+                    import numpy as _np_fps
+                    speed = float(_np_fps.linalg.norm(_ship["v_world"]))
+                elif _nav_mode[0] == 0:  # Avion
+                    speed = abs(_plane["fwd_v"])
+                else:
+                    speed = 0.0
+                ts.text(f"↦ {speed:.1f} vox/s")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -303,7 +358,6 @@ def _attach_controls(
             return
         _render_state["dirty"] = False
         _render_state["last_t"] = now
-        _fps_tick()
         try:
             plt.render()
         except Exception:  # noqa: BLE001
@@ -464,13 +518,26 @@ def _attach_controls(
             plt.render()
         return _cb
 
-    x1, x2 = 0.30, 0.85
+    def _slim_slider(sw) -> None:
+        """Compact visual style: thin tube + handle for all slider widgets."""
+        if sw is None:
+            return
+        try:
+            rep = sw.GetRepresentation()
+            if rep is not None:
+                rep.SetTubeWidth(0.003)
+                rep.SetSliderWidth(0.012)
+                rep.SetSliderLength(0.04)
+        except Exception:  # noqa: BLE001
+            pass
+
+    x1, x2 = 0.33, 0.82
     slider_defs = [
         ("opacity",  0.0, 1.0, 0.04),
-        ("ambient",  0.0, 1.0, 0.09),
-        ("diffuse",  0.0, 1.0, 0.14),
-        ("specular", 0.0, 1.0, 0.19),
-        ("hue",      0.0, 1.0, 0.24),
+        ("ambient",  0.0, 1.0, 0.08),
+        ("diffuse",  0.0, 1.0, 0.12),
+        ("specular", 0.0, 1.0, 0.16),
+        ("hue",      0.0, 1.0, 0.20),
     ]
     mesh_sliders: list = []
     for key, vmin, vmax, y in slider_defs:
@@ -479,10 +546,16 @@ def _attach_controls(
             vmin, vmax, value=state[key],
             pos=((x1, y), (x2, y)),
             title=key,
-            title_size=0.4,
+            title_size=0.3,
             show_value=True,
         )
+        _slim_slider(sw)
         mesh_sliders.append(sw)
+        # Gauges start hidden (user activates via renderer-options panel)
+        sw.SetEnabled(0)
+        _rep = sw.GetRepresentation()
+        if _rep is not None:
+            _rep.SetVisibility(0)
 
     def _set_widget_visible(widget, visible: bool) -> None:
         """Show / hide a vtkSliderWidget (used to swap the bottom toolbar)."""
@@ -522,8 +595,8 @@ def _attach_controls(
         states=[f"Shading ▸ {name}" for name, _ in _SHADING_MODES],
         c=["white"] * len(_SHADING_MODES),
         bc=["#3b5b8c", "#6b8e23", "#8c6b3b"],
-        pos=(0.88, 0.95),
-        size=16,
+        pos=(0.88, 0.39),
+        size=14,
         bold=True,
     )
 
@@ -552,6 +625,7 @@ def _attach_controls(
     _avion_buttons: list = []         # airplane mode buttons (left panel)
     _ship_buttons: list = []          # spaceship mode buttons (left panel)
     _nav_mode_btn_ref: list = [None]  # forward ref; filled after spaceship section
+    _controls_img_actors: dict = {}   # mode_index → vtkImageActor (or None)
     _restart_nav_btn_ref: list = [None]
     _keyboard_btn_ref: list = [None]  # "Keys ▸ off/on" toggle (avion keys)
     _keyboard_on: list = [False]      # is keyboard navigation armed? (armed after first render)
@@ -573,11 +647,13 @@ def _attach_controls(
 
     _style_btn = plt.add_button(
         _cycle_style_cb,
-        states=[f"Move ▸ {n}" for n, _ in _INTERACTION_STYLES],
-        c=["white"] * len(_INTERACTION_STYLES),
+        # State 0 = Trackball active  → click to go back to keyboard/buttons nav
+        # State 1 = Navigation(buttons) active  → click to activate mouse trackball
+        states=["Deactivate mouse trackball", "Activate mouse trackball"],
+        c=["white", "white"],
         bc=["#2e7d32", "#455a64"],
-        pos=(0.88, 0.89),
-        size=16,
+        pos=(0.10, 0.50),
+        size=14,
         bold=True,
     )
 
@@ -644,6 +720,11 @@ def _attach_controls(
             ortho_overlay.update(pos, direction)
         except Exception as exc:  # noqa: BLE001
             logger.warning("_refresh_ortho failed: %s", exc)
+        # Also refresh the camera orientation HUD.
+        try:
+            _update_orient_text()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _translate(axis: str, sign: int, speed_factor: float):
         cam, fwd, right, up, dist = _camera_axes()
@@ -701,77 +782,9 @@ def _attach_controls(
         _refresh_ortho()
         plt.render()
 
-    def _mk_btn(cb, label, x, y, bc):
-        b = plt.add_button(
-            lambda *_a, _f=cb, **_kw: _f(),
-            states=[label],
-            c=["white"],
-            bc=[bc],
-            pos=(x, y),
-            size=14,
-            bold=True,
-        )
-        _nav_buttons.append(b)
-        return b
-
-    # Layout: right side, below the three existing top-right buttons
-    # (Shading / Move / Save pos at y ≈ 0.95 / 0.89 / 0.83).
-    # Columns: 5 speed columns for translations, 10 for rotations
-    # (5 speeds × 2 directions).
-    COL_X = [0.69, 0.74, 0.79, 0.84, 0.89]                    # 5 speed cols
-    ROT_X = [0.69, 0.73, 0.77, 0.81, 0.85,
-             0.90, 0.94, 0.98, 1.02, 1.06]                    # 5×2 dirs
-
-    # Translation rows: (label, axis_key, sign, color)
-    trans_rows = [
-        ("Fwd",  "F", +1, "#1b5e20"),
-        ("Bwd",  "F", -1, "#1b5e20"),
-        ("Rgt",  "R", +1, "#0d47a1"),
-        ("Lft",  "R", -1, "#0d47a1"),
-        ("Up",   "U", +1, "#4a148c"),
-        ("Dn",   "U", -1, "#4a148c"),
-    ]
-    y_top = 0.77
-    dy = 0.044
-    speed_tags = ["·", "··", "···", "····", "·····"]
-    for ri, (lbl, axis, sign, color) in enumerate(trans_rows):
-        y = y_top - ri * dy
-        for ci, factor in enumerate(SPEED_FACTORS):
-            tag = speed_tags[ci]
-            _mk_btn(
-                lambda _a=axis, _s=sign, _f=factor: _translate(_a, _s, _f),
-                f"{lbl}{tag}",
-                COL_X[ci], y, color,
-            )
-
-    # Rotation rows: yaw / pitch / roll.
-    # 5 speeds × 2 directions = 10 buttons per row.
-    rot_rows = [
-        ("Yaw",   "yaw",   "◄", "►", "#bf360c"),
-        ("Pitch", "pitch", "▲", "▼", "#33691e"),
-        ("Roll",  "roll",  "↺", "↻", "#01579b"),
-    ]
-    y_rot_top = y_top - len(trans_rows) * dy - 0.01
-    for ri, (lbl, axis, lsym, rsym, color) in enumerate(rot_rows):
-        y = y_rot_top - ri * dy
-        # Negative direction, fast → slow → very-very-fine (reversed).
-        for ci, factor in enumerate(ROT_SPEED_FACTORS[::-1]):
-            tag = speed_tags[::-1][ci]
-            _mk_btn(
-                lambda _a=axis, _f=factor: _rotate_around_camera(_a, -_f),
-                f"{lsym}{tag}", ROT_X[ci], y, color,
-            )
-        # Positive direction, very-very-fine → fast.
-        for ci, factor in enumerate(ROT_SPEED_FACTORS):
-            tag = speed_tags[ci]
-            _mk_btn(
-                lambda _a=axis, _f=factor: _rotate_around_camera(_a, +_f),
-                f"{rsym}{tag}", ROT_X[5 + ci], y, color,
-            )
-
     def _refresh_nav_panel_visibility():
         is_nav = (style_state["idx"] == style_state["custom_idx"])
-        mode = _nav_mode[0]  # 0=Avion, 1=Spaceship, 2=Custom
+        mode = _nav_mode[0]  # 0=Airplane, 1=Space probe, 2=Custom
 
         def _set_vis(btn_list, visible: bool) -> None:
             for b in btn_list:
@@ -783,14 +796,9 @@ def _attach_controls(
                 except Exception:  # noqa: BLE001
                     pass
 
-        _set_vis(_nav_buttons,   is_nav and mode == 2)  # Custom panel (right)
-        _set_vis(_ship_buttons,  is_nav and mode == 1)  # Spaceship  (left)
-        _set_vis(_avion_buttons, is_nav and mode == 0)  # Airplane   (left)
 
-        # Nav mode switch + Restart + Keys: always visible when in
-        # Navigation mode.
-        for _ref in (_nav_mode_btn_ref, _restart_nav_btn_ref,
-                     _keyboard_btn_ref):
+        # Airplane mode button + Restart: visible only in Navigation mode.
+        for _ref in (_nav_mode_btn_ref, _restart_nav_btn_ref):
             _b = _ref[0]
             if _b is None:
                 continue
@@ -800,6 +808,15 @@ def _attach_controls(
                     actor.SetVisibility(1 if is_nav else 0)
                 except Exception:  # noqa: BLE001
                     pass
+
+        # Controls image: show the actor for the current nav mode, hide others.
+        for _mi, _mi_act in _controls_img_actors.items():
+            if _mi_act is None:
+                continue
+            try:
+                _mi_act.SetVisibility(1 if (is_nav and _mi == mode) else 0)
+            except Exception:  # noqa: BLE001
+                pass
 
     _refresh_nav_panel_visibility()
 
@@ -899,6 +916,11 @@ def _attach_controls(
             data.append(entry)
             fpath.write_text(json.dumps(data, indent=2))
             positions_state["count"] += 1
+            if positions_state["count"] == 1:
+                try:
+                    _show_orient_hud()
+                except Exception:  # noqa: BLE001
+                    pass
             logger.info(
                 "Saved position #%d → %s  "
                 "(cam.pos=%s, actor.pos=%s, actor.ori=%s)",
@@ -907,18 +929,216 @@ def _attach_controls(
                 tuple(round(v, 2) for v in entry["actor"]["position"]),
                 tuple(round(v, 2) for v in entry["actor"]["orientation"]),
             )
+            try:
+                _save_feedback.text(f"position {entry['index']} saved")
+                _save_feedback.alpha(0.85)
+                plt.render()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001
             logger.warning("Save position failed: %s", exc)
 
-    plt.add_button(
+    _save_pos_btn_ref: list = [None]
+    _save_pos_btn_ref[0] = plt.add_button(
         _save_position_cb,
-        states=["Save pos"],
+        states=["Save position"],
         c=["white"],
         bc=["#00838f"],
-        pos=(0.88, 0.83),
-        size=16,
+        pos=(0.10, 0.58),
+        size=14,
         bold=True,
     )
+
+    # On-screen feedback: "position {i} saved" – updated after each save.
+    import vedo as _vedo_sp
+    _save_feedback = _vedo_sp.Text2D(
+        "",
+        pos=(0.10, 0.625),
+        c="white",
+        bg="#00838f",
+        alpha=0.0,
+        s=1.0,
+        font="Calco",
+    )
+    plt.add(_save_feedback)
+
+    # ─── "x" key shortcut → Save position ───────────────────────────────
+    def _save_pos_key_cb(obj, _event):
+        try:
+            key = obj.GetKeySym()
+        except Exception:  # noqa: BLE001
+            return
+        if key != "x":
+            return
+        _save_position_cb()
+        try:
+            cmd = obj.GetCommand(_save_pos_key_tag[0])
+            if cmd is not None:
+                cmd.AbortFlagOn()
+        except Exception:  # noqa: BLE001
+            pass
+
+    _save_pos_key_tag: list = [None]
+    _iren_save = getattr(plt, "interactor", None)
+    if _iren_save is not None:
+        try:
+            _save_pos_key_tag[0] = _iren_save.AddObserver(
+                "KeyPressEvent", _save_pos_key_cb, 1.0,
+            )
+            logger.info("'x' key → Save position observer attached.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("'x' key Save position observer could not attach: %s", exc)
+
+    # ─── Camera orientation HUD (YAW / PITCH / ROLL) ────────────────────
+    # Revealed below the ortho panel once the user saves the first position.
+    # Gives a world-space readout (reference axis: world Z = [0, 0, 1]).
+    #
+    # Yaw   = heading in the XY plane, measured from +X (range ±180°).
+    # Pitch = elevation above the horizontal plane ( >0 ↑, <0 ↓).
+    # Roll  = rotation of view-up around the look axis vs. world-up.
+
+    def _compute_camera_ypr(cam):
+        """Return (yaw_deg, pitch_deg, roll_deg) from a VTK camera.
+
+        Reference: world Z = [0, 0, 1] is the vertical axis.
+        All angles in degrees, range [-180, +180].
+        """
+        import math as _math
+        pos  = np.asarray(cam.GetPosition(),   dtype=float)
+        foc  = np.asarray(cam.GetFocalPoint(), dtype=float)
+        vu   = np.asarray(cam.GetViewUp(),     dtype=float)
+
+        look = foc - pos
+        n = float(np.linalg.norm(look))
+        if n < 1e-9:
+            return 0.0, 0.0, 0.0
+        look = look / n
+
+        vu_n = float(np.linalg.norm(vu))
+        vu = vu / vu_n if vu_n > 1e-9 else np.array([0.0, 0.0, 1.0])
+
+        # Yaw: angle of look projected onto the XY plane, measured from +X.
+        yaw_deg = _math.degrees(_math.atan2(look[1], look[0]))
+
+        # Pitch: elevation of look above the XY plane.
+        pitch_deg = _math.degrees(_math.asin(float(np.clip(look[2], -1.0, 1.0))))
+
+        # Roll: signed angle between the "natural up" (world-Z projected ⊥ to
+        # look) and the camera's view-up projected ⊥ to look.
+        world_up = np.array([0.0, 0.0, 1.0])
+        nat_up = world_up - look * float(np.dot(world_up, look))
+        nat_n = float(np.linalg.norm(nat_up))
+        if nat_n < 1e-6:
+            # Looking straight up or down – roll is ill-defined.
+            return yaw_deg, pitch_deg, 0.0
+        nat_up = nat_up / nat_n
+
+        cam_up = vu - look * float(np.dot(vu, look))
+        cam_n = float(np.linalg.norm(cam_up))
+        if cam_n < 1e-6:
+            return yaw_deg, pitch_deg, 0.0
+        cam_up = cam_up / cam_n
+
+        cos_r = float(np.clip(np.dot(nat_up, cam_up), -1.0, 1.0))
+        sin_r = float(np.dot(np.cross(nat_up, cam_up), look))
+        roll_deg = _math.degrees(_math.atan2(sin_r, cos_r))
+        return yaw_deg, pitch_deg, roll_deg
+
+    # HUD state: initially invisible; _show_orient_hud() flips visible=True.
+    _orient_state: dict = {
+        "text2d":  None,
+        "widget":  None,
+        "visible": False,
+    }
+
+    def _update_orient_text():
+        """Recompute YPR and push new strings to the HUD Text2D."""
+        t2d = _orient_state["text2d"]
+        if t2d is None or not _orient_state["visible"]:
+            return
+        try:
+            yaw, pitch, roll = _compute_camera_ypr(plt.camera)
+            t2d.text(
+                f"YAW   {yaw:+04.0f}°\n"
+                f"PITCH {pitch:+04.0f}°\n"
+                f"ROLL  {roll:+04.0f}°"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("_update_orient_text failed: %s", exc)
+
+    # YPR readout Text2D – right of the axes widget, just below the ortho panel.
+    try:
+        import vedo as _vedo_orient
+        _orient_state["text2d"] = _vedo_orient.Text2D(
+            "YAW     ---\nPITCH   ---\nROLL    ---",
+            pos=(0.205, 0.435),
+            s=0.90,
+            c="lime",
+            bg="black",
+            alpha=0.0,
+            font="Calco",
+            justify="top-left",
+        )
+        plt.add(_orient_state["text2d"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not create orient Text2D: %s", exc)
+
+    # Axes orientation widget to the left of the text.
+    # Tries vtkCameraOrientationWidget (VTK ≥ 9.1); falls back to
+    # vtkOrientationMarkerWidget + vtkAxesActor.
+    try:
+        import vtk as _vtk_orient
+        _iren_ow = getattr(plt, "interactor", None)
+        _ren_ow  = getattr(plt, "renderer",   None)
+        if _iren_ow is not None and _ren_ow is not None:
+            try:
+                _cow = _vtk_orient.vtkCameraOrientationWidget()
+                _cow.SetParentRenderer(_ren_ow)
+                _rep_cow = _cow.GetRepresentation()
+                if _rep_cow is not None:
+                    _rep_cow.SetViewport(0.01, 0.23, 0.20, 0.44)
+                _cow.EnabledOff()
+                _orient_state["widget"] = _cow
+                logger.info("vtkCameraOrientationWidget created.")
+            except (AttributeError, Exception) as _e_cow:
+                logger.info(
+                    "vtkCameraOrientationWidget unavailable (%s); "
+                    "falling back to vtkOrientationMarkerWidget.", _e_cow,
+                )
+                try:
+                    _axes_actor = _vtk_orient.vtkAxesActor()
+                    _omw = _vtk_orient.vtkOrientationMarkerWidget()
+                    _omw.SetOrientationMarker(_axes_actor)
+                    _omw.SetInteractor(_iren_ow)
+                    _omw.SetViewport(0.01, 0.23, 0.20, 0.44)
+                    _omw.SetEnabled(0)
+                    _omw.InteractiveOff()
+                    _orient_state["widget"] = _omw
+                    logger.info("vtkOrientationMarkerWidget (fallback) created.")
+                except Exception as _e_omw:  # noqa: BLE001
+                    logger.warning("Orientation marker widget failed: %s", _e_omw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not create orientation widget: %s", exc)
+
+    def _show_orient_hud():
+        """Reveal the orientation HUD (called on the first saved position)."""
+        if _orient_state["visible"]:
+            return
+        _orient_state["visible"] = True
+        t2d = _orient_state["text2d"]
+        if t2d is not None:
+            try:
+                t2d.alpha(0.85)
+            except Exception:  # noqa: BLE001
+                pass
+        w = _orient_state["widget"]
+        if w is not None:
+            try:
+                w.EnabledOn()
+            except Exception:  # noqa: BLE001
+                pass
+        _update_orient_text()
+        logger.info("Camera orientation HUD revealed.")
 
     # ─── Mesh-choice toggle (Cortical bridges ↔ All watered tissues) ────
     # Only meaningful when the alternate mesh is available.  The button
@@ -1012,7 +1232,8 @@ def _attach_controls(
         # Visible whenever we're in any Arrows view, or when the
         # Cortical bridges mesh is the active mesh.  Hidden on the
         # 'All watered tissues' mesh.
-        if view_mode.get("name") in ("arrows_grid", "arrows_tracks"):
+        if view_mode.get("name") in ("arrows_grid", "arrows_tracks",
+                                      "arrows_dual"):
             return True
         return view_mode.get("name") == "mesh_bridges"
 
@@ -1020,7 +1241,8 @@ def _attach_controls(
         if pillars_mesh is None:
             return
         # Determine the target style *before* any visibility change.
-        in_arrows = view_mode.get("name") in ("arrows_grid", "arrows_tracks")
+        in_arrows = view_mode.get("name") in ("arrows_grid", "arrows_tracks",
+                                               "arrows_dual")
         target_style = "solid" if in_arrows else "glow"
         want = _pillars_should_show()
         # --- visibility change FIRST -----------------------------------
@@ -1075,11 +1297,14 @@ def _attach_controls(
     }
     arrows_actor = None
     tracks_actor = None          # may be a list [lines_act, path_arrows_act]
+    water_dual_actor = None      # water arrows for dual overlay
+    air_dual_actor   = None      # air arrows for dual overlay
     _track_cam_obs_tag = [None]  # mutable container for camera observer tag
     arrow_sliders: list = []
+    wind_sliders:  list = []  # wind speed gauge — populated after wind init
     # Whether the bottom gauge sliders are visible.  Toggled by the
     # "Gauges" button placed next to the keyboard-navigation toggle.
-    _gauge_state = {"on": True}
+    _gauge_state = {"on": False}   # gauges start hidden
 
     # ── Density colormap (per-cell scalars) ──────────────────────────────
     _density_btn = None  # populated below if scalars are present
@@ -1312,7 +1537,7 @@ def _attach_controls(
             states=["Water OFF", "Water ON"],
             c=["white", "white"],
             bc=["#22336e", "#3aa0ff"],
-            pos=(0.02, 0.10),
+            pos=(0.88, 0.76),
             size=14,
             bold=True,
         )
@@ -1470,7 +1695,7 @@ def _attach_controls(
             states=["Lames OFF", "Lames ON"],
             c=["white", "white"],
             bc=["#1a4f7a", "#4cc2ff"],
-            pos=(0.02, 0.04),
+            pos=(0.88, 0.80),
             size=14,
             bold=True,
         )
@@ -1492,110 +1717,200 @@ def _attach_controls(
     def _wind_make_actor(species: str) -> "object | None":  # noqa: F821
         """Build the vedo.Points actor for ``species`` on first toggle-ON.
 
-        Picks ``display`` random (template, phase) pairs from the cached
-        trajectory pool, seeds the actor with the corresponding frame-0
-        positions, and registers an alpha LUT so each particle fades in
-        at birth and out at death (triangular ramp on its lifespan)."""
+        Pre-computes phased position/alpha tensors for all speed levels from
+        ``cfg["tpls"]`` (list of 3 pre-baked trajectory dicts: slow/med/fast)
+        and stores them in ``wind_states[species]``.  Speed switching swaps
+        the active pointer instantly — no rebuild required."""
         cfg = _wind_data.get(species)
         if cfg is None:
             return None
         try:
             import numpy as np
-            import vedo as _vedo_w
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Wind %s: vedo/numpy import failed: %s",
+            logger.warning("Wind %s: numpy import failed: %s",
                            species.upper(), exc)
             return None
 
-        tpl        = cfg["tpl"]
-        positions  = np.ascontiguousarray(tpl["positions"], dtype=np.float32)
-        alive      = np.ascontiguousarray(tpl["alive"], dtype=bool)
-        n_tpl      = int(tpl["n_templates"])
-        n_frames   = int(tpl["n_frames"])
-        life_frm   = int(tpl["life_frames"])
-        n_disp     = int(cfg["display"])
-        if n_disp <= 0 or n_tpl <= 0 or n_frames <= 0:
+        tpls      = cfg["tpls"]        # list of dicts: slow / med / fast
+        n_disp    = int(cfg["display"])
+        speed_idx = int(cfg.get("speed_idx", DEFAULT_WIND_SPEED_LEVEL_IDX))
+        if not tpls or n_disp <= 0:
             return None
 
-        rng = np.random.default_rng(0xC0DE if species == "o2" else 0xBEEF)
-        template_idx = rng.integers(0, n_tpl, size=n_disp, dtype=np.int64)
-        phase        = rng.integers(0, n_frames, size=n_disp, dtype=np.int64)
+        try:
+            # Shared metadata: use first tpl as reference (all levels have the
+            # same n_templates and life_frames — only the Euler step differs).
+            _ref_tpl = tpls[0]
+            n_tpl    = int(_ref_tpl["n_templates"])
+            life_frm = int(_ref_tpl["life_frames"])
+            if n_tpl <= 0 or life_frm <= 0:
+                logger.warning("Wind %s: empty template.", species.upper())
+                return None
 
-        # Birth offsets — each particle's birth frame inside its template
-        # is the start of its trajectory (frame 0 of that template), but
-        # the *display* phase is randomised so deaths/births don't pulse.
-        # Triangular life ramp peaks at lifespan/2.
-        if life_frm > 0:
-            life_t = np.arange(life_frm, dtype=np.float32) / float(life_frm)
+            _lfrm      = max(life_frm, 1)
+            life_t     = np.arange(_lfrm, dtype=np.float32) / float(_lfrm)
             life_alpha = (1.0 - np.abs(2.0 * life_t - 1.0)).astype(np.float32)
-        else:
-            life_alpha = np.ones(1, dtype=np.float32)
 
-        # Seed actor with frame-0 positions of the chosen templates.
-        pts0 = positions[template_idx, 0, :].copy()
+            _rng = np.random.default_rng(0xC0DE if species == "o2" else 0xBEEF)
+            template_idx = _rng.integers(0, n_tpl, size=n_disp, dtype=np.int64)
+            # Phase randomised over one life span so particles spread
+            # across the birth→death cycle from the very first frame.
+            phase        = _rng.integers(0, _lfrm, size=n_disp, dtype=np.int64)
+
+            # Pre-build phased tensors for ALL speed levels so that speed
+            # switching at runtime is just a pointer swap — no rebuild needed.
+            pos_phased_all   = []
+            alpha_phased_all = []
+            for _tpl_i in tpls:
+                _positions_i = np.ascontiguousarray(_tpl_i["positions"], dtype=np.float32)
+                _alive_i     = np.ascontiguousarray(_tpl_i["alive"], dtype=bool)
+                _lfrm_i      = max(int(_tpl_i["life_frames"]), 1)
+                _pos_ph  = np.empty((_lfrm_i, n_disp, 3), dtype=np.float32)
+                _alp_ph  = np.empty((_lfrm_i, n_disp),    dtype=np.float32)
+                for _gf in range(_lfrm_i):
+                    _wa = (_gf + phase) % _lfrm_i
+                    _pos_ph[_gf]   = _positions_i[template_idx, _wa, :]
+                    _alive_mask_i  = _alive_i[template_idx, _wa]
+                    # life_alpha is indexed mod _lfrm (shared ramp length)
+                    _alp_ph[_gf]   = life_alpha[_wa % _lfrm] * _alive_mask_i
+                pos_phased_all.append(_pos_ph)
+                alpha_phased_all.append(_alp_ph)
+
+            pos_phased   = pos_phased_all[speed_idx]
+            alpha_phased = alpha_phased_all[speed_idx]
+            n_frames     = _lfrm
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Wind %s: tensor pre-computation failed: %s",
+                           species.upper(), exc)
+            return None
+
         col = cfg["color"]
         col01 = (col[0] / 255.0, col[1] / 255.0, col[2] / 255.0)
+        # n_tpl already set inside the try block above.
+
+        # ── Culling radius (world-space, squared) ───────────────────────
+        # Particles farther than DEFAULT_WIND_CULL_RADIUS_FRAC × scene
+        # diagonal from the camera are given alpha = 0.  0 = no culling.
         try:
-            actor = _vedo_w.Points(pts0, r=float(cfg["point_size"]), c=col01)
-            actor.lighting("off")
+            _bx = mesh.bounds()
+            _diag_w = float(
+                ((_bx[1]-_bx[0])**2 + (_bx[3]-_bx[2])**2
+                 + (_bx[5]-_bx[4])**2) ** 0.5
+            )
+        except Exception:  # noqa: BLE001
+            _diag_w = 1000.0
+        _cull_frac = float(DEFAULT_WIND_CULL_RADIUS_FRAC)
+        cull_r2 = (_cull_frac * _diag_w) ** 2 if _cull_frac > 0 else 0.0
+
+        # ── Glyph3D pipeline ────────────────────────────────────────────
+        # vtkSphereSource → vtkGlyph3D → vtkPolyDataMapper → vtkActor.
+        # Per-particle alpha encoded as uint8 scalar [0, 255] on the
+        # dynamic point cloud; a LUT maps scalar → fixed-RGB + alpha.
+        try:
+            import vtk as _vtk_w
+
+            # Sphere template.
+            sphere_src = _vtk_w.vtkSphereSource()
+            sphere_src.SetRadius(float(cfg["sphere_radius"]))
+            sphere_src.SetPhiResolution(8)
+            sphere_src.SetThetaResolution(8)
+            sphere_src.Update()
+
+            # Species-colour LUT: fixed RGB, alpha ∝ scalar.
+            lut = _vtk_w.vtkLookupTable()
+            lut.SetNumberOfTableValues(256)
+            lut.SetRange(0.0, 255.0)
+            _r01, _g01, _b01 = col01
+            for _ci in range(256):
+                lut.SetTableValue(_ci, _r01, _g01, _b01, _ci / 255.0)
+            lut.Build()
+
+            # Dynamic point cloud (rebuilt each frame with visible subset).
+            point_pd  = _vtk_w.vtkPolyData()
+            vtk_pts_w = _vtk_w.vtkPoints()
+            point_pd.SetPoints(vtk_pts_w)
+
+            # Glyph filter: one sphere per input point.
+            glyph3d = _vtk_w.vtkGlyph3D()
+            glyph3d.SetInputData(point_pd)
+            glyph3d.SetSourceConnection(sphere_src.GetOutputPort())
+            glyph3d.SetColorModeToColorByScalar()
+            glyph3d.ScalingOff()
+            glyph3d.OrientOff()
+
+            # Mapper + actor.
+            glyph_mapper = _vtk_w.vtkPolyDataMapper()
+            glyph_mapper.SetInputConnection(glyph3d.GetOutputPort())
+            glyph_mapper.SetLookupTable(lut)
+            glyph_mapper.SetScalarRange(0, 255)
+            glyph_mapper.SetColorModeToMapScalars()
+            glyph_mapper.SetScalarModeToUsePointData()
+            glyph_mapper.ScalarVisibilityOn()
+
+            vtk_actor_w = _vtk_w.vtkActor()
+            vtk_actor_w.SetMapper(glyph_mapper)
+            vtk_actor_w.GetProperty().SetOpacity(1.0)
+            vtk_actor_w.ForceTranslucentOn()
+            vtk_actor_w.VisibilityOff()
+
+            # Thin wrapper so the rest of the app can do
+            # getattr(actor, "actor", actor) and actor.name.
+            class _WA:  # noqa: N801
+                def __init__(self, a):
+                    self.actor = a
+                    self.name  = ""
+                def __getattr__(self, n):
+                    return getattr(self.actor, n)
+
+            actor = _WA(vtk_actor_w)
             actor.name = f"wind_{species}_particles"
-            # Configure the VTK mapper for direct RGBA so per-point alpha works.
-            # actor.alpha() must NOT be called with 0 — Property.Opacity is a
-            # global multiplier that would zero out all per-point alpha values.
-            _vtk_m = actor.actor.GetMapper()
-            _vtk_m.SetColorModeToDirectScalars()
-            _vtk_m.SetScalarModeToUsePointData()
-            _vtk_m.ScalarVisibilityOn()
-            actor.actor.GetProperty().SetOpacity(1.0)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Wind %s: Points actor creation failed: %s",
+            logger.warning("Wind %s: glyph actor creation failed: %s",
                            species.upper(), exc)
             return None
 
-        # Per-frame RGBA buffer (uint8) for fast point-color uploads.
-        rgba = np.empty((n_disp, 4), dtype=np.uint8)
-        rgba[:, 0] = col[0]
-        rgba[:, 1] = col[1]
-        rgba[:, 2] = col[2]
-        rgba[:, 3] = 0
-
-        wind_states[species]["positions"]    = positions
-        wind_states[species]["alive"]        = alive
-        wind_states[species]["template_idx"] = template_idx
-        wind_states[species]["phase"]        = phase
-        wind_states[species]["life_alpha"]   = life_alpha
-        wind_states[species]["rgba"]         = rgba
-        wind_states[species]["n_frames"]     = n_frames
-        wind_states[species]["life_frames"]  = max(life_frm, 1)
+        wind_states[species]["speed_idx"]        = speed_idx
+        wind_states[species]["pos_phased"]       = pos_phased
+        wind_states[species]["alpha_phased"]     = alpha_phased
+        wind_states[species]["pos_phased_all"]   = pos_phased_all
+        wind_states[species]["alpha_phased_all"] = alpha_phased_all
+        wind_states[species]["n_frames"]         = n_frames
         wind_states[species]["n_display"]    = n_disp
         wind_states[species]["actor"]        = actor
+        wind_states[species]["point_pd"]     = point_pd
+        wind_states[species]["sphere_src"]   = sphere_src
+        wind_states[species]["cull_r2"]      = cull_r2
         logger.info(
             "Wind %s actor built: %d particles, %d templates, "
-            "%d frames, life=%d frm, point_r=%.1f, color=(%d,%d,%d)",
-            species.upper(), n_disp, n_tpl, n_frames, max(life_frm, 1),
-            float(cfg["point_size"]), col[0], col[1], col[2],
+            "%d frames, sphere_r=%.1fvox, speed=%s, color=(%d,%d,%d)",
+            species.upper(), n_disp, n_tpl, n_frames,
+            float(cfg["sphere_radius"]),
+            WIND_SPEED_LABELS[wind_states[species].get("speed_idx", DEFAULT_WIND_SPEED_LEVEL_IDX)], col[0], col[1], col[2],
         )
         try:
-            flat = positions.reshape(-1, 3)
+            _active_tpl     = tpls[speed_idx]
+            _stat_positions = np.ascontiguousarray(_active_tpl["positions"], dtype=np.float32)
+            _stat_alive     = np.ascontiguousarray(_active_tpl["alive"], dtype=bool)
+            flat = _stat_positions.reshape(-1, 3)
             bb_min = flat.min(axis=0)
             bb_max = flat.max(axis=0)
             vol = float(np.prod(bb_max - bb_min))
             density = n_tpl / vol if vol > 1.0 else float("inf")
-            displ = np.linalg.norm(np.diff(positions, axis=1), axis=2)
+            displ = np.linalg.norm(np.diff(_stat_positions, axis=1), axis=2)
             mean_spd_frm = float(displ.mean())
-            fps_tpl = int(tpl.get("fps", 25))
+            fps_tpl = int(_active_tpl.get("fps", 25))
             mean_spd_s = mean_spd_frm * fps_tpl
-            alive_frac = 100.0 * float(alive.mean())
+            alive_frac = 100.0 * float(_stat_alive.mean())
             logger.info(
                 "Wind %s stats: bbox X=[%.1f,%.1f] Y=[%.1f,%.1f] Z=[%.1f,%.1f]  "
                 "vol=%.0f vox\u00b3  density=%.2e tpl/vox\u00b3  "
                 "speed=%.3f vox/frm = %.2f vox/s  "
-                "point_r=%.1f px  alive=%.1f%%",
+                "sphere_r=%.1fvox  alive=%.1f%%",
                 species.upper(),
                 bb_min[0], bb_max[0], bb_min[1], bb_max[1], bb_min[2], bb_max[2],
                 vol, density,
                 mean_spd_frm, mean_spd_s,
-                float(cfg["point_size"]),
+                float(cfg["sphere_radius"]),
                 alive_frac,
             )
         except Exception as _se:  # noqa: BLE001
@@ -1608,41 +1923,48 @@ def _attach_controls(
             return
         try:
             import numpy as np
-            positions    = st["positions"]
-            alive        = st["alive"]
-            template_idx = st["template_idx"]
-            phase        = st["phase"]
-            life_alpha   = st["life_alpha"]
-            rgba         = st["rgba"]
+            pos_phased   = st["pos_phased"]    # [n_frames, n_disp, 3] float32
+            alpha_phased = st["alpha_phased"]  # [n_frames, n_disp]    float32
             n_frames     = st["n_frames"]
-            life_frames  = st["life_frames"]
-            frame        = int(st["frame"])
+            frame        = int(st["frame"]) % n_frames
+            point_pd     = st["point_pd"]
+            cull_r2      = float(st["cull_r2"])
 
-            # Frame index along each particle's own trajectory.
-            tframe = (frame + phase) % n_frames
-            pts  = positions[template_idx, tframe, :]
-            aliv = alive[template_idx, tframe]
-            # Alpha = triangular life ramp evaluated at (tframe % life_frames).
-            life_idx = (tframe % life_frames).astype(np.int64, copy=False)
-            a = (life_alpha[life_idx] * aliv.astype(np.float32) * 255.0)
-            rgba[:, 3] = np.clip(a, 0, 255).astype(np.uint8)
+            pts_all = pos_phased[frame]    # [n_disp, 3] — contiguous slice
+            alp_raw = alpha_phased[frame]  # [n_disp]   — smooth 0..1 ramp
 
-            actor = st["actor"]
-            actor.points = pts
-            try:
-                actor.pointcolors = rgba
-            except Exception:
-                # VTK direct fallback: write RGBA as point scalars.
+            # Scale to uint8; apply culling by zeroing alpha (fixed n_disp
+            # point count keeps the VTK glyph pipeline stable across frames).
+            a_out = np.clip(alp_raw * 255.0, 0.0, 255.0)
+            if cull_r2 > 0.0:
                 try:
-                    from vtk.util.numpy_support import numpy_to_vtk as _n2v
-                    _arr = _n2v(rgba, deep=False, array_type=3)  # VTK_UNSIGNED_CHAR
-                    _arr.SetName("RGBA")
-                    _arr.SetNumberOfComponents(4)
-                    _vtk_pd = actor.actor.GetMapper().GetInput()
-                    _vtk_pd.GetPointData().SetScalars(_arr)
-                    _vtk_pd.GetPointData().Modified()
+                    _cx, _cy, _cz = plt.camera.GetPosition()
+                    _d2 = ((pts_all[:, 0] - _cx) ** 2
+                           + (pts_all[:, 1] - _cy) ** 2
+                           + (pts_all[:, 2] - _cz) ** 2)
+                    a_out[_d2 >= cull_r2] = 0.0
                 except Exception:  # noqa: BLE001
                     pass
+            a_u8 = a_out.astype(np.uint8)
+
+            # Upload always-n_disp points to VTK; explicit Modified() calls
+            # ensure the glyph pipeline sees the update every frame.
+            try:
+                from vtkmodules.util.numpy_support import numpy_to_vtk as _n2v_w
+            except ImportError:
+                from vtk.util.numpy_support import numpy_to_vtk as _n2v_w  # type: ignore[no-redef]
+
+            pts_c    = np.ascontiguousarray(pts_all, dtype=np.float32)
+            _pts_arr = _n2v_w(pts_c, deep=True, array_type=10)    # VTK_FLOAT
+            _pts_arr.SetNumberOfComponents(3)
+            point_pd.GetPoints().SetData(_pts_arr)
+            point_pd.GetPoints().Modified()
+
+            _a_arr = _n2v_w(a_u8, deep=True, array_type=3)        # VTK_UNSIGNED_CHAR
+            _a_arr.SetName("alpha")
+            _a_arr.SetNumberOfComponents(1)
+            point_pd.GetPointData().SetScalars(_a_arr)
+            point_pd.Modified()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Wind %s frame apply failed: %s",
                            species.upper(), exc)
@@ -1652,6 +1974,7 @@ def _attach_controls(
             st = wind_states.get(species)
             if st is None or not st["visible"]:
                 return
+            _fpt = int(st.get("frames_per_tick", 1))
             st["frame"] = (int(st["frame"]) + 1) % int(st["n_frames"])
             _wind_apply_frame(species)
             _request_render()
@@ -1733,9 +2056,9 @@ def _attach_controls(
     # Initialise per-species state and register one TimerEvent observer
     # per loaded species (no-ops while the species is hidden).
     _wind_button_layout = {
-        "o2":  {"pos": (0.12, 0.04), "labels": ["O₂ OFF",  "O₂ ON"],
+        "o2":  {"pos": (0.88, 0.72), "labels": ["O Off",  "O₂ ON"],
                 "bc":  ["#1a4f7a", "#e8f4ff"]},
-        "ch4": {"pos": (0.22, 0.04), "labels": ["CH₄ OFF", "CH₄ ON"],
+        "ch4": {"pos": (0.88, 0.68), "labels": ["CH Off", "CH₄ ON"],
                 "bc":  ["#4f3a1a", "#ffd470"]},
     }
     for _sp in ("o2", "ch4"):
@@ -1785,11 +2108,100 @@ def _attach_controls(
                 logger.warning("Could not pre-add wind %s actor: %s",
                                _sp_pre.upper(), _exc_pre)
 
-    def _make_arrows_actor(data):
+    # ─── Wind speed button (cycles slow / med / fast) ───────────────────
+    # Always visible when wind data is present; not gated by the gauge panel.
+    if wind_states:
+        _wind_speed_btn_ref: list = [None]
+
+        def _wind_speed_cycle_cb(*_a, **_kw) -> None:
+            for _sp_sc in ("o2", "ch4"):
+                _st_sc = wind_states.get(_sp_sc)
+                if _st_sc is None:
+                    continue
+                _cur    = int(_st_sc.get("speed_idx", DEFAULT_WIND_SPEED_LEVEL_IDX))
+                _n_lvls = len(_st_sc.get("pos_phased_all") or WIND_SPEED_LABELS)
+                _new    = (_cur + 1) % _n_lvls
+                _st_sc["speed_idx"]    = _new
+                _st_sc["pos_phased"]   = _st_sc["pos_phased_all"][_new]
+                _st_sc["alpha_phased"] = _st_sc["alpha_phased_all"][_new]
+                _st_sc["frame"]        = 0
+            # Sync button state to the new index of o2 (both species stay in sync).
+            _st_o2 = wind_states.get("o2") or wind_states.get("ch4")
+            if _st_o2 is not None:
+                _new_idx = int(_st_o2.get("speed_idx", DEFAULT_WIND_SPEED_LEVEL_IDX))
+                _btn = _wind_speed_btn_ref[0]
+                if _btn is not None:
+                    try:
+                        # Force button to the correct visual state.
+                        while _btn.status_idx != _new_idx:
+                            _btn.switch()
+                    except Exception:  # noqa: BLE001
+                        pass
+            _request_render()
+
+        _wind_speed_btn_ref[0] = plt.add_button(
+            _wind_speed_cycle_cb,
+            states=[f"Wind \u25b8 {lbl}" for lbl in WIND_SPEED_LABELS],
+            c=["white"] * 3,
+            bc=["#0d47a1", "#1976d2", "#42a5f5"],
+            pos=(0.88, 0.64),
+            size=14,
+            bold=True,
+        )
+        # Advance button to the default starting speed level.
+        _def_idx = int(DEFAULT_WIND_SPEED_LEVEL_IDX)
+        for _ in range(_def_idx):
+            try:
+                _wind_speed_btn_ref[0].switch()
+            except Exception:  # noqa: BLE001
+                break
+
+        # ── Sphere-radius gauge ───────────────────────────────────────────
+        # Adjusts the vtkSphereSource radius for both species live.
+        # Range 0.5 – 20 vox; default = average of O2 and CH4 defaults.
+        _wsr_init = (DEFAULT_WIND_O2_SPHERE_RADIUS
+                     + DEFAULT_WIND_CH4_SPHERE_RADIUS) / 2.0
+
+        def _wind_sphere_cb(widget, _event):
+            v = float(widget.value)
+            for _sp_sr in ("o2", "ch4"):
+                _src = wind_states.get(_sp_sr, {}).get("sphere_src")
+                if _src is None:
+                    continue
+                try:
+                    _src.SetRadius(v)
+                    _src.Update()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                widget.GetRepresentation().SetTitleText(
+                    f"Sphere radius {v:.1f} vox"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            _request_render()
+
+        _wsr_sw = plt.add_slider(
+            _wind_sphere_cb,
+            0.5, 20.0,
+            value=_wsr_init,
+            pos=((0.33, 0.31), (0.82, 0.31)),
+            title=f"Sphere radius {_wsr_init:.1f} vox",
+            title_size=0.3,
+            show_value=True,
+        )
+        _slim_slider(_wsr_sw)
+        wind_sliders.append(_wsr_sw)
+        _set_widget_visible(_wsr_sw, False)
+
+    def _make_arrows_actor(data, color_override=None, domain=None):
         """Build a uniform-length / uniform-thickness vedo Arrows actor
         from a data dict produced by :func:`_build_arrow_field` or
         :func:`_build_track_arrow_field`.  Only the colour varies, driven
-        by ``astate["cmap_mode"]`` (``"angle"`` or ``"convergence"``)."""
+        by ``astate["cmap_mode"]`` (``"angle"`` or ``"convergence"``),
+        unless ``domain`` is ``"water"`` or ``"air"`` (dual-overlay colormaps)
+        or ``color_override`` is given as an ``(R, G, B)`` float tuple in [0,1]
+        (fixed uniform colour, fallback)."""
         if data is None:
             return None
         try:
@@ -1815,7 +2227,34 @@ def _attach_controls(
                 [0.90, 0.10, 0.10],   # red
             ], dtype=np.float32)
 
-            if astate["cmap_mode"] == "convergence" and len(boost) > 1:
+            if domain == "water":
+                # Radial-angle score (0=radial, 1=tangential).
+                # Colormap: deep ultramarine → light blue → light violet → scarlet.
+                stops = np.array([
+                    [0.10, 0.12, 0.72],   # deep ultramarine
+                    [0.25, 0.45, 1.00],   # light blue
+                    [0.70, 0.35, 0.90],   # light violet
+                    [0.90, 0.05, 0.05],   # scarlet red
+                ], dtype=np.float32)
+                t = np.clip(
+                    np.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0),
+                    0.0, 1.0,
+                ).astype(np.float32)
+            elif domain == "air":
+                # X-axis alignment score: 0 = aligned with numpy X (dirs[:,2]),
+                # 1 = perpendicular.  Colormap: fir green → yellow-green.
+                stops = np.array([
+                    [0.05, 0.38, 0.10],   # fir / forest green
+                    [0.28, 0.68, 0.12],   # mid green
+                    [0.72, 0.88, 0.12],   # yellow-green
+                ], dtype=np.float32)
+                nrm_d = np.linalg.norm(dirs, axis=-1)
+                safe  = nrm_d > 1e-9
+                dirs_unit_loc = np.zeros_like(dirs)
+                dirs_unit_loc[safe] = dirs[safe] / nrm_d[safe, None]
+                x_align = np.abs(dirs_unit_loc[:, 0])  # |cos(angle with scene X = numpy axis 0 = long root axis)|
+                t = np.clip(1.0 - x_align, 0.0, 1.0).astype(np.float32)
+            elif astate["cmap_mode"] == "convergence" and len(boost) > 1:
                 # Defensive: scrub NaN/Inf that may sneak in from older
                 # caches (np.percentile propagates NaN, which then makes
                 # every t = NaN -> rgb = NaN -> uint8 = 0 -> BLACK arrows).
@@ -1837,6 +2276,11 @@ def _attach_controls(
             i0 = np.clip(seg.astype(int), 0, len(stops) - 2)
             f  = (seg - i0)[:, None]
             rgb = stops[i0] * (1.0 - f) + stops[i0 + 1] * f
+            if color_override is not None:
+                # Fixed colour fallback (legacy).
+                r, g, b_c = color_override
+                rgb = np.full_like(rgb, 0.0)
+                rgb[:, 0] = r; rgb[:, 1] = g; rgb[:, 2] = b_c
             colors = (rgb * 255).astype(np.uint8)
 
             act = _vedo.Arrows(
@@ -2441,9 +2885,10 @@ def _attach_controls(
                 vmin, vmax, value=astate[key],
                 pos=((x1, y), (x2, y)),
                 title=f"arr·{key}",
-                title_size=0.4,
+                title_size=0.3,
                 show_value=True,
             )
+            _slim_slider(sw)
             arrow_sliders.append(sw)
             _set_widget_visible(sw, False)  # hidden until Arrows mode
 
@@ -2461,11 +2906,12 @@ def _attach_controls(
             _pillars_hue_slider = plt.add_slider(
                 _pillars_hue_cb,
                 0.0, 1.0, value=pillars_state["hue_shift"],
-                pos=((x1, 0.10), (x2, 0.10)),
+                pos=((x1, 0.09), (x2, 0.09)),
                 title="pillars·hue",
-                title_size=0.4,
+                title_size=0.3,
                 show_value=True,
             )
+            _slim_slider(_pillars_hue_slider)
             arrow_sliders.append(_pillars_hue_slider)
             _set_widget_visible(_pillars_hue_slider, False)
 
@@ -2475,10 +2921,20 @@ def _attach_controls(
         modes: list[str] = ["mesh_bridges"]
         if alt_mesh is not None:
             modes.append("mesh_all")
-        if arrows_actor is not None:
+        if dual_arrows_data is not None:
+            modes.append("arrows_dual")
+        elif arrows_actor is not None:
             modes.append("arrows_grid")
         if tracks_data is not None:
             modes.append("arrows_tracks")
+            water_dual_actor = _make_arrows_actor(
+                dual_arrows_data.get("water"),
+                domain="water",
+            )
+            air_dual_actor = _make_arrows_actor(
+                dual_arrows_data.get("air"),
+                domain="air",
+            )
 
         def _actor_for(name):
             if name == "mesh_bridges":
@@ -2489,17 +2945,24 @@ def _attach_controls(
                 return arrows_actor
             if name == "arrows_tracks":
                 return tracks_actor
+            if name == "arrows_dual":
+                return None  # two actors — handled explicitly in _enter_mode
             return None
 
         def _is_arrows_mode(name: str) -> bool:
-            return name in ("arrows_grid", "arrows_tracks")
+            return name in ("arrows_grid", "arrows_tracks", "arrows_dual")
 
         def _enter_mode(new_mode: str) -> None:
+            nonlocal water_dual_actor, air_dual_actor
             cur = view_mode["name"]
             if cur == new_mode:
                 return
             cur_actor = _actor_for(cur)
             _plt_remove(cur_actor)
+            # Extra removal for dual mode (two actors).
+            if cur == "arrows_dual":
+                _plt_remove(water_dual_actor)
+                _plt_remove(air_dual_actor)
             view_mode["name"] = new_mode
             # Keep `active["mesh"]` in sync (used by `_pillars_should_show`
             # and the status banner).
@@ -2522,13 +2985,24 @@ def _attach_controls(
                 )
             new_actor = _actor_for(new_mode)
             _plt_add(new_actor)
+            # Extra add for dual mode.
+            if new_mode == "arrows_dual":
+                _plt_add(water_dual_actor)
+                _plt_add(air_dual_actor)
             _refresh_pillars_visibility()
             in_arrows = _is_arrows_mode(new_mode)
             for s in mesh_sliders:
                 _set_widget_visible(s, not in_arrows and _gauge_state["on"])
             for s in arrow_sliders:
-                _set_widget_visible(s, in_arrows and _gauge_state["on"])
-            _set_button_visible(_cmap_btn, in_arrows)
+                # Dual-arrow mode doesn't use the arrow-length slider
+                # (fixed colour, no cmap toggle needed).
+                _set_widget_visible(s, in_arrows
+                                    and new_mode != "arrows_dual"
+                                    and _gauge_state["on"])
+            for s in wind_sliders:
+                _set_widget_visible(s, _gauge_state["on"])
+            _set_button_visible(_cmap_btn, in_arrows
+                                and new_mode != "arrows_dual")
             if _density_btn is not None:
                 _set_button_visible(
                     _density_btn,
@@ -2541,6 +3015,29 @@ def _attach_controls(
                 _show_status(STATUS_TITLE_ARROWS_GRID)
             elif new_mode == "arrows_tracks":
                 _show_status(STATUS_TITLE_ARROWS_TRACKS)
+            elif new_mode == "arrows_dual":
+                _show_status("Water ⊕ Air conduction — dual arrows")
+            # ── Update subtitle ──────────────────────────────────────────
+            _mode_subtitles = {
+                "mesh_bridges":  "Cortical bridges mesh",
+                "mesh_all":      "All watered tissues",
+                "arrows_grid":   "Water gradient field",
+                "arrows_tracks": "Conduction shortest paths",
+                "arrows_dual":   "Water ⊕ Air dual conduction",
+            }
+            _sub = _mode_subtitles.get(new_mode, "")
+            _current_subtitle[0] = _sub
+            if _info_panel is not None:
+                try:
+                    _info_panel.update(_sub)
+                except Exception:  # noqa: BLE001
+                    pass
+            _st = _subtitle_state.get("text2d")
+            if _st is not None:
+                try:
+                    _st.text(_sub)
+                except Exception:  # noqa: BLE001
+                    pass
             plt.render()
 
         # ─── 4 exclusive radio buttons ──────────────────────────────────
@@ -2549,22 +3046,25 @@ def _attach_controls(
         _view_buttons: dict = {}
 
         _btn_positions = {
-            "mesh_bridges":  (0.88, 0.77),
-            "mesh_all":      (0.88, 0.71),
-            "arrows_grid":   (0.88, 0.65),
-            "arrows_tracks": (0.88, 0.59),
+            "mesh_bridges":  (0.88, 0.96),
+            "mesh_all":      (0.88, 0.92),
+            "arrows_grid":   (0.88, 0.88),
+            "arrows_dual":   (0.88, 0.88),
+            "arrows_tracks": (0.88, 0.84),
         }
         _btn_active_bg = {
             "mesh_bridges":  "#37474f",   # blue-grey
             "mesh_all":      "#5d4037",   # brown
             "arrows_grid":   "#ad1457",   # magenta
             "arrows_tracks": "#6a1b9a",   # purple
+            "arrows_dual":   "#006064",   # teal
         }
         _btn_inactive_bg = "#263238"      # darker neutral
         _btn_label = {
             "mesh_bridges":  "Mesh ▸ Cortical bridges",
             "mesh_all":      "Mesh ▸ All watered tissues",
             "arrows_grid":   "Arrows ▸ grid",
+            "arrows_dual":   "Arrows ▸ water ⊕ air",
             "arrows_tracks": "Conduction ▸ shorter paths",
         }
 
@@ -2629,7 +3129,7 @@ def _attach_controls(
             states=["Arrow color ▸ Angle", "Arrow color ▸ Convergence"],
             c=["white", "white"],
             bc=["#283593", "#bf360c"],
-            pos=(0.88, 0.47),
+            pos=(0.88, 0.64),
             size=14,
             bold=True,
         )
@@ -2727,10 +3227,10 @@ def _attach_controls(
 
         _density_btn = plt.add_button(
             _toggle_density_cb,
-            states=["Density colormap ▸ off", "Density colormap ▸ on"],
+            states=["Cortical bridges density ▸ off", "Cortical bridges density ▸ on"],
             c=["white", "white"],
             bc=["#263238", "#0277bd"],
-            pos=(0.72, 0.77),
+            pos=(0.88, 0.31),
             size=14,
             bold=True,
         )
@@ -2739,6 +3239,11 @@ def _attach_controls(
         _set_button_visible(_density_btn, True)
     else:
         logger.info("Density colormap data unavailable – toggle disabled.")
+
+    # Switch to "All watered tissues" as the default startup view.
+    if alt_mesh is not None and "mesh_all" in modes:
+        _enter_mode("mesh_all")
+        _refresh_view_buttons()
 
     # ─── Spaceship navigation (bottom-left, translation + rotation) ────
     # Two 4-row × 3-col control panels stacked in the bottom-left corner
@@ -3001,92 +3506,6 @@ def _attach_controls(
     # top-left ortho-panel overlay (y ≥ 0.5).
     _SHIP_X_L, _SHIP_X_C, _SHIP_X_R = 0.04, 0.10, 0.16
 
-    # Translation panel (upper of the two).  Cross + bottom row.
-    #       [ ↑ ]
-    # [ ← ]       [ → ]
-    #       [ ↓ ]
-    # [FWD][STOP][BCK]
-    _t_rows = [0.40, 0.36, 0.32, 0.28]
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("t", 2, +1), states=["▲"],
-        pos=(_SHIP_X_C, _t_rows[0]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("t", 1, -1), states=["◀"],
-        pos=(_SHIP_X_L, _t_rows[1]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("t", 1, +1), states=["▶"],
-        pos=(_SHIP_X_R, _t_rows[1]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("t", 2, -1), states=["▼"],
-        pos=(_SHIP_X_C, _t_rows[2]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("t", 0, +1), states=["FWD"],
-        pos=(_SHIP_X_L, _t_rows[3]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_stop("t"), states=["STOP"],
-        pos=(_SHIP_X_C, _t_rows[3]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_STOP_FG], bc=[_SHIP_STOP_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("t", 0, -1), states=["BCK"],
-        pos=(_SHIP_X_R, _t_rows[3]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_T_FG], bc=[_SHIP_T_BG]))
-
-    # Rotation panel (lower).
-    #       [ P↑ ]
-    # [ Y← ]       [ Y→ ]
-    #       [ P↓ ]
-    # [R⟲ ][STOP ][ R⟳]
-    _r_rows = [0.20, 0.16, 0.12, 0.08]
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("r", 1, +1), states=["P▲"],
-        pos=(_SHIP_X_C, _r_rows[0]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
-    # Yaw signs flipped so that the arrow direction matches the
-    # actual rotation of the view (cam.Yaw(+deg) swings view left).
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("r", 0, +1), states=["Y◀"],
-        pos=(_SHIP_X_L, _r_rows[1]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("r", 0, -1), states=["Y▶"],
-        pos=(_SHIP_X_R, _r_rows[1]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("r", 1, -1), states=["P▼"],
-        pos=(_SHIP_X_C, _r_rows[2]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("r", 2, -1), states=["R↺"],
-        pos=(_SHIP_X_L, _r_rows[3]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_stop("r"), states=["STOP"],
-        pos=(_SHIP_X_C, _r_rows[3]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_STOP_FG], bc=[_SHIP_STOP_BG]))
-    _ship_buttons.append(plt.add_button(
-        _mk_bump("r", 2, +1), states=["R↻"],
-        pos=(_SHIP_X_R, _r_rows[3]),
-        size=_SHIP_SIZE, bold=True,
-        c=[_SHIP_R_FG], bc=[_SHIP_R_BG]))
-
     # ─── Restart navigation ────────────────────────────────────────────
     # Zeroes all thrust velocities and restores the initial camera
     # framing captured right after ``plt.show(...)``.
@@ -3121,6 +3540,26 @@ def _attach_controls(
             _stop_plane_timer()
         except Exception:  # noqa: BLE001
             pass
+        # Reset saved-positions session (new file + counter on next save).
+        try:
+            positions_state["count"] = 0
+            positions_state["file"]  = None
+            _save_feedback.text("")
+            _save_feedback.alpha(0.0)
+        except Exception:  # noqa: BLE001
+            pass
+        # Hide orient HUD until first position is saved in the new session.
+        try:
+            _orient_state["visible"] = False
+            t2d = _orient_state["text2d"]
+            if t2d is not None:
+                t2d.text("YAW     ---\nPITCH   ---\nROLL    ---")
+                t2d.alpha(0.0)
+            w = _orient_state["widget"]
+            if w is not None:
+                w.EnabledOff()
+        except Exception:  # noqa: BLE001
+            pass
         # Restore the initial camera.
         if _initial_cam:
             try:
@@ -3145,16 +3584,21 @@ def _attach_controls(
                 pass
         _show_status("Navigation restarted (camera + thrust reset)")
         try:
+            _show_orient_hud()    # no-op if already visible
+            _update_orient_text()  # refresh YPR with restored camera angles
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             plt.render()
         except Exception:  # noqa: BLE001
             pass
 
     _restart_nav_btn_ref[0] = plt.add_button(
         _restart_nav_cb,
-        states=["Restart ↺"],
+        states=["Restart navigation"],
         c=["white"],
         bc=["#4527a0"],   # deep indigo, distinct from the STOP red
-        pos=(_SHIP_X_C, 0.44),   # just above the movement panels
+        pos=(0.10, 0.54),
         size=14,
         bold=True,
     )
@@ -3163,7 +3607,7 @@ def _attach_controls(
     # Single button in the left panel to cycle between the three
     # navigation sub-modes.  Visible whenever the interaction style is
     # "Navigation (buttons)".
-    _NAV_MODE_NAMES = ["Avion", "Spaceship", "Custom"]
+    _NAV_MODE_NAMES = ["Airplane mode", "Space probe mode", "Custom moves"]
 
     def _cycle_nav_mode_cb(*_a, **_kw):
         old_mode = _nav_mode[0]
@@ -3202,10 +3646,10 @@ def _attach_controls(
 
     _nav_mode_btn_ref[0] = plt.add_button(
         _cycle_nav_mode_cb,
-        states=[f"Nav ▸ {n}" for n in _NAV_MODE_NAMES],
+        states=_NAV_MODE_NAMES,
         c=["white"] * len(_NAV_MODE_NAMES),
         bc=["#1565c0", "#0d47a1", "#455a64"],
-        pos=(_SHIP_X_C, 0.48),
+        pos=(0.10, 0.46),
         size=14,
         bold=True,
     )
@@ -3257,7 +3701,7 @@ def _attach_controls(
 
     # Caps.
     _PLANE_MAX_FWD = float(_scene_max_side_plane)   # units/s (≈ X-length / s)
-    _PLANE_MAX_YAW_PITCH_DPS = 80.0   # deg/s — yaw & pitch
+    _PLANE_MAX_YAW_PITCH_DPS = 100.0   # deg/s — yaw & pitch
     _PLANE_MAX_ROLL_DPS      = 180.0   # deg/s — roll (tunable independently)
     _PLANE_ROT_DEG = 2.0  # button-click micro-impulse magnitude (legacy)
 
@@ -3574,6 +4018,11 @@ def _attach_controls(
         if not any_motion and not any_intent and not any_pending_release:
             _plane["last_t"] = None
             _stop_plane_timer()
+            if _info_panel is not None:
+                try:
+                    _info_panel.update(_current_subtitle[0], "")
+                except Exception:  # noqa: BLE001
+                    pass
             return
 
         # ── 6. Apply camera motion ───────────────────────────────────
@@ -3657,6 +4106,16 @@ def _attach_controls(
 
         if moved:
             _request_render()
+            if _info_panel is not None:
+                try:
+                    _spd_um_s = _plane["fwd_v"] * _VOXEL_SIZE_UM
+                    _spd_text = (
+                        f"Travelling speed:  {_spd_um_s:.1f} um/s"
+                        if _spd_um_s > 0.1 else ""
+                    )
+                    _info_panel.update(_current_subtitle[0], _spd_text)
+                except Exception:  # noqa: BLE001
+                    pass
 
     # Register the plane tick with the master scheduler.  The master
     # timer is created on-demand the first time any subsystem enables
@@ -3732,51 +4191,166 @@ def _attach_controls(
     _AVION_BIG  = 22             # bigger font for FWD / BCK
     _AVION_SIZE = 18
 
-    _avion_buttons.append(plt.add_button(
-        _plane_fwd, states=["FWD"],
-        c=[_AVION_FG], bc=[_AVION_FWD_BG],
-        pos=(_SHIP_X_C, 0.40), size=_AVION_BIG, bold=True,
-    ))
-    _avion_buttons.append(plt.add_button(
-        _plane_stop, states=["STOP"],
-        c=[_AVION_FG], bc=[_AVION_STOP_BG],
-        pos=(_SHIP_X_C, 0.35), size=_AVION_SIZE, bold=True,
-    ))
-    _avion_buttons.append(plt.add_button(
-        _plane_bck, states=["BCK"],
-        c=[_AVION_FG], bc=[_AVION_FWD_BG],
-        pos=(_SHIP_X_C, 0.30), size=_AVION_BIG, bold=True,
-    ))
-    _avion_buttons.append(plt.add_button(
-        _mk_plane_rot("pitch", +_PLANE_ROT_DEG), states=["P▲"],
-        c=[_AVION_FG], bc=[_AVION_PITCH_BG],
-        pos=(_SHIP_X_C, 0.24), size=_AVION_SIZE, bold=True,
-    ))
-    _avion_buttons.append(plt.add_button(
-        _mk_plane_rot("yaw", +_PLANE_ROT_DEG), states=["Y◀"],
-        c=[_AVION_FG], bc=[_AVION_YAW_BG],
-        pos=(_SHIP_X_L, 0.20), size=_AVION_SIZE, bold=True,
-    ))
-    _avion_buttons.append(plt.add_button(
-        _mk_plane_rot("yaw", -_PLANE_ROT_DEG), states=["Y▶"],
-        c=[_AVION_FG], bc=[_AVION_YAW_BG],
-        pos=(_SHIP_X_R, 0.20), size=_AVION_SIZE, bold=True,
-    ))
-    _avion_buttons.append(plt.add_button(
-        _mk_plane_rot("pitch", -_PLANE_ROT_DEG), states=["P▼"],
-        c=[_AVION_FG], bc=[_AVION_PITCH_BG],
-        pos=(_SHIP_X_C, 0.16), size=_AVION_SIZE, bold=True,
-    ))
-    _avion_buttons.append(plt.add_button(
-        _mk_plane_rot("roll", +_PLANE_ROT_DEG), states=["R↺"],
-        c=[_AVION_FG], bc=[_AVION_ROLL_BG],
-        pos=(_SHIP_X_L, 0.12), size=_AVION_SIZE, bold=True,
-    ))
-    _avion_buttons.append(plt.add_button(
-        _mk_plane_rot("roll", -_PLANE_ROT_DEG), states=["R↻"],
-        c=[_AVION_FG], bc=[_AVION_ROLL_BG],
-        pos=(_SHIP_X_R, 0.12), size=_AVION_SIZE, bold=True,
-    ))
+    # ─── Keyboard layout detection (AZERTY / QWERTY) ─────────────────────
+    def _detect_kb_layout() -> str:
+        """Return 'azerty' or 'qwerty' by querying the X11 keyboard layout."""
+        import subprocess  # noqa: PLC0415
+        # 1) setxkbmap -query  (most reliable on X11/Wayland-XWayland)
+        try:
+            out = subprocess.check_output(
+                ["setxkbmap", "-query"], text=True, timeout=2,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                if line.startswith("layout:"):
+                    layout = line.split(":", 1)[1].strip().split(",")[0]
+                    if layout in ("fr", "be"):
+                        return "azerty"
+                    return "qwerty"
+        except Exception:  # noqa: BLE001
+            pass
+        # 2) /etc/default/keyboard  (Debian/Ubuntu headless)
+        try:
+            kbd_conf = open("/etc/default/keyboard").read()
+            for ln in kbd_conf.splitlines():
+                if ln.startswith("XKBLAYOUT="):
+                    layout = ln.split("=", 1)[1].strip().strip('"').split(",")[0]
+                    if layout in ("fr", "be"):
+                        return "azerty"
+                    return "qwerty"
+        except Exception:  # noqa: BLE001
+            pass
+        # 3) localectl  (systemd)
+        try:
+            out = subprocess.check_output(
+                ["localectl", "status"], text=True, timeout=2,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                if "X11 Layout" in line or "VC Keymap" in line:
+                    if "fr" in line or "be" in line:
+                        return "azerty"
+                    return "qwerty"
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("Could not detect keyboard layout; defaulting to AZERTY.")
+        return "azerty"
+
+    _kb_layout = _detect_kb_layout()
+    logger.info("Keyboard layout detected: %s", _kb_layout)
+
+    # ─── Controls image (below nav mode buttons) ─────────────────────────
+    # Place layout-specific images in:  <repo>/images/
+    #   Controls_airplane_azerty.jpg   Controls_airplane_qwerty.jpg
+    #   Controls_spaceship_azerty.jpg  Controls_spaceship_qwerty.jpg  (future)
+    # Falls back to Controls_<mode>, Controls_<layout>, Controls (any format).
+    _MODE_IMG_STEMS = ["airplane", "spaceship", "custom"]
+
+    def _resolve_controls_img_path(mode_stem: str):
+        """Return first existing image path for this mode+layout, or None."""
+        candidates = [
+            _REPO_ROOT / "images" / f"Controls_{mode_stem}_{_kb_layout}",
+            _REPO_ROOT / "images" / f"Controls_{mode_stem}",
+            _REPO_ROOT / "images" / f"Controls_{_kb_layout}",
+            _REPO_ROOT / "images" / "Controls",
+            _REPO_ROOT / f"Controls_{mode_stem}_{_kb_layout}",
+            _REPO_ROOT / f"Controls_{mode_stem}",
+            _REPO_ROOT / f"Controls_{_kb_layout}",
+            _REPO_ROOT / "Controls",
+        ]
+        for _stem in candidates:
+            for _ext in (".jpg", ".jpeg", ".png"):
+                _cp = _stem.with_suffix(_ext)
+                if _cp.exists():
+                    return str(_cp)
+        return None
+
+    _CTRL_IMG_NRM_W = 0.40 / 1.7  # normalised-viewport width of the controls image
+    # src_h/src_w stored per mode so Position2 can be recalculated on resize.
+    _ctrl_img_aspects: dict = {}  # mode_index → float
+
+    def _load_controls_actor(path: str):
+        """Load a vtkActor2D (hidden) for a screen-space image overlay.
+
+        Returns ``(actor, src_aspect)`` where ``src_aspect = src_h / src_w``.
+        """
+        try:
+            import vtk as _vtk_img  # noqa: PLC0415
+            _rdr = _vtk_img.vtkImageReader2Factory.CreateImageReader2(path)
+            if _rdr is None:
+                logger.warning("Unsupported image format for controls image: %s", path)
+                return None, None
+            _rdr.SetFileName(path)
+            _rdr.Update()
+            _img_data = _rdr.GetOutput()
+            _dims = _img_data.GetDimensions()
+            _src_w, _src_h = max(_dims[0], 1), max(_dims[1], 1)
+            _src_aspect = _src_h / _src_w  # stored for resize recomputation
+            try:
+                _win_w, _win_h = plt.window.GetSize()
+            except Exception:  # noqa: BLE001
+                _win_w, _win_h = 1600, 900
+            _win_w, _win_h = max(_win_w, 1), max(_win_h, 1)
+            # nrm_h = nrm_w * (win_w / win_h) * (src_h / src_w)
+            _nrm_h = _CTRL_IMG_NRM_W * (_win_w / _win_h) * _src_aspect
+            # vtkActor2D + RenderToRectangle: correct brightness, proper 2-D overlay.
+            _mapper = _vtk_img.vtkImageMapper()
+            _mapper.SetInputData(_img_data)
+            _mapper.SetColorWindow(255)
+            _mapper.SetColorLevel(127.5)
+            _mapper.RenderToRectangleOn()
+            _act = _vtk_img.vtkActor2D()
+            _act.SetMapper(_mapper)
+            _act.GetPositionCoordinate().SetCoordinateSystemToNormalizedDisplay()
+            _act.GetPositionCoordinate().SetValue(0.01, 0.02)
+            _act.GetPosition2Coordinate().SetCoordinateSystemToNormalizedDisplay()
+            _act.GetPosition2Coordinate().SetValue(0.01 + _CTRL_IMG_NRM_W,
+                                                    0.02 + _nrm_h)
+            _act.SetVisibility(0)  # hidden until _refresh_nav_panel_visibility
+            plt.renderer.AddActor2D(_act)
+            return _act, _src_aspect
+        except Exception as _exc_img:  # noqa: BLE001
+            logger.warning("Could not load controls image %s: %s", path, _exc_img)
+            return None, None
+
+    for _mi, _mstem in enumerate(_MODE_IMG_STEMS):
+        _img_path = _resolve_controls_img_path(_mstem)
+        if _img_path is not None:
+            logger.info("Controls image mode=%s: %s", _mstem, _img_path)
+            _act_mi, _asp_mi = _load_controls_actor(_img_path)
+            _controls_img_actors[_mi] = _act_mi
+            if _asp_mi is not None:
+                _ctrl_img_aspects[_mi] = _asp_mi
+        else:
+            _controls_img_actors[_mi] = None
+
+    def _reposition_ctrl_imgs(*_a, **_kw) -> None:
+        """Recompute Position2 for every controls image actor (called on resize)."""
+        try:
+            _ww, _wh = plt.window.GetSize()
+        except Exception:  # noqa: BLE001
+            return
+        _ww, _wh = max(_ww, 1), max(_wh, 1)
+        for _mi_r, _act_r in _controls_img_actors.items():
+            if _act_r is None:
+                continue
+            _asp_r = _ctrl_img_aspects.get(_mi_r)
+            if _asp_r is None:
+                continue
+            try:
+                _nh = _CTRL_IMG_NRM_W * (_ww / _wh) * _asp_r
+                _act_r.GetPosition2Coordinate().SetValue(
+                    0.01 + _CTRL_IMG_NRM_W, 0.02 + _nh
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        plt.window.AddObserver("ModifiedEvent", _reposition_ctrl_imgs)
+    except Exception as _obs_exc:  # noqa: BLE001
+        logger.warning("Could not register ctrl-img resize observer: %s", _obs_exc)
+
+    _nav_img_widget: list = [None]  # legacy sentinel
 
     # ─── Keyboard navigation toggle (Avion) ───────────────────
     # Inactive by default. When ON *and* the current sub-mode is Avion,
@@ -3800,15 +4374,8 @@ def _attach_controls(
         except Exception:  # noqa: BLE001
             pass
 
-    _keyboard_btn_ref[0] = plt.add_button(
-        _toggle_keyboard_cb,
-        states=["Keys ▸ off", "Keys ▸ on"],
-        c=["#9e9e9e", "white"],
-        bc=["#263238", "#00695c"],
-        pos=(0.22, 0.48),
-        size=14,
-        bold=True,
-    )
+    # Keyboard button removed – the keyboard auto-activates via _kbd_activate_once.
+    # _keyboard_btn_ref[0] stays None; visibility code handles None gracefully.
 
     # One-shot RenderEvent: activate keyboard after the first complete render
     # (= window shown, all actors uploaded to GPU, panels painted).
@@ -3852,34 +4419,48 @@ def _attach_controls(
     def _toggle_gauge_cb(*_a, **_kw):
         _gauge_state["on"] = not _gauge_state["on"]
         on = _gauge_state["on"]
-        in_arrows = view_mode.get("name") in ("arrows_grid", "arrows_tracks")
+        in_arrows = view_mode.get("name") in ("arrows_grid", "arrows_tracks",
+                                               "arrows_dual")
         for s in mesh_sliders:
             _set_widget_visible(s, on and not in_arrows)
         for s in arrow_sliders:
-            _set_widget_visible(s, on and in_arrows)
+            # Dual mode uses fixed colours — no length/cmap sliders.
+            _set_widget_visible(s, on and in_arrows
+                                and view_mode.get("name") != "arrows_dual")
+        for s in wind_sliders:
+            _set_widget_visible(s, on)
         _gauge_btn.switch()
         plt.render()
 
     _gauge_btn = plt.add_button(
         _toggle_gauge_cb,
-        states=["Gauges ▸ on", "Gauges ▸ off"],
-        c=["white", "#9e9e9e"],
-        bc=["#00695c", "#263238"],
-        pos=(0.35, 0.48),
+        # State 0 = gauges hidden ("off" shown), state 1 = gauges visible
+        states=["Gauges ▸ off", "Gauges ▸ on"],
+        c=["#9e9e9e", "white"],
+        bc=["#263238", "#00695c"],
+        pos=(0.88, 0.43),
         size=14,
         bold=True,
     )
 
     # KeySym sets. We accept both NumLock-on and NumLock-off variants of
     # the numpad keys so the roll bindings work either way.
+    # AZERTY: accel=Z, decel=S, roll-left=Q, roll-right=D
+    # QWERTY: accel=W, decel=S, roll-left=A, roll-right=D  (same physical keys)
     _AVION_KEYS_YAW_LEFT   = {"Left"}
     _AVION_KEYS_YAW_RIGHT  = {"Right"}
     _AVION_KEYS_PITCH_UP   = {"Up"}    # flèche haut = pitch vers le haut
     _AVION_KEYS_PITCH_DOWN = {"Down"}  # flèche bas = pitch vers le bas
-    _AVION_KEYS_ACCEL      = {"z", "Z"}
-    _AVION_KEYS_DECEL      = {"s", "S"}
-    _AVION_KEYS_ROLL_LEFT  = {"q", "Q"}
-    _AVION_KEYS_ROLL_RIGHT = {"d", "D"}
+    if _kb_layout == "azerty":
+        _AVION_KEYS_ACCEL      = {"z", "Z"}
+        _AVION_KEYS_DECEL      = {"s", "S"}
+        _AVION_KEYS_ROLL_LEFT  = {"d", "D"}  # swapped (Q felt backwards)
+        _AVION_KEYS_ROLL_RIGHT = {"q", "Q"}
+    else:  # qwerty
+        _AVION_KEYS_ACCEL      = {"w", "W"}
+        _AVION_KEYS_DECEL      = {"s", "S"}
+        _AVION_KEYS_ROLL_LEFT  = {"d", "D"}  # swapped (A felt backwards)
+        _AVION_KEYS_ROLL_RIGHT = {"a", "A"}
 
     # Resolve keysym names to X11 keycodes for fast polling.
     for _intent, _keysyms in (
@@ -4105,6 +4686,102 @@ def _attach_controls(
     # Avion is the default → avion buttons visible, ship + custom hidden.
     _refresh_nav_panel_visibility()
 
+    # ─── Global key sink ────────────────────────────────────────────────
+    # Absorbs ALL key presses that higher-priority app handlers (avion@10.0,
+    # save_pos/'x'@1.0, Enter@1.0) did not consume.  Registered at 0.5 so
+    # it fires AFTER our specific handlers (which abort their own keys) but
+    # BEFORE vedo's default_keypress (0.0) and VTK style OnChar/OnKeyPress
+    # (0.0).  Both events are covered:
+    #   • KeyPressEvent  — raw key sym (special keys, arrow keys, …)
+    #   • CharEvent      — printable characters ('q','e','r','w','s','f',…)
+    def _global_key_sink(obj, _event):
+        """Absorb any key that no higher-priority handler consumed."""
+        try:
+            tag = _key_sink_tag[0]
+            if tag is not None:
+                cmd = obj.GetCommand(tag)
+                if cmd is not None:
+                    cmd.AbortFlagOn()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            obj.SetKeySym("")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            obj.SetKeyCode("\0")
+        except Exception:  # noqa: BLE001
+            pass
+
+    _key_sink_tag:  list = [None]
+    _char_sink_tag: list = [None]
+    _iren_ks = getattr(plt, "interactor", None)
+    if _iren_ks is not None:
+        try:
+            _key_sink_tag[0] = _iren_ks.AddObserver(
+                "KeyPressEvent", _global_key_sink, 0.5,
+            )
+            _char_sink_tag[0] = _iren_ks.AddObserver(
+                "CharEvent", _global_key_sink, 0.5,
+            )
+            logger.info("Global key/char sink attached (priority 0.5).")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Global key/char sink could not attach: %s", exc)
+
+    # ─── Global mouse sink (navigation mode) ────────────────────────────
+    # In Navigation mode (vtkInteractorStyleUser) left-clicks should only
+    # activate app buttons / sliders — never reach vedo's default picker.
+    #
+    # Priority layout for LeftButtonPressEvent:
+    #   10.0  _reassert_style_on_click  (style guard, already registered)
+    #    0.5  vedo Slider2D widgets     (registered early; abort if hit)
+    #    0.5  _global_mouse_sink        (registered here, AFTER sliders)
+    #    0.0  vedo default_mouseleftclick
+    #
+    # Same-priority observers fire in registration order (FIFO).  When a
+    # slider widget handles the click it calls AbortFlagOn on its command,
+    # which stops the loop before _global_mouse_sink runs.  When no slider
+    # intercepts, _global_mouse_sink fires: it runs vtkPropPicker.PickProp()
+    # which raises PickEvent on any 2-D actor under the cursor (→ button
+    # callbacks execute), then always aborts so vedo's handler never
+    # double-fires those callbacks.
+    # In Trackball mode the function returns immediately so camera navigation
+    # and vedo work normally.
+    def _global_mouse_sink(obj, _event):
+        """Navigation-mode left-click guard."""
+        if style_state["idx"] != style_state["custom_idx"]:
+            return  # trackball: full pass-through
+        try:
+            x, y = obj.GetEventPosition()
+            ren = obj.FindPokedRenderer(x, y)
+            if ren is not None:
+                import vtk as _vtk_ms
+                _pick = _vtk_ms.vtkPropPicker()
+                _pick.PickProp(x, y, ren)
+                # PickProp fires PickEvent on every pickable prop at (x,y),
+                # including 2-D button actors → their function() callbacks
+                # execute here.  Aborting below prevents vedo from running
+                # a second pick that would double-fire those callbacks.
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cmd = obj.GetCommand(_mouse_sink_tag[0])
+            if cmd is not None:
+                cmd.AbortFlagOn()
+        except Exception:  # noqa: BLE001
+            pass
+
+    _mouse_sink_tag: list = [None]
+    _iren_ms = getattr(plt, "interactor", None)
+    if _iren_ms is not None:
+        try:
+            _mouse_sink_tag[0] = _iren_ms.AddObserver(
+                "LeftButtonPressEvent", _global_mouse_sink, 0.5,
+            )
+            logger.info("Global mouse sink (nav-mode) attached (priority 0.5).")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Global mouse sink could not attach: %s", exc)
+
     # ─── Fog (depth) + SSAO toggles ─────────────────────────────────────
     # Both are GPU effects driven from the bottom-right button column.
     # They are independent and either / both / none may be active.
@@ -4202,7 +4879,7 @@ def _attach_controls(
         states=["Fog ▸ off", "Fog ▸ on"],
         c=["#9e9e9e", "white"],
         bc=["#263238", "#1976d2"],
-        pos=(0.88, 0.41),
+        pos=(0.88, 0.27),
         size=14,
         bold=True,
     )
@@ -4295,10 +4972,50 @@ def _attach_controls(
         states=["SSAO ▸ off", "SSAO ▸ on"],
         c=["#9e9e9e", "white"],
         bc=["#263238", "#6a1b9a"],
+        pos=(0.88, 0.23),
+        size=14,
+        bold=True,
+    )
+
+    # ─── Axis toggle (renderer options panel) ───────────────────────────
+    _axis_state: dict = {"on": False}
+
+    def _toggle_axis_cb(*_a, **_kw):
+        _axis_state["on"] = not _axis_state["on"]
+        on = _axis_state["on"]
+        for _ax in getattr(plt, "axes_instances", []):
+            if _ax is None:
+                continue
+            try:
+                if hasattr(_ax, "GetOrientationMarker"):  # vtkOrientationMarkerWidget
+                    _ax.GetOrientationMarker().SetVisibility(1 if on else 0)
+                elif hasattr(_ax, "SetVisibility"):  # vedo Assembly / actor
+                    _ax.SetVisibility(1 if on else 0)
+            except Exception:  # noqa: BLE001
+                pass
+        _axis_btn.switch()
+        plt.render()
+
+    _axis_btn = plt.add_button(
+        _toggle_axis_cb,
+        states=["Axis OFF", "Axis ON"],
+        c=["#9e9e9e", "white"],
+        bc=["#263238", "#006064"],
         pos=(0.88, 0.35),
         size=14,
         bold=True,
     )
+    # Initially hide all axis markers (axis starts OFF)
+    for _ax_init in getattr(plt, "axes_instances", []):
+        if _ax_init is None:
+            continue
+        try:
+            if hasattr(_ax_init, "GetOrientationMarker"):  # vtkOrientationMarkerWidget
+                _ax_init.GetOrientationMarker().SetVisibility(0)
+            elif hasattr(_ax_init, "SetVisibility"):  # vedo Assembly / actor
+                _ax_init.SetVisibility(0)
+        except Exception:  # noqa: BLE001
+            pass
 
     _ui_capturers.append(lambda: {
         "fog_on":  bool(_depth_state["fog_on"]),
@@ -4351,6 +5068,16 @@ def _attach_controls(
             )
     except Exception as _wu_exc:  # noqa: BLE001
         logger.warning("Shader warmup failed (non-fatal): %s", _wu_exc)
+
+    # ── FPS/speed HUD: hook to VTK EndEvent so it fires on every render,
+    # including trackball mouse-drag renders that bypass the master timer.
+    try:
+        _ren_win = getattr(plt, "window", None)
+        if _ren_win is not None:
+            _ren_win.AddObserver("EndEvent", lambda *_: _fps_tick())
+            logger.info("FPS/speed HUD hooked to RenderWindow EndEvent.")
+    except Exception as _hud_exc:  # noqa: BLE001
+        logger.warning("Could not hook FPS/speed HUD to EndEvent: %s", _hud_exc)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4413,7 +5140,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     plt.show(mesh, viewup="z", interactive=False)
 
-    # Load the raw greyscale volume once: it is reused by both the
+    # ── Loading overlay ─────────────────────────────────────────────────
+    # Cover the window with an opaque black renderer (layer 1) that shows
+    # "Loading…" while all meshes, caches, and UI controls are being set
+    # up.  Torn down as soon as _attach_controls() returns.
+    try:
+        import vtk as _vtk_load
+        _load_ren = _vtk_load.vtkRenderer()
+        _load_ren.SetViewport(0.0, 0.0, 1.0, 1.0)
+        _load_ren.SetLayer(1)
+        _load_ren.SetBackground(0.0, 0.0, 0.0)
+        _load_ren.InteractiveOff()
+        _load_txt = _vtk_load.vtkTextActor()
+        _load_txt.SetInput("Loading...")
+        _load_txt.GetTextProperty().SetFontSize(72)
+        _load_txt.GetTextProperty().SetColor(1.0, 1.0, 1.0)
+        _load_txt.GetTextProperty().SetBold(True)
+        _load_txt.GetTextProperty().SetJustificationToCentered()
+        _load_txt.GetTextProperty().SetVerticalJustificationToCentered()
+        _pos = _load_txt.GetPositionCoordinate()
+        _pos.SetCoordinateSystemToNormalizedDisplay()
+        _pos.SetValue(0.5, 0.5)
+        _load_ren.AddActor2D(_load_txt)
+        _n_layers = plt.window.GetNumberOfLayers()
+        plt.window.SetNumberOfLayers(max(_n_layers, 2))
+        plt.window.AddRenderer(_load_ren)
+        plt.window.Render()
+        _loading_overlay_ren = _load_ren
+    except Exception as _lov_exc:  # noqa: BLE001
+        logger.warning("Loading overlay failed (non-fatal): %s", _lov_exc)
+        _loading_overlay_ren = None
     # orthogonal-slice panel and the (optional) volume-rendering toggle.
     raw_volume = None
     raw_path = Path(args.raw).expanduser().resolve()
@@ -4436,7 +5192,7 @@ def main(argv: list[str] | None = None) -> int:
             ortho_overlay = OrthoPanelOverlay(
                 plt, raw_volume,
                 viewport=(0.0, 0.5, 0.4, 1.0),  # top-left, ~40% wide × 50% tall
-                cell_pixels=320,
+                cell_pixels=224,
             )
             # Refresh on standard mouse interactions too.
             iren = getattr(plt, "interactor", None)
@@ -4463,6 +5219,17 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("Ortho-panel overlay attached.")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to attach ortho panel: %s", exc)
+
+    # Load dual (water + air) arrow caches for the arrows_dual mode.
+    dual_arrows_data = _load_or_build_dual_arrows(
+        DEFAULT_WATER_HARMONIC_CACHE,
+        DEFAULT_WIND_FIELD_CACHE,
+        dual_water_cache=Path(args.dual_water_cache).expanduser().resolve()
+                         if getattr(args, "dual_water_cache", None) else None,
+        dual_air_cache=Path(args.dual_air_cache).expanduser().resolve()
+                       if getattr(args, "dual_air_cache", None) else None,
+        rebuild=False,
+    )
 
     # Build (or load cached) gradient-arrow field for the 4th toggle.
     arrows_data = _load_or_build_arrows(
@@ -4663,39 +5430,45 @@ def main(argv: list[str] | None = None) -> int:
             _load_wind_tpl = None  # type: ignore[assignment]
 
         if _load_wind_tpl is not None:
-            for _species, _arg_cache, _display, _color, _psize in (
-                ("o2",  args.wind_o2_cache,  int(args.wind_o2_display),
-                 DEFAULT_WIND_O2_COLOR,  DEFAULT_WIND_O2_POINT_SIZE),
-                ("ch4", args.wind_ch4_cache, int(args.wind_ch4_display),
-                 DEFAULT_WIND_CH4_COLOR, DEFAULT_WIND_CH4_POINT_SIZE),
+            for _species, _default_caches, _display, _color, _sradius in (
+                ("o2",  DEFAULT_WIND_O2_CACHES,  int(args.wind_o2_display),
+                 DEFAULT_WIND_O2_COLOR,  DEFAULT_WIND_O2_SPHERE_RADIUS),
+                ("ch4", DEFAULT_WIND_CH4_CACHES, int(args.wind_ch4_display),
+                 DEFAULT_WIND_CH4_COLOR, DEFAULT_WIND_CH4_SPHERE_RADIUS),
             ):
-                _path = Path(_arg_cache).expanduser().resolve()
-                if not _path.exists():
-                    logger.info("Wind %s cache not found: %s — skipped.",
-                                _species.upper(), _path)
-                    continue
-                try:
-                    _tpl = _load_wind_tpl(_path)
+                _tpls = []
+                for _lbl_w, _cache_w in zip(WIND_SPEED_LABELS, _default_caches):
+                    _path = Path(_cache_w).expanduser().resolve()
+                    if not _path.exists():
+                        logger.info("Wind %s [%s] cache not found: %s — skipped.",
+                                    _species.upper(), _lbl_w, _path)
+                        continue
+                    try:
+                        _tpl = _load_wind_tpl(_path)
+                        logger.info(
+                            "Wind %s [%s] templates loaded: %d × %d frames @ %d fps"
+                            " (display=%d, sphere_r=%.1fvox)",
+                            _species.upper(), _lbl_w,
+                            _tpl["n_templates"], _tpl["n_frames"], _tpl["fps"],
+                            _display, _sradius,
+                        )
+                        _tpls.append(_tpl)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Could not load wind %s [%s] cache (%s): %s",
+                                       _species.upper(), _lbl_w, _path, exc)
+                if _tpls:
                     wind_data[_species] = {
-                        "tpl":        _tpl,
-                        "display":    _display,
-                        "color":      _color,
-                        "point_size": _psize,
+                        "tpls":          _tpls,
+                        "display":       _display,
+                        "color":         _color,
+                        "sphere_radius": _sradius,
+                        "speed_idx":     DEFAULT_WIND_SPEED_LEVEL_IDX,
                     }
-                    logger.info(
-                        "Wind %s templates loaded: %d × %d frames @ %d fps "
-                        "(display=%d, size=%.1fpx)",
-                        _species.upper(),
-                        _tpl["n_templates"], _tpl["n_frames"], _tpl["fps"],
-                        _display, _psize,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Could not load wind %s cache (%s): %s",
-                                   _species.upper(), _path, exc)
 
     _attach_controls(
         plt, mesh,
         arrows_data=arrows_data,
+        dual_arrows_data=dual_arrows_data,
         ortho_overlay=ortho_overlay,
         alt_mesh=alt_mesh,
         pillars_mesh=pillars_mesh,
@@ -4706,6 +5479,14 @@ def main(argv: list[str] | None = None) -> int:
         mask_overlay_meshes=mask_overlay_meshes,
         wind_data=wind_data,
     )
+    # ── Tear down the loading overlay ───────────────────────────────────
+    if _loading_overlay_ren is not None:
+        try:
+            plt.window.RemoveRenderer(_loading_overlay_ren)
+        except Exception as _lov_rm_exc:  # noqa: BLE001
+            logger.warning("Could not remove loading overlay: %s", _lov_rm_exc)
+        _loading_overlay_ren = None
+    plt.render()
     plt.interactive()
     plt.close()
     return 0

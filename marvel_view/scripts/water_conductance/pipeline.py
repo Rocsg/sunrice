@@ -1138,6 +1138,110 @@ def _load_or_build_crown_tracks(
     return data
 
 
+def _load_or_build_dual_arrows(
+    water_harmonic_path: Path,
+    wind_field_path: Path,
+    *,
+    dual_water_cache: Path | None = None,
+    dual_air_cache:  Path | None = None,
+    fine_stride: int = 4,
+    separation_vox: int = 2,
+    rebuild: bool = False,
+) -> dict | None:
+    """Load cached dual-arrow fields (water + air), or build them on the fly.
+
+    Returns a dict ``{"water": arrows_data, "air": arrows_data}`` or ``None``
+    if either harmonic field is unavailable.
+
+    The individual ``arrows_data`` dicts have the same structure as
+    :func:`_build_arrow_field` (``pts``, ``dirs``, ``scores``, ``boost``,
+    ``stride``).
+    """
+    import numpy as np
+
+    def _load_cache(path: Path) -> dict | None:
+        try:
+            z = np.load(str(path), allow_pickle=False)
+            n = len(z["pts"])
+            return {
+                "pts":    z["pts"].astype(np.float32),
+                "dirs":   z["dirs"].astype(np.float32),
+                "scores": z["scores"].astype(np.float32),
+                "boost":  z["boost"].astype(np.float32),
+                "stride": int(z["stride"][0]) if z["stride"].ndim > 0
+                          else int(z["stride"]),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to load dual-arrows cache %s: %s", path, exc)
+            return None
+
+    # Fast path: both caches present.
+    if (dual_water_cache is not None and dual_water_cache.exists()
+            and dual_air_cache is not None and dual_air_cache.exists()
+            and not rebuild):
+        w = _load_cache(dual_water_cache)
+        a = _load_cache(dual_air_cache)
+        if w is not None and a is not None:
+            logger.info(
+                "Loaded dual arrows: water=%d  air=%d",
+                len(w["pts"]), len(a["pts"]),
+            )
+            return {"water": w, "air": a}
+
+    # Slow path: build from harmonic fields.
+    if not water_harmonic_path.exists():
+        logger.info(
+            "Water harmonic cache not found (%s) — dual arrows disabled.  "
+            "Run marvel-water-harmonic-build first.", water_harmonic_path,
+        )
+        return None
+    if not wind_field_path.exists():
+        logger.info(
+            "Wind field cache not found (%s) — dual arrows disabled.  "
+            "Run marvel-wind-field-build first.", wind_field_path,
+        )
+        return None
+
+    from marvel_view.preprocessing.water_harmonic import (
+        load_water_harmonic_field, build_dual_arrows_filtered,
+    )
+    from marvel_view.preprocessing.wind_field import load_wind_field
+
+    logger.info("Building dual arrow fields (water + air) …")
+    water = load_water_harmonic_field(water_harmonic_path)
+    wind  = load_wind_field(wind_field_path)
+
+    w_arrows, a_arrows = build_dual_arrows_filtered(
+        water_vec=water["vec"],
+        water_area=water["area"],
+        air_vec=wind["vec"],
+        air_area=wind["area"],
+        fine_stride=fine_stride,
+        separation_vox=separation_vox,
+        spacing=DEFAULT_SPACING,
+    )
+
+    # Cache to disk if paths provided.
+    for cache_path, arrows in ((dual_water_cache, w_arrows),
+                                (dual_air_cache,   a_arrows)):
+        if cache_path is not None:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    str(cache_path),
+                    pts=arrows["pts"],
+                    dirs=arrows["dirs"],
+                    scores=arrows["scores"],
+                    boost=arrows["boost"],
+                    stride=np.array([arrows["stride"]], dtype=np.int32),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not cache dual arrows %s: %s",
+                               cache_path, exc)
+
+    return {"water": w_arrows, "air": a_arrows}
+
+
 def _load_or_build_overlay_mesh(
     input_path: Path,
     *,

@@ -87,6 +87,7 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_SOURCE_CROWN_PATH,
     DEFAULT_SPACING,
     DEFAULT_TARGET_CROWN_PATH,
+    DEFAULT_WATER_HARMONIC_CACHE,
     _build_arrow_field,
     _build_crown_dijkstra_tracks,
     _build_density_facet_scalars,
@@ -311,6 +312,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--lames-debug-n-cols", type=int, default=3,
                    help="Number of random columns to inspect in --lames-debug "
                         "mode (default: 3).")
+    p.add_argument("--lames-field",
+                   choices=["geoddist", "T_simple", "T_eikonal"],
+                   default="geoddist",
+                   help="Distance field used as iso-surface source for the "
+                        "lames animation.  'geoddist' (default) uses the "
+                        "geodesic-distance TIFF; 'T_simple' and 'T_eikonal' "
+                        "load the passage-time arrays from water_harmonic.npz "
+                        "(requires marvel-water-harmonic-build to have run "
+                        "first).")
+    p.add_argument("--harmonic-cache",
+                   default=None,
+                   help="Path to water_harmonic.npz cache (used when "
+                        "--lames-field is T_simple or T_eikonal).")
     # ── Water "lame2" (V3) descending animation ──
     p.add_argument("--lame2-only", action="store_true",
                    help="Skip every step except the lame2 (V3) build.")
@@ -770,6 +784,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Skipping pillars build (--skip-pillars).")
 
     # ── Water "membranes" descending animation ──────────────────────────
+    # TODO CLEAN_MEMBRANE: membranes still use geodesic distance as their
+    # iso-surface field.  Once water-harmonic-build is validated, consider
+    # adding a --membranes-field {geoddist,T_simple,T_eikonal} flag here,
+    # mirroring the --lames-field mechanism introduced for the lames.
     if not args.skip_membranes:
         membranes_out      = Path(args.membranes_output).expanduser().resolve()
         membranes_meta_out = Path(args.membranes_meta_output).expanduser().resolve()
@@ -827,8 +845,38 @@ def main(argv: list[str] | None = None) -> int:
                 "Lames (V2): missing input TIFFs %s -- skipping.", missing,
             )
         else:
+            # Optional: replace geodesic distance with harmonic passage time.
+            _lames_field_vol = None
+            if args.lames_field != "geoddist":
+                _harm_path = (
+                    Path(args.harmonic_cache).expanduser().resolve()
+                    if args.harmonic_cache
+                    else DEFAULT_WATER_HARMONIC_CACHE
+                )
+                if _harm_path.exists():
+                    import numpy as _np
+                    _harm = _np.load(_harm_path, allow_pickle=False)
+                    if args.lames_field in _harm:
+                        _lames_field_vol = _harm[args.lames_field]
+                        logger.info(
+                            "Lames: using %s from %s as distance field.",
+                            args.lames_field, _harm_path,
+                        )
+                    else:
+                        logger.warning(
+                            "Lames: key '%s' not found in %s; "
+                            "falling back to geoddist.",
+                            args.lames_field, _harm_path,
+                        )
+                else:
+                    logger.warning(
+                        "Lames: harmonic cache not found at %s; "
+                        "falling back to geoddist.",
+                        _harm_path,
+                    )
             build_water_lames(
                 geoddist_path=geoddist_for_lames,
+                field_volume=_lames_field_vol,
                 bg_dist_path=lames_bg_dist,
                 object_path=object_path_l,
                 crown_path=crown_path_l,
@@ -921,7 +969,6 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("Building '%s' isosurface (iso=%.1f) from %s …",
                         _name, _iso_level, _tiff_p)
             try:
-                from marvel_view.preprocessing import load_float_volume, mask_to_mesh
                 _vol  = load_float_volume(_tiff_p)
                 _mesh = mask_to_mesh(
                     _vol,

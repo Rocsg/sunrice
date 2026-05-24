@@ -9,11 +9,15 @@ Reads (binary 8-bit TIFF, threshold 127, shape ``(Z, Y, X)``):
     1_Intermediate_computed_images/wind_source.tif  (source slice @ high axis-0)
     1_Intermediate_computed_images/wind_target.tif  (target slice @ low  axis-0)
 
-Writes:
+Writes (one set per speed level: slow / med / fast):
 
-    2_Vtk_files/wind_field.npz       (harmonic u, ∇u, wall_dist, masks)
-    2_Vtk_files/wind_o2.npz          (O₂  trajectory templates)
-    2_Vtk_files/wind_ch4.npz         (CH₄ trajectory templates)
+    2_Vtk_files/wind_field.npz   (harmonic u, ∇u, wall_dist, masks)
+    2_Vtk_files/wind_o2_slow.npz (O₂  trajectory templates — slow / 10 substeps)
+    2_Vtk_files/wind_o2_med.npz  (O₂  trajectory templates — med  / 20 substeps)
+    2_Vtk_files/wind_o2_fast.npz (O₂  trajectory templates — fast / 40 substeps)
+    2_Vtk_files/wind_ch4_slow.npz(CH₄ trajectory templates — slow / 10 substeps)
+    2_Vtk_files/wind_ch4_med.npz (CH₄ trajectory templates — med  / 20 substeps)
+    2_Vtk_files/wind_ch4_fast.npz(CH₄ trajectory templates — fast / 40 substeps)
 
 Usage
 -----
@@ -25,6 +29,9 @@ Usage
 
     # Force a full rebuild even if caches are up-to-date:
     marvel-wind-field-build --force
+
+    # Build only specific speed levels:
+    marvel-wind-field-build --speeds slow med
 
     # Tune the trajectory generation:
     marvel-wind-field-build --o2-templates 5000 --ch4-templates 2500 \\
@@ -50,7 +57,6 @@ from marvel_view.preprocessing.wind_field import (  # noqa: E402
     DEFAULT_LIFESPAN_S,
     DEFAULT_N_TEMPLATES,
     DEFAULT_SECONDS,
-    DEFAULT_SPEED_VOX_PER_FRAME,
     build_particle_templates,
     build_wind_field_from_tifs,
     load_wind_field,
@@ -60,10 +66,12 @@ from marvel_view.preprocessing.wind_field import (  # noqa: E402
 from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_WIND_AREA_PATH,
     DEFAULT_WIND_FIELD_CACHE,
-    DEFAULT_WIND_O2_CACHE,
-    DEFAULT_WIND_CH4_CACHE,
     DEFAULT_WIND_SOURCE_PATH,
     DEFAULT_WIND_TARGET_PATH,
+    DEFAULT_WIND_O2_CACHES,
+    DEFAULT_WIND_CH4_CACHES,
+    WIND_SUBSTEP_VALUES,
+    WIND_SPEED_LABELS,
 )
 
 logging.basicConfig(
@@ -92,10 +100,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Outputs.
     p.add_argument("--field-cache", default=str(DEFAULT_WIND_FIELD_CACHE),
                    help="Path to the harmonic-field .npz cache.")
-    p.add_argument("--o2-cache",  default=str(DEFAULT_WIND_O2_CACHE),
-                   help="Path to the O₂  particle-templates .npz cache.")
-    p.add_argument("--ch4-cache", default=str(DEFAULT_WIND_CH4_CACHE),
-                   help="Path to the CH₄ particle-templates .npz cache.")
     # Field params.
     p.add_argument("--grad-sigma", type=float, default=DEFAULT_GRAD_SIGMA,
                    help="Masked-Gaussian sigma applied to u before gradient.")
@@ -110,8 +114,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Length of the periodic precomputed loop, in seconds.")
     p.add_argument("--lifespan",  type=float, default=DEFAULT_LIFESPAN_S,
                    help="Per-particle lifespan, in seconds.")
-    p.add_argument("--speed",     type=float, default=DEFAULT_SPEED_VOX_PER_FRAME,
-                   help="Particle speed at the trunk (voxels per frame).")
     p.add_argument("--o2-templates",  type=int, default=DEFAULT_N_TEMPLATES,
                    help="Number of O₂  trajectory templates to precompute.")
     p.add_argument("--ch4-templates", type=int, default=DEFAULT_N_TEMPLATES // 2,
@@ -139,8 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     wind_source = Path(args.wind_source).expanduser().resolve()
     wind_target = Path(args.wind_target).expanduser().resolve()
     field_cache = Path(args.field_cache).expanduser().resolve()
-    o2_cache    = Path(args.o2_cache).expanduser().resolve()
-    ch4_cache   = Path(args.ch4_cache).expanduser().resolve()
+
+    speed_idx_map = {lbl: i for i, lbl in enumerate(WIND_SPEED_LABELS)}
 
     logger.info("═" * 64)
     logger.info("Marvel Wind-Field Build")
@@ -148,8 +150,10 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("  source  : %s", wind_source)
     logger.info("  target  : %s", wind_target)
     logger.info("  → field : %s", field_cache)
-    logger.info("  → O₂    : %s", o2_cache)
-    logger.info("  → CH₄   : %s", ch4_cache)
+    for _lbl in WIND_SPEED_LABELS:
+        _i = speed_idx_map[_lbl]
+        logger.info("  → O₂  %-4s : %s", _lbl, DEFAULT_WIND_O2_CACHES[_i])
+        logger.info("  → CH₄ %-4s : %s", _lbl, DEFAULT_WIND_CH4_CACHES[_i])
     logger.info("═" * 64)
 
     # ── 1. Harmonic field ────────────────────────────────────────────
@@ -178,37 +182,53 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Done (field only).")
         return 0
 
-    # ── 2. Particle templates ───────────────────────────────────────
-    need_o2  = args.force or not o2_cache.exists()
-    need_ch4 = args.force or not ch4_cache.exists()
+    # ── 2. Particle templates — one set per speed level ─────────────────
+    # Each level is built with a different n_substeps (10 / 20 / 40).
+    # speed_vox_per_frame is the same for all three so the particle paths
+    # cover the same physical distance but with finer curvature resolution
+    # at higher levels.  frames_per_tick is always 1 in the viewer.
 
-    if need_o2:
-        tpl_o2 = build_particle_templates(
-            field, species="o2",
-            n_templates=args.o2_templates,
-            fps=args.fps,
-            seconds=args.seconds,
-            lifespan_s=args.lifespan,
-            speed_vox_per_frame=args.speed,
-            seed=args.seed,
-        )
-        save_particle_templates(tpl_o2, o2_cache)
-    else:
-        logger.info("Skipping O₂ templates (cache exists: %s).", o2_cache)
+    _DEFAULT_SPEED = 1.4  # vox/frame — same for all three levels
 
-    if need_ch4:
-        tpl_ch4 = build_particle_templates(
-            field, species="ch4",
-            n_templates=args.ch4_templates,
-            fps=args.fps,
-            seconds=args.seconds,
-            lifespan_s=args.lifespan,
-            speed_vox_per_frame=args.speed,
-            seed=args.seed + 1,
-        )
-        save_particle_templates(tpl_ch4, ch4_cache)
-    else:
-        logger.info("Skipping CH₄ templates (cache exists: %s).", ch4_cache)
+    for _lbl in WIND_SPEED_LABELS:
+        _i        = speed_idx_map[_lbl]
+        _nsub     = int(WIND_SUBSTEP_VALUES[_i])
+        _o2_cache  = Path(DEFAULT_WIND_O2_CACHES[_i]).expanduser().resolve()
+        _ch4_cache = Path(DEFAULT_WIND_CH4_CACHES[_i]).expanduser().resolve()
+
+        logger.info("── Speed level: %s (n_substeps=%d) ──", _lbl, _nsub)
+
+        if args.force or not _o2_cache.exists():
+            _tpl_o2 = build_particle_templates(
+                field, species="o2",
+                n_templates=args.o2_templates,
+                fps=args.fps,
+                seconds=args.seconds,
+                lifespan_s=args.lifespan,
+                speed_vox_per_frame=_DEFAULT_SPEED,
+                seed=args.seed,
+                n_substeps=_nsub,
+            )
+            save_particle_templates(_tpl_o2, _o2_cache)
+        else:
+            logger.info("Skipping O₂ %s templates (cache exists: %s).",
+                        _lbl, _o2_cache)
+
+        if args.force or not _ch4_cache.exists():
+            _tpl_ch4 = build_particle_templates(
+                field, species="ch4",
+                n_templates=args.ch4_templates,
+                fps=args.fps,
+                seconds=args.seconds,
+                lifespan_s=args.lifespan,
+                speed_vox_per_frame=_DEFAULT_SPEED,
+                seed=args.seed + 1,
+                n_substeps=_nsub,
+            )
+            save_particle_templates(_tpl_ch4, _ch4_cache)
+        else:
+            logger.info("Skipping CH₄ %s templates (cache exists: %s).",
+                        _lbl, _ch4_cache)
 
     logger.info("Done.")
     return 0

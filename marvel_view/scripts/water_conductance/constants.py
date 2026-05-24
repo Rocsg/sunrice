@@ -146,20 +146,64 @@ DEFAULT_WIND_TARGET_PATH: Path = acfg.DEFAULT_INPUT_DIR / "wind_target.tif"
 DEFAULT_WIND_FIELD_CACHE: Path = DEFAULT_VTK_OUTPUT_DIR / "wind_field.npz"
 DEFAULT_WIND_O2_CACHE:    Path = DEFAULT_VTK_OUTPUT_DIR / "wind_o2.npz"
 DEFAULT_WIND_CH4_CACHE:   Path = DEFAULT_VTK_OUTPUT_DIR / "wind_ch4.npz"
-# Number of *displayed* particles per species — must be ≥ n_templates in
-# the cache file; templates are reused at different phase offsets so we
-# can render many more concurrent particles than we precompute.
-DEFAULT_WIND_O2_DISPLAY:  int = 50_000
-DEFAULT_WIND_CH4_DISPLAY: int = 20_000
-# Point sizes (pixels) — capped by GPU; particles further from the camera
-# stay small in screen space, so distant flecks naturally fade.
-DEFAULT_WIND_O2_POINT_SIZE:  float = 4.0
-DEFAULT_WIND_CH4_POINT_SIZE: float = 5.0
+# Number of *displayed* particles per species.  Templates are reused at
+# different phase offsets so you can display more particles than were
+# precomputed.  All positions for all frames are pre-indexed at startup
+# into a pos_phased[n_frames, n_display, 3] tensor (float32); memory is
+# roughly n_display × n_frames × 12 bytes per species.
+#   5 000 ×  1 000 × 12 ≈  60 MB   (default, comfortable)
+#  20 000 ×  1 000 × 12 ≈ 240 MB   (medium budget)
+#  50 000 ×  1 000 × 12 ≈ 600 MB   (high budget, heavy startup)
+DEFAULT_WIND_O2_DISPLAY:  int = 5_000
+DEFAULT_WIND_CH4_DISPLAY: int = 2_500
+# Sphere radii (voxels) — world-space radius of each sphere glyph.
+DEFAULT_WIND_O2_SPHERE_RADIUS:  float = 0.51
+
+# ── Water harmonic potential field ──────────────────────────────────────────
+# Harmonic field + passage-time maps + stream tracks pre-built by
+# ``marvel-water-harmonic-build``.  Stream tracks are saved to the same
+# ``crown_tracks.vtp`` path so the viewer is unchanged.  Dual-arrow caches
+# store spatially-separated water and air arrow fields.
+DEFAULT_WATER_AREA_PATH:         Path = acfg.DEFAULT_INPUT_DIR / "Source_Target_Possible_Paths.tif"
+DEFAULT_WATER_SOURCE_PATH:       Path = acfg.DEFAULT_INPUT_DIR / "Source_crown.tif"
+DEFAULT_WATER_TARGET_PATH:       Path = acfg.DEFAULT_INPUT_DIR / "Target_crown.tif"
+DEFAULT_WATER_HARMONIC_CACHE:    Path = DEFAULT_VTK_OUTPUT_DIR / "water_harmonic.npz"
+DEFAULT_WATER_DUAL_ARROWS_CACHE: Path = DEFAULT_VTK_OUTPUT_DIR / "water_dual_arrows.npz"
+DEFAULT_AIR_DUAL_ARROWS_CACHE:   Path = DEFAULT_VTK_OUTPUT_DIR / "air_dual_arrows.npz"
+# Colours used for the dual-arrow overlay.
+DUAL_WATER_COLOR: tuple[float, float, float] = (0.3, 0.6, 1.0)   # blue
+DUAL_AIR_COLOR:   tuple[float, float, float] = (0.3, 0.9, 0.3)   # green
+DEFAULT_WIND_CH4_SPHERE_RADIUS: float = 0.51
+# Camera-based distance culling: particles farther than this fraction of
+# the scene diagonal from the camera are given alpha = 0 (transparent).
+# 0.0 disables culling (show all).  0.35 shows roughly a 1/3-diagonal
+# sphere around the camera — enough to see the full local neighbourhood.
+DEFAULT_WIND_CULL_RADIUS_FRAC: float = 0.35
 # Soft colours.
 DEFAULT_WIND_O2_COLOR  = (245, 250, 255)   # near-white
 DEFAULT_WIND_CH4_COLOR = (180, 168,  80)   # khaki / olive
 # Runtime tick (~25 fps to match the precomputed sequence).
 WIND_TICK_MS: int = 40
+# Playback speed multiplier — kept for backward compatibility but no longer
+# used by the 3-speed system below.
+DEFAULT_WIND_SPEED_MULT: int = 2
+
+# ── Three pre-baked trajectory speed levels ──────────────────────────────
+# Each level is a separate .npz built with a different n_substeps value
+# (10 / 20 / 40 Euler steps per stored frame).  At runtime the speed
+# button swaps between pre-phased tensors — always 1 frame/tick,
+# always smooth, always the full 4 s lifespan.
+WIND_SPEED_LABELS: tuple = ("slow", "med", "fast")
+WIND_SUBSTEP_VALUES: tuple = (10, 20, 40)      # n_substeps: slow / med / fast
+DEFAULT_WIND_SPEED_LEVEL_IDX: int = 0           # start on "slow"
+DEFAULT_WIND_O2_CACHES: list = [
+    DEFAULT_VTK_OUTPUT_DIR / f"wind_o2_{lbl}.npz"
+    for lbl in WIND_SPEED_LABELS
+]
+DEFAULT_WIND_CH4_CACHES: list = [
+    DEFAULT_VTK_OUTPUT_DIR / f"wind_ch4_{lbl}.npz"
+    for lbl in WIND_SPEED_LABELS
+]
 
 # ── Mask overlays (Stele + Outside) ─────────────────────────────────────
 # Two binary 8-bit masks (0/255) iso-surfaced at 127.5 and displayed
@@ -284,3 +328,18 @@ _SHADING_MODES = [
     ("Gouraud", 1),
     ("Flat",    0),
 ]
+
+# ── Info panel ─────────────────────────────────────────────────────────────────
+# Physical voxel edge length in µm — used to convert voxels/s → µm/s.
+VOXEL_SIZE_UM: float = 6.71
+
+# Fixed title shown at the top of every rendering mode (interactor + movie).
+PANEL_TITLE = "Specimen Dolores. 3 cm from apex of root 4."
+
+# Mode subtitle shown on the second line of the info panel.
+VIEW_MODE_SUBTITLES: dict = {
+    "mesh_bridges":  "Cortical bridges mesh",
+    "mesh_all":      "All watered tissues",
+    "arrows_grid":   "Water gradient field",
+    "arrows_tracks": "Conduction shortest paths",
+}

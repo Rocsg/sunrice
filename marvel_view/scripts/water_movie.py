@@ -45,13 +45,25 @@ if str(_REPO_ROOT) not in sys.path:
 
 from marvel_view.scripts.water_conductance import (
     BACKGROUND,
+    DEFAULT_ALL_MESH_CACHE_PATH,
+    DEFAULT_ARROW_LENGTH,
+    DEFAULT_ARROW_THICKNESS,
+    DEFAULT_ARROWS_CACHE_PATH,
+    DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_VTP_CACHE,
     DEFAULT_INPUT_PATH,
+    DEFAULT_LAMES_META_CACHE,
+    DEFAULT_LAMES_VTP_CACHE,
     DEFAULT_LEVEL,
     DEFAULT_MESH_CACHE_PATH,
     DEFAULT_MP4_DIR,
+    DEFAULT_PILLARS_CACHE_PATH,
     DEFAULT_POSITIONS_DIR,
     DEFAULT_SMOOTH_ITER,
+    _build_lames_step_polydatas,
+    _load_lames,
     _load_or_build_mesh,
+    _set_shading,
     _style_mesh,
 )
 
@@ -171,7 +183,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--ipd-frac", type=float, default=VR_IPD_FRAC,
                    help="Interocular distance as a fraction of the camera→"
                         "focal-point distance (0.03 = subtle, 0.05 = "
-                        "standard, 0.08 = strong relief).")
+                        "standard, 0.08 = strong relief).  Ignored when "
+                        "--meters-per-voxel is set.")
+    p.add_argument("--meters-per-voxel", type=float, default=0.5,
+                   help="Physical scale: how many metres one voxel represents. "
+                        "When >0, the IPD is fixed at --ipd-metres / "
+                        "--meters-per-voxel voxels, independent of camera "
+                        "distance.  Default 0.5 m/vox (= 200 m object for "
+                        "400 vox).  Set to 0 to revert to the legacy "
+                        "--ipd-frac × cam-distance formula.")
+    p.add_argument("--ipd-metres", type=float, default=0.065,
+                   help="Real human inter-pupillary distance in metres "
+                        "(default 0.065 = 65 mm).  Only used together with "
+                        "--meters-per-voxel.")
     p.add_argument("--vr-cube-resolution", type=int, default=VR_CUBE_RESOLUTION,
                    help="Internal cubemap face size (px) used by the "
                         "panoramic projection pass.  Higher = sharper but "
@@ -199,6 +223,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "(truncates the track after fps×4 frames).  "
                         "Useful to validate a VR rendering pipeline before "
                         "committing to a multi-minute encode.")
+    p.add_argument("--fast", action="store_true",
+                   help="Low-resolution quick-render mode.  Overrides "
+                        "resolution to 960×540 (flat) or 2048×512 / "
+                        "1024×512 (vr360 / vr180), sets cube-face to 1024 px, "
+                        "and uses --preset ultrafast CRF 28 (unless those "
+                        "are already specified).  Keeps the full duration; "
+                        "combine with --stresstest for a ~4-second clip.")
+    p.add_argument("--high", action="store_true",
+                   help="High-quality render mode.  Sets flat resolution to "
+                        "3840×2160 (4K), VR cube-face to 4096 px (keep SBS "
+                        "canvas at default), CRF 16 and preset veryslow "
+                        "(unless those are already specified).")
+
+    # ── anti-aliasing ────────────────────────────────────────────────────
+    p.add_argument("--msaa", type=int, default=8,
+                   help="MSAA multi-sample count for the render window "
+                        "(0 = off, 4 / 8 / 16 typical).  Note: silently "
+                        "ignored when VR mode uses vtkPanoramicProjectionPass "
+                        "(custom render passes bypass window-level MSAA); "
+                        "in VR rely on FXAA + a larger --vr-cube-resolution.")
+    p.add_argument("--no-fxaa", action="store_true",
+                   help="Disable VTK's post-process FXAA pass.  FXAA is "
+                        "cheap and dramatically reduces jaggies on mesh "
+                        "silhouettes and text, including in VR.")
+    p.add_argument("--fxaa-contrast", type=float, default=0.0833,
+                   help="FXAA RelativeContrastThreshold (VTK default 0.0833; "
+                        "lower = more aggressive smoothing).")
+    p.add_argument("--fxaa-hard-contrast", type=float, default=0.0312,
+                   help="FXAA HardContrastThreshold (VTK default 0.0625; "
+                        "lower = more aggressive on high-contrast edges).")
+    p.add_argument("--save-mid-png", action="store_true", default=True,
+                   help="Also save the middle frame as a standalone PNG "
+                        "next to the MP4 (uncompressed, pre-encoding).  "
+                        "Useful to check whether residual aliasing comes "
+                        "from rendering or from video encoding.")
+    p.add_argument("--no-save-mid-png", dest="save_mid_png",
+                   action="store_false",
+                   help="Disable the mid-frame PNG dump.")
+    p.add_argument("--ultra-high", action="store_true",
+                   help="Ultra-high-quality render mode.  Superset of --high: "
+                        "VR cube-face resolution bumped to 8192 px (4× SSAA "
+                        "vs default 2048), flat output 5120×2880 (5K), "
+                        "CRF 10 and preset veryslow.  Very slow (~4× --high). "
+                        "Implies --high; explicit --crf / --preset still "
+                        "take precedence.")
+    p.add_argument("--trick", type=int, default=None, metavar="N",
+                   help="Keep only the first N control points before "
+                        "building the track.  Handy to quickly render the "
+                        "beginning of a trajectory without touching the "
+                        "positions file.  E.g. --trick 12 stops at the "
+                        "12th saved position.")
 
     p.add_argument("--debugdisplayindexframes", action="store_true",
                    help="Flat-mode only: burn an indicative keyframe index "
@@ -212,16 +287,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Enable DEBUG-level logging.")
     # ── UI-state replay (matches the viewer's saved per-keyframe state)──
-    p.add_argument("--alt-mesh-cache", default=None,
+    p.add_argument("--alt-mesh-cache", default=str(DEFAULT_ALL_MESH_CACHE_PATH),
                    help="Path to a cached .vtk mesh for the alternate "
                         "('All watered tissues') view.  When provided AND "
                         "the positions JSON contains a 'mesh_all' view_mode "
-                        "at some keyframe, the movie will swap to it.")
-    p.add_argument("--pillars-cache", default=None,
+                        "at some keyframe, the movie will swap to it. "
+                        f"(default: {DEFAULT_ALL_MESH_CACHE_PATH})")
+    p.add_argument("--pillars-cache", default=str(DEFAULT_PILLARS_CACHE_PATH),
                    help="Path to a cached .vtk overlay mesh ('Pillars').  "
                         "When provided AND any keyframe sets "
                         "pillars_visible=true, the overlay is shown / "
-                        "styled / hue-rotated accordingly.")
+                        "styled / hue-rotated accordingly.  "
+                        f"(default: {DEFAULT_PILLARS_CACHE_PATH})")
     p.add_argument("--membranes-vtp-cache", default=None,
                    help="Path to the cached water-membranes .vtp.  When "
                         "provided AND keyframes set membranes_visible=true, "
@@ -229,6 +306,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--membranes-meta-cache", default=None,
                    help="JSON sidecar with the membranes n_steps / phases. "
                         "Required alongside --membranes-vtp-cache.")
+    p.add_argument("--lames-vtp-cache",
+                   default=str(DEFAULT_LAMES_VTP_CACHE),
+                   help="Path to the cached water-lames .vtp.  When "
+                        "provided AND keyframes set lames_visible=true, "
+                        "the descending-lames animation is replayed. "
+                        f"(default: {DEFAULT_LAMES_VTP_CACHE})")
+    p.add_argument("--lames-meta-cache",
+                   default=str(DEFAULT_LAMES_META_CACHE),
+                   help="JSON sidecar with the lames n_steps. "
+                        "Required alongside --lames-vtp-cache. "
+                        f"(default: {DEFAULT_LAMES_META_CACHE})")
+    p.add_argument("--arrows-cache",
+                   default=str(DEFAULT_ARROWS_CACHE_PATH),
+                   help="Path to the cached geodesic-distance arrows .npz.  "
+                        "When present, the 'Arrows grid' view-mode renders "
+                        "the gradient field in the movie.  "
+                        f"(default: {DEFAULT_ARROWS_CACHE_PATH})")
+    p.add_argument("--crown-tracks-cache",
+                   default=str(DEFAULT_CROWN_TRACKS_VTP_CACHE),
+                   help="Path to the cached crown Dijkstra tracks .vtp.  "
+                        "When present, the 'Conduction shorter paths' mode "
+                        "shows splined path lines.  "
+                        f"(default: {DEFAULT_CROWN_TRACKS_VTP_CACHE})")
+    p.add_argument("--crown-tracks-arrows-cache",
+                   default=str(DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE),
+                   help="Path to the cached crown tracks glyph-arrow "
+                        "centres .vtp (pre-built by "
+                        "marvel-water-conductance-build-meshes).  "
+                        f"(default: {DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE})")
     p.add_argument("--ui-transition-seconds", type=float, default=0.5,
                    help="Duration of the smooth ramp at every keyframe "
                         "transition for UI-state values (opacity, hue, "
@@ -290,19 +396,22 @@ def _stack_actor_field(points: Sequence[dict], key: str, default) -> np.ndarray:
     return np.stack(vals, axis=0)
 
 
-def _interp_vec(values: np.ndarray, t_out: np.ndarray) -> np.ndarray:
+def _interp_vec(values: np.ndarray, t_out: np.ndarray, *,
+                t_ctrl: np.ndarray | None = None) -> np.ndarray:
     """Interpolate (n_ctrl, d) → (len(t_out), d) via cubic spline.
 
-    ``t_out`` is expected in [0, 1] (control points are placed uniformly
-    on that interval).  Falls back to linear if scipy is missing or fewer
-    than 4 control points are available.
+    ``t_out`` is expected in [0, 1].  When ``t_ctrl`` is *None* the control
+    points are placed uniformly on that interval; otherwise the caller
+    supplies the exact knot positions (e.g. arc-length fractions).
+    Falls back to linear when scipy is unavailable or fewer than 4 knots.
     """
     n_ctrl, d = values.shape
     n_frames = len(t_out)
     if n_ctrl == 1:
         return np.tile(values, (n_frames, 1))
 
-    t_ctrl = np.linspace(0.0, 1.0, n_ctrl)
+    if t_ctrl is None:
+        t_ctrl = np.linspace(0.0, 1.0, n_ctrl)
 
     if n_ctrl >= 4:
         try:
@@ -318,17 +427,20 @@ def _interp_vec(values: np.ndarray, t_out: np.ndarray) -> np.ndarray:
     return out
 
 
-def _interp_scalar(values: np.ndarray, t_out: np.ndarray) -> np.ndarray:
-    return _interp_vec(values.reshape(-1, 1), t_out).ravel()
+def _interp_scalar(values: np.ndarray, t_out: np.ndarray, *,
+                   t_ctrl: np.ndarray | None = None) -> np.ndarray:
+    return _interp_vec(values.reshape(-1, 1), t_out, t_ctrl=t_ctrl).ravel()
 
 
-def _interp_orientation(euler_deg: np.ndarray, t_out: np.ndarray) -> np.ndarray:
+def _interp_orientation(euler_deg: np.ndarray, t_out: np.ndarray, *,
+                        t_ctrl: np.ndarray | None = None) -> np.ndarray:
     """Slerp-interpolate orientations expressed as XYZ Euler angles (deg).
 
-    ``t_out`` is in [0, 1] (control orientations evenly spaced).
-    Linearly interpolating Euler angles produces visibly wrong intermediate
-    orientations as soon as more than one axis is non-zero, hence the
-    detour through quaternions.
+    ``t_out`` is in [0, 1].  When ``t_ctrl`` is *None* the control
+    orientations are evenly spaced; otherwise the caller supplies knot
+    positions (e.g. arc-length fractions).  Linearly interpolating Euler
+    angles produces visibly wrong intermediate orientations as soon as
+    more than one axis is non-zero, hence the detour through quaternions.
     """
     n_ctrl = len(euler_deg)
     n_frames = len(t_out)
@@ -338,9 +450,10 @@ def _interp_orientation(euler_deg: np.ndarray, t_out: np.ndarray) -> np.ndarray:
     try:
         from scipy.spatial.transform import Rotation, Slerp
     except ImportError:
-        return _interp_vec(euler_deg, t_out)
+        return _interp_vec(euler_deg, t_out, t_ctrl=t_ctrl)
 
-    t_ctrl = np.linspace(0.0, 1.0, n_ctrl)
+    if t_ctrl is None:
+        t_ctrl = np.linspace(0.0, 1.0, n_ctrl)
     rots = Rotation.from_euler("xyz", euler_deg, degrees=True)
     slerp = Slerp(t_ctrl, rots)
     return slerp(t_out).as_euler("xyz", degrees=True)
@@ -349,6 +462,14 @@ def _interp_orientation(euler_deg: np.ndarray, t_out: np.ndarray) -> np.ndarray:
 def _normalize(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
     return v / n if n > 0 else v
+
+
+def _rotate_yaw(v: np.ndarray, world_up: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Rotate *v* around *world_up* by *angle_deg* (Rodrigues formula)."""
+    axis = _normalize(world_up)
+    theta = np.radians(angle_deg)
+    c, s = float(np.cos(theta)), float(np.sin(theta))
+    return v * c + np.cross(axis, v) * s + axis * float(np.dot(axis, v)) * (1.0 - c)
 
 
 def _format_eta(seconds: float) -> str:
@@ -363,6 +484,185 @@ def _format_eta(seconds: float) -> str:
 
 
 # ───────────────────────────── camera + actor track ──────────────────────────
+
+# ── Stage A: arc-length reparameterisation ────────────────────────────────────
+
+def _arclength_spline(
+    positions: np.ndarray,
+    n_dense: int = 2048,
+) -> tuple:
+    """Build a chord-parameterised CubicSpline + arc-length inverse map.
+
+    Returns ``(cs, t_ctrl_chord, s_ctrl, L_total, t_of_s)``:
+
+    * ``cs``           – CubicSpline (t ∈ [0, 1] → 3-D position), or *None*
+                         when scipy is unavailable.
+    * ``t_ctrl_chord`` – spline-t values at each control point (chord fractions).
+    * ``s_ctrl``       – cumulative arc-length at each control point.
+    * ``L_total``      – total arc-length of the spline.
+    * ``t_of_s``       – callable mapping arc-length s → spline parameter t.
+
+    Chord-length parameterisation is used so that the spline parameter is
+    proportional to physical distance rather than to control-point index.
+    This eliminates the "fast on sparse segments, slow on dense segments"
+    artefact that arises when waypoints are unevenly spaced.
+    """
+    n_ctrl = len(positions)
+    if n_ctrl == 1:
+        return (
+            None,
+            np.array([0.0]),
+            np.array([0.0]),
+            0.0,
+            lambda s: np.zeros_like(np.asarray(s, dtype=float)),
+        )
+
+    chords    = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+    cumchord  = np.concatenate([[0.0], np.cumsum(chords)])
+    total_chord = float(cumchord[-1])
+    t_ctrl_chord = (
+        cumchord / total_chord
+        if total_chord > 1e-12
+        else np.linspace(0.0, 1.0, n_ctrl)
+    )
+
+    try:
+        from scipy.interpolate import CubicSpline, interp1d
+    except ImportError:
+        # No scipy: fall back to chord-linear map.
+        t_of_s_fb = (lambda s, _tc=t_ctrl_chord, _sc=cumchord:  # noqa: E731
+                     np.interp(s, _sc, _tc))
+        return None, t_ctrl_chord, cumchord.copy(), total_chord, t_of_s_fb
+
+    cs = CubicSpline(t_ctrl_chord, positions, bc_type="not-a-knot", axis=0)
+
+    # Densely sample the spline to compute arc-length numerically.
+    t_dense   = np.linspace(0.0, 1.0, n_dense)
+    pts_dense = cs(t_dense)                              # (n_dense, 3)
+    seg_len   = np.linalg.norm(np.diff(pts_dense, axis=0), axis=1)
+    s_dense   = np.concatenate([[0.0], np.cumsum(seg_len)])
+    L_total   = float(s_dense[-1])
+
+    # Arc-length at each control point (by interpolating s_dense at t_ctrl).
+    s_ctrl = np.interp(t_ctrl_chord, t_dense, s_dense)
+
+    # Inverse map: arc-length → spline parameter (for evaluating at any s).
+    s_uniq, idx_uniq = np.unique(s_dense, return_index=True)
+    t_uniq = t_dense[idx_uniq]
+    t_of_s_fn = interp1d(
+        s_uniq, t_uniq, kind="linear",
+        bounds_error=False, fill_value=(t_uniq[0], t_uniq[-1]),
+    )
+    return cs, t_ctrl_chord, s_ctrl, L_total, t_of_s_fn
+
+
+# ── Stage B: curvature-adaptive velocity profile ──────────────────────────────
+
+def _velocity_profile_plan(
+    cs,
+    t_of_s,
+    L_total: float,
+    v_cruise: float,
+    a_max: float,
+    a_lat_max: float,
+    n_dense: int = 2048,
+) -> np.ndarray:
+    """Return a smooth velocity profile v[i] (arc-length / frame) at
+    ``n_dense`` evenly-spaced arc-length positions.
+
+    Three constraints are enforced simultaneously:
+
+    1. **Cruise limit** – v ≤ v_cruise everywhere.
+    2. **Lateral acceleration** – v ≤ sqrt(a_lat_max / κ(s)) in curves so the
+       camera never swings sideways faster than comfortable in VR.
+    3. **Longitudinal acceleration** – |Δv / frame| ≤ a_max via a
+       forward + backward trapezoidal pass, giving smooth ease-in from rest
+       and ease-out back to rest (endpoints forced to v = 0).
+
+    When *cs* is None (scipy unavailable) a simple trapezoidal profile is
+    returned.
+    """
+    if L_total < 1e-9:
+        return np.zeros(n_dense)
+
+    s_arr = np.linspace(0.0, L_total, n_dense)
+    ds    = float(L_total) / (n_dense - 1)
+
+    if cs is None:
+        v_max = np.full(n_dense, v_cruise)
+    else:
+        # Curvature κ(s) via central finite differences on dense arc-length samples.
+        t_eval  = np.asarray(t_of_s(s_arr), dtype=float)
+        pts     = cs(t_eval)                                   # (n_dense, 3)
+        dp      = np.diff(pts, axis=0) / ds                    # (n-1, 3)
+        d2p     = (pts[2:] - 2.0 * pts[1:-1] + pts[:-2]) / ds ** 2   # (n-2, 3)
+        dp_norm = 0.5 * (np.linalg.norm(dp[:-1], axis=1)
+                         + np.linalg.norm(dp[1:], axis=1))    # (n-2,)
+        dp_norm = np.maximum(dp_norm, 1e-9)
+        kappa_i = np.linalg.norm(d2p, axis=1) / dp_norm ** 2  # (n-2,)
+        kappa   = np.concatenate([[kappa_i[0]], kappa_i, [kappa_i[-1]]])
+
+        v_lat = np.sqrt(a_lat_max / np.maximum(kappa, 1e-12))
+        v_max = np.minimum(v_cruise, v_lat)
+
+    # Force rest at endpoints → drives the ease-in / ease-out ramps.
+    v_max[0]  = 0.0
+    v_max[-1] = 0.0
+
+    # Forward pass: v[i+1] ≤ sqrt(v[i]² + 2·a_max·ds)
+    v = v_max.copy()
+    for i in range(1, n_dense):
+        v[i] = min(v[i], np.sqrt(max(0.0, v[i - 1] ** 2 + 2.0 * a_max * ds)))
+
+    # Backward pass: v[i] ≤ sqrt(v[i+1]² + 2·a_max·ds)
+    for i in range(n_dense - 2, -1, -1):
+        v[i] = min(v[i], np.sqrt(max(0.0, v[i + 1] ** 2 + 2.0 * a_max * ds)))
+
+    return v
+
+
+# ── Stage C: zero-phase position smoothing ────────────────────────────────────
+
+def _smooth_track_positions(
+    track: "List[dict]",
+    fps: int,
+    window_s: float = 0.8,
+) -> None:
+    """Apply zero-phase Gaussian smoothing to camera positions and focal points
+    inside *track*, in place.
+
+    Eliminates high-frequency jitter (spline oscillations, quantisation of
+    control-point placement) from the ortho-panel red dot and info-billboard
+    without introducing temporal offset.  Falls back silently when scipy is
+    unavailable.
+
+    Parameters
+    ----------
+    track:
+        Per-frame state dicts as returned by :func:`build_track`.
+    fps:
+        Frame rate – used to convert *window_s* to a sample count.
+    window_s:
+        Smoothing half-width in seconds.  Recommended: 0.6 s for flat,
+        1.0 s for VR.
+    """
+    if not track:
+        return
+    win = max(3, int(round(window_s * fps)))
+    try:
+        from scipy.signal import filtfilt, gaussian as _gauss
+        kernel  = _gauss(win * 4 + 1, std=float(win))
+        kernel /= kernel.sum()
+        pos = np.array([s["camera"]["position"]    for s in track], dtype=float)
+        foc = np.array([s["camera"]["focal_point"] for s in track], dtype=float)
+        for ax in range(3):
+            pos[:, ax] = filtfilt(kernel, [1.0], pos[:, ax])
+            foc[:, ax] = filtfilt(kernel, [1.0], foc[:, ax])
+        for i, state in enumerate(track):
+            state["camera"]["position"]    = pos[i].tolist()
+            state["camera"]["focal_point"] = foc[i].tolist()
+    except Exception as exc:   # noqa: BLE001
+        logger.debug("Stage-C position smoothing skipped: %s", exc)
 
 
 def _build_time_axis(
@@ -458,66 +758,163 @@ def build_track(
     hold_frames: int = 0,
     ease_segments: int = 2,
     ease_strength: float = 3.0,
-) -> List[dict]:
-    """Return one combined camera+actor state per frame.
+) -> "tuple[List[dict], np.ndarray]":
+    """Return ``(track, t_out_ui)`` – one camera+actor state per frame plus a
+    ``[0, 1]``-normalised fractional-control-point array for
+    :func:`_build_ui_track`.
+
+    Three-stage pipeline
+    --------------------
+    **A – Arc-length reparameterisation**: spline knots are placed at
+    chord-length fractions so the parameter is proportional to physical
+    distance, not to the number of saved control points.  This decouples
+    spatial waypoint density from travel speed.
+
+    **B – Curvature-adaptive velocity profile**: a forward + backward
+    trapezoidal planner derives ``v(s)`` that (a) starts and ends at rest,
+    (b) never exceeds the cruise speed derived from *frames_per_segment*,
+    and (c) reduces speed in tight curves to bound lateral acceleration
+    (VR comfort).
+
+    **C** – Zero-phase positional smoothing is applied externally by
+    :func:`_smooth_track_positions` (called by ``main()`` after build).
 
     Parameters
     ----------
-    control_points:
-        Loaded JSON entries (one per "Save pos" click).
-    frames_per_segment:
-        Frames between two consecutive control points at constant speed.
-    hold_frames:
-        How many frozen frames to append at the end of the movie.
     ease_segments:
-        Number of segments (counted from the end) over which to ease-out.
-        Set to 0 to disable easing.
+        Controls the acceleration ramp:
+        ``a_max = v_cruise / (ease_segments × frames_per_segment)``.
+        Larger → gentler ease-in / ease-out.
     ease_strength:
-        Power used in the ease-out curve on the very last segment.  Values
-        > 1 produce stronger deceleration.
+        Retained for CLI compatibility; unused (ramp shape is now
+        determined by the physics-based forward/backward pass).
     """
     n_ctrl = len(control_points)
     if n_ctrl < 1:
         raise ValueError("Need at least one control point.")
 
-    t_out = _build_time_axis(
-        n_ctrl, frames_per_segment,
-        hold_frames=hold_frames,
-        ease_segments=min(ease_segments, max(0, n_ctrl - 1)),
-        ease_strength=ease_strength,
-    )
-
+    # ── Extract per-control-point fields ──────────────────────────────────
     positions      = _stack_camera_field(control_points, "position")
     focals         = _stack_camera_field(control_points, "focal_point")
     view_ups       = _stack_camera_field(control_points, "view_up")
-    view_angles    = np.array([p["camera"]["view_angle"] for p in control_points])
+    view_angles    = np.array([p["camera"]["view_angle"]    for p in control_points])
     parallel_scale = np.array([p["camera"]["parallel_scale"] for p in control_points])
-
-    pos_track = _interp_vec(positions, t_out)
-    foc_track = _interp_vec(focals,    t_out)
-    up_track  = _interp_vec(view_ups,  t_out)
-    ang_track = _interp_scalar(view_angles,    t_out)
-    psc_track = _interp_scalar(parallel_scale, t_out)
-
     act_pos   = _stack_actor_field(control_points, "position",    [0.0, 0.0, 0.0])
     act_scale = _stack_actor_field(control_points, "scale",       [1.0, 1.0, 1.0])
     act_orig  = _stack_actor_field(control_points, "origin",      [0.0, 0.0, 0.0])
     act_orie  = _stack_actor_field(control_points, "orientation", [0.0, 0.0, 0.0])
 
-    act_pos_track   = _interp_vec(act_pos,   t_out)
-    act_scale_track = _interp_vec(act_scale, t_out)
-    act_orig_track  = _interp_vec(act_orig,  t_out)
-    act_orie_track  = _interp_orientation(act_orie, t_out)
+    # ── Degenerate: single control point ──────────────────────────────────
+    if n_ctrl == 1:
+        n_frames = max(frames_per_segment, 1) + max(hold_frames, 0)
+        t_out_ui = np.zeros(n_frames)
+        pos = positions[0]; foc = focals[0]; up = view_ups[0]
+        look = _normalize(foc - pos)
+        up   = up - look * float(np.dot(up, look))
+        up   = _normalize(up)
+        if not np.isfinite(up).all() or np.linalg.norm(up) < 1e-9:
+            up = np.array([0.0, 1.0, 0.0])
+        frame = {
+            "camera": {
+                "position":       pos.tolist(),
+                "focal_point":    foc.tolist(),
+                "view_up":        up.tolist(),
+                "view_angle":     float(view_angles[0]),
+                "parallel_scale": float(parallel_scale[0]),
+            },
+            "actor": {
+                "position":    act_pos[0].tolist(),
+                "orientation": act_orie[0].tolist(),
+                "scale":       act_scale[0].tolist(),
+                "origin":      act_orig[0].tolist(),
+            },
+            "keyframe_index": 0.0,
+        }
+        return [frame] * n_frames, t_out_ui
 
+    # ─────────────────────────── Stage A ──────────────────────────────────
+    cs_pos, t_ctrl_chord, s_ctrl, L_total, t_of_s = _arclength_spline(positions)
+    # Build additional splines for focal points and view-up on the *same*
+    # chord knots so all camera components move consistently.
+    try:
+        from scipy.interpolate import CubicSpline as _CS
+        cs_foc = _CS(t_ctrl_chord, focals,   bc_type="not-a-knot", axis=0)
+        cs_up  = _CS(t_ctrl_chord, view_ups, bc_type="not-a-knot", axis=0)
+    except ImportError:
+        cs_foc = None
+        cs_up  = None
+
+    # ─────────────────────────── Stage B ──────────────────────────────────
+    n_segs      = max(1, n_ctrl - 1)
+    v_cruise    = L_total / (n_segs * max(1, frames_per_segment))
+    ease_frames = max(1, ease_segments * max(1, frames_per_segment))
+    a_max       = v_cruise / ease_frames       # arc-length / frame²
+    a_lat_max   = 2.0 * a_max                  # lateral comfort margin (VR)
+    _N_DENSE    = 2048
+    v_dense = _velocity_profile_plan(
+        cs_pos, t_of_s, L_total,
+        v_cruise=v_cruise,
+        a_max=a_max,
+        a_lat_max=a_lat_max,
+        n_dense=_N_DENSE,
+    )
+
+    # Integrate v(s) → s(t): convert velocity profile to cumulative time,
+    # then resample at uniform frame times.
+    s_arr    = np.linspace(0.0, L_total, _N_DENSE)
+    ds_dense = float(L_total) / (_N_DENSE - 1)
+    v_mid    = 0.5 * (v_dense[:-1] + v_dense[1:])         # midpoint velocities
+    dt_steps = ds_dense / np.maximum(v_mid, 1e-15)         # frames per arc step
+    t_cumul  = np.concatenate([[0.0], np.cumsum(dt_steps)])  # cumulative time
+    T_total  = float(t_cumul[-1])                           # total motion (frames)
+
+    n_motion     = max(2, int(np.ceil(T_total)) + 1)
+    frame_times  = np.linspace(0.0, T_total, n_motion)
+    s_out_motion = np.interp(frame_times, t_cumul, s_arr)   # arc-length per frame
+
+    if hold_frames > 0:
+        s_out = np.concatenate([s_out_motion, np.full(hold_frames, L_total)])
+    else:
+        s_out = s_out_motion
+
+    total_frames = len(s_out)
+
+    # ── Sample all splines at per-frame arc-length positions ──────────────
+    t_eval = np.asarray(t_of_s(s_out), dtype=float)
+
+    def _lin_fallback(vals: np.ndarray) -> np.ndarray:
+        return np.array(
+            [np.interp(t_eval, t_ctrl_chord, vals[:, ax]) for ax in range(3)],
+            dtype=float,
+        ).T
+
+    pos_track = cs_pos(t_eval) if cs_pos is not None else _lin_fallback(positions)
+    foc_track = cs_foc(t_eval) if cs_foc is not None else _lin_fallback(focals)
+    up_track  = cs_up(t_eval)  if cs_up  is not None else _lin_fallback(view_ups)
+
+    # Scalar / actor fields: spline parameterised by arc-length fraction so
+    # segment transitions coincide with spatial, not click-index, boundaries.
+    t_ctrl_norm = s_ctrl / max(L_total, 1e-12)          # control-point knots in [0, 1]
+    kf_out      = np.interp(s_out, s_ctrl, np.arange(float(n_ctrl)))
+    t_out_ui    = kf_out / max(1, n_ctrl - 1)           # → [0, 1] for _build_ui_track
+
+    ang_track       = _interp_scalar(view_angles,    t_out_ui, t_ctrl=t_ctrl_norm)
+    psc_track       = _interp_scalar(parallel_scale, t_out_ui, t_ctrl=t_ctrl_norm)
+    act_pos_track   = _interp_vec(act_pos,   t_out_ui, t_ctrl=t_ctrl_norm)
+    act_scale_track = _interp_vec(act_scale, t_out_ui, t_ctrl=t_ctrl_norm)
+    act_orig_track  = _interp_vec(act_orig,  t_out_ui, t_ctrl=t_ctrl_norm)
+    act_orie_track  = _interp_orientation(act_orie, t_out_ui, t_ctrl=t_ctrl_norm)
+
+    # ── Assemble per-frame dicts ───────────────────────────────────────────
     track: List[dict] = []
-    for i in range(len(t_out)):
-        pos = pos_track[i]
-        foc = foc_track[i]
-        up  = up_track[i]
+    for i in range(total_frames):
+        pos  = pos_track[i]
+        foc  = foc_track[i]
+        up   = up_track[i]
         # Re-orthonormalise view_up so the spline doesn't roll the camera.
         look = _normalize(foc - pos)
-        up = up - look * float(np.dot(up, look))
-        up = _normalize(up)
+        up   = up - look * float(np.dot(up, look))
+        up   = _normalize(up)
         if not np.isfinite(up).all() or np.linalg.norm(up) < 1e-9:
             up = np.array([0.0, 1.0, 0.0])
         track.append({
@@ -534,12 +931,91 @@ def build_track(
                 "scale":       act_scale_track[i].tolist(),
                 "origin":      act_orig_track[i].tolist(),
             },
-            # Float "keyframe index" in [0, n_ctrl-1]: 0 = first saved
-            # "Save pos" click, n_ctrl-1 = last.  Useful for debug overlays
-            # so the user can tell us "trigger something at frame index 4.2".
-            "keyframe_index": float(t_out[i]) * max(1, n_ctrl - 1),
+            # Float keyframe index in [0, n_ctrl-1]: arc-length-aware
+            # (e.g. 2.5 means halfway between saved positions 2 and 3).
+            "keyframe_index": float(kf_out[i]),
         })
-    return track
+    return track, t_out_ui
+
+
+def _compute_travel_dirs(
+    track,
+    world_up: np.ndarray,
+    *,
+    velocity_window: int = 8,
+    alpha: float = 0.12,
+    eps_frac: float = 0.005,
+) -> np.ndarray:
+    """Compute a smoothed per-frame travel-direction array from a keyframe track.
+
+    Uses a central-difference velocity over a wide window, EMA smoothing, and
+    freezes the direction when the camera is (nearly) stationary.  Near-vertical
+    movement is ignored so the billboard stays stable even at the start/end of
+    the path.
+
+    Parameters
+    ----------
+    track:
+        List of per-frame state dicts (each must contain ``state["camera"]["position"]``).
+    world_up:
+        Constant world-up unit vector.
+    velocity_window:
+        Half-window for central-difference velocity (frames).
+    alpha:
+        EMA weight for each new sample (0 = never update, 1 = no smoothing).
+    eps_frac:
+        Fraction of the median speed below which a frame is considered stationary.
+
+    Returns
+    -------
+    np.ndarray
+        ``(N, 3)`` array of unit travel-direction vectors.
+    """
+    N = len(track)
+    positions = np.array([s["camera"]["position"] for s in track], dtype=float)
+
+    # Central-difference velocity over the window.
+    raw_vel = np.zeros_like(positions)
+    for i in range(N):
+        i0 = max(0, i - velocity_window)
+        i1 = min(N - 1, i + velocity_window)
+        raw_vel[i] = positions[i1] - positions[i0]
+
+    speeds = np.linalg.norm(raw_vel, axis=1)
+    nonzero = speeds[speeds > 0]
+    median_speed = float(np.median(nonzero)) if nonzero.size else 1.0
+    eps_abs = eps_frac * median_speed
+
+    up = np.asarray(world_up, dtype=float)
+    up_n = float(np.linalg.norm(up))
+    up = up / up_n if up_n > 1e-9 else np.array([0.0, 1.0, 0.0])
+
+    dirs = np.zeros((N, 3), dtype=float)
+    current_dir: np.ndarray | None = None
+
+    for i in range(N):
+        if speeds[i] > eps_abs:
+            candidate = raw_vel[i] / speeds[i]
+            # Skip near-vertical movement (cross product with world_up near zero).
+            if float(np.linalg.norm(np.cross(candidate, up))) > 0.05:
+                if current_dir is None:
+                    current_dir = candidate
+                else:
+                    blended = (1.0 - alpha) * current_dir + alpha * candidate
+                    b_n = float(np.linalg.norm(blended))
+                    current_dir = blended / b_n if b_n > 1e-9 else current_dir
+
+        if current_dir is None:
+            # Fallback: use focal → look direction from first frame.
+            foc = np.asarray(track[i]["camera"]["focal_point"], dtype=float)
+            pos = np.asarray(track[i]["camera"]["position"], dtype=float)
+            d = foc - pos
+            d_n = float(np.linalg.norm(d))
+            current_dir = d / d_n if d_n > 1e-9 else np.array([1.0, 0.0, 0.0])
+
+        dirs[i] = current_dir
+
+    return dirs
 
 
 def _apply_camera_state(cam, state: dict) -> None:
@@ -548,6 +1024,139 @@ def _apply_camera_state(cam, state: dict) -> None:
     cam.SetViewUp(*state["view_up"])
     cam.SetViewAngle(state["view_angle"])
     cam.SetParallelScale(state["parallel_scale"])
+
+
+def _install_headlight(plt) -> list:
+    """Install a single camera-attached headlight for flat-movie rendering.
+
+    Matches the VTK interactor default exactly: one light at the camera
+    position aimed at the focal point (the "torch" effect).  VTK
+    transforms the camera-space coordinates to world space automatically
+    before each render, so no per-frame update is needed.
+    """
+    import vtkmodules.vtkRenderingCore as _vtkrc
+    created: list = []
+    for renderer in plt.renderers:
+        try:
+            renderer.AutomaticLightCreationOff()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            renderer.RemoveAllLights()
+        except Exception:  # noqa: BLE001
+            pass
+        lt = _vtkrc.vtkLight()
+        lt.SetLightTypeToCameraLight()
+        # Camera-space coordinates: position directly behind the viewpoint,
+        # aimed at the focal plane centre – the standard VTK headlight.
+        lt.SetPosition(0.0, 0.0, 1.0)
+        lt.SetFocalPoint(0.0, 0.0, 0.0)
+        lt.SetColor(1.0, 1.0, 1.0)
+        lt.SetIntensity(1.0)
+        renderer.AddLight(lt)
+        created.append(lt)
+    return created
+
+
+def _install_vr_headlight(plt) -> tuple:
+    """Install world-space scene lights for VR rendering.
+
+    Cannot use camera lights here: the panoramic pass renders 6 cube
+    faces, each with a different camera orientation.  A camera-attached
+    light would move between faces → different shading per face → visible
+    seams in the equirectangular remap.
+
+    Returns a 3-tuple ``(torch_lights, green_lights, red_lights)`` where
+    each element is a list of vtkLight objects (one per renderer).
+
+    Light roles
+    -----------
+    * torch  – white, intensity 1.1, follows the smoothed travel direction.
+    * green  – faint green fill, intensity 0.12, fires toward back-right
+               (travel direction yawed +135 ° around world-up).
+    * red    – faint red fill, intensity 0.12, fires toward back-left
+               (travel direction yawed -135 °).
+    """
+    import vtkmodules.vtkRenderingCore as _vtkrc
+    torch_lights: list = []
+    green_lights: list = []
+    red_lights:   list = []
+    for renderer in plt.renderers:
+        try:
+            renderer.AutomaticLightCreationOff()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            renderer.RemoveAllLights()
+        except Exception:  # noqa: BLE001
+            pass
+        # Main torch — white, slightly boosted.
+        lt_torch = _vtkrc.vtkLight()
+        lt_torch.SetLightTypeToSceneLight()
+        lt_torch.SetPositional(False)
+        lt_torch.SetColor(1.0, 1.0, 1.0)
+        lt_torch.SetIntensity(1.1)
+        renderer.AddLight(lt_torch)
+        torch_lights.append(lt_torch)
+        # Green fill — backs-right, very dim.
+        lt_green = _vtkrc.vtkLight()
+        lt_green.SetLightTypeToSceneLight()
+        lt_green.SetPositional(False)
+        lt_green.SetColor(0.78, 1.0, 0.78)
+        lt_green.SetIntensity(0.12)
+        renderer.AddLight(lt_green)
+        green_lights.append(lt_green)
+        # Red fill — back-left, very dim.
+        lt_red = _vtkrc.vtkLight()
+        lt_red.SetLightTypeToSceneLight()
+        lt_red.SetPositional(False)
+        lt_red.SetColor(1.0, 0.78, 0.78)
+        lt_red.SetIntensity(0.12)
+        renderer.AddLight(lt_red)
+        red_lights.append(lt_red)
+    return torch_lights, green_lights, red_lights
+
+
+def _update_vr_headlight(
+    lights: tuple,
+    camera_state: dict,
+    travel_dir: "np.ndarray | None" = None,
+    world_up: "np.ndarray | None" = None,
+) -> None:
+    """Aim world-space VR lights for the current frame.
+
+    *lights* is the 3-tuple returned by :func:`_install_vr_headlight`.
+    When *travel_dir* is provided, the torch follows the smoothed travel
+    direction; the green/red fills are yawed ±135 ° around *world_up*.
+    Falls back to the camera focal direction when *travel_dir* is None.
+    """
+    if not lights:
+        return
+    torch_lights, green_lights, red_lights = lights
+    pos = np.asarray(camera_state["position"], dtype=float)
+    fp  = np.asarray(camera_state["focal_point"], dtype=float)
+
+    if travel_dir is not None and world_up is not None:
+        forward = _normalize(np.asarray(travel_dir, dtype=float))
+    else:
+        d = fp - pos
+        forward = _normalize(d) if np.linalg.norm(d) > 1e-9 else np.array([0.0, 0.0, -1.0])
+
+    up = np.asarray(world_up, dtype=float) if world_up is not None else np.array([0.0, 1.0, 0.0])
+
+    green_dir = _normalize(_rotate_yaw(forward, up,  135.0))
+    red_dir   = _normalize(_rotate_yaw(forward, up, -135.0))
+
+    # Light position = camera; focal point = camera + direction (directional light).
+    for lt in torch_lights:
+        lt.SetPosition(*pos.tolist())
+        lt.SetFocalPoint(*(pos + forward).tolist())
+    for lt in green_lights:
+        lt.SetPosition(*pos.tolist())
+        lt.SetFocalPoint(*(pos + green_dir).tolist())
+    for lt in red_lights:
+        lt.SetPosition(*pos.tolist())
+        lt.SetFocalPoint(*(pos + red_dir).tolist())
 
 
 def _lock_orientation_for_vr(track: List[dict]) -> None:
@@ -580,88 +1189,6 @@ def _lock_orientation_for_vr(track: List[dict]) -> None:
         pos = np.asarray(entry["camera"]["position"], dtype=float)
         entry["camera"]["focal_point"] = (pos + look * dist).tolist()
         entry["camera"]["view_up"]     = up.tolist()
-
-
-def _install_scene_lights(plt) -> list:
-    """Replace VTK's camera-following headlight by a small rig of
-    scene-fixed omni lights placed around the volume bounds.
-
-    Why this matters for VR cubemap rendering: the panoramic pass
-    renders 6 cube faces from the same camera position but with 6
-    different orientations.  A camera-attached headlight is *relative*
-    to the camera basis, so its world position is recomputed per face
-    -> each face sees slightly different lighting and the cube seams
-    become visible after the equirectangular remap.
-
-    Scene-fixed lights are evaluated in world coordinates, identical
-    for every face, so the 6 renders share the exact same lighting
-    field and seam together perfectly.  Returns the created
-    :class:`vtkLight` objects (caller keeps them alive).
-    """
-    import vtkmodules.vtkRenderingCore as _vtkrc
-    created: list = []
-    for renderer in plt.renderers:
-        try:
-            renderer.AutomaticLightCreationOff()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            renderer.RemoveAllLights()
-        except Exception:  # noqa: BLE001
-            pass
-        # Compute scene bounds (fallback to a unit cube around the camera
-        # focal point if the renderer has no actors yet).
-        try:
-            bounds = renderer.ComputeVisiblePropBounds()
-            xmin, xmax, ymin, ymax, zmin, zmax = bounds
-            cx = 0.5 * (xmin + xmax)
-            cy = 0.5 * (ymin + ymax)
-            cz = 0.5 * (zmin + zmax)
-            diag = float(np.linalg.norm(
-                [xmax - xmin, ymax - ymin, zmax - zmin]
-            ))
-            if not np.isfinite(diag) or diag <= 0:
-                raise ValueError("bad bounds")
-        except Exception:  # noqa: BLE001
-            cx = cy = cz = 0.0
-            diag = 1.0
-        radius = max(diag, 1.0) * 1.5
-        # 6 omni point-lights on the ±X, ±Y, ±Z faces of a bounding
-        # cube (slightly different intensities for soft directionality
-        # while keeping seams invisible).  Plus a faint pure ambient
-        # via a 7th very-dim light at the centre.
-        offsets = [
-            (+1, 0, 0, 0.50),
-            (-1, 0, 0, 0.45),
-            (0, +1, 0, 0.55),
-            (0, -1, 0, 0.50),
-            (0, 0, +1, 0.50),
-            (0, 0, -1, 0.45),
-        ]
-        for dx, dy, dz, intensity in offsets:
-            lt = _vtkrc.vtkLight()
-            lt.SetLightTypeToSceneLight()
-            lt.SetPositional(False)  # directional/parallel -> identical on every cube face
-            lt.SetPosition(cx + dx * radius,
-                           cy + dy * radius,
-                           cz + dz * radius)
-            lt.SetFocalPoint(cx, cy, cz)
-            lt.SetColor(1.0, 1.0, 1.0)
-            lt.SetIntensity(intensity)
-            renderer.AddLight(lt)
-            created.append(lt)
-        # Ambient fill (very low) — ensures concavities never go to pure
-        # black, matching the cortex's "wet shiny" look across all faces.
-        amb = _vtkrc.vtkLight()
-        amb.SetLightTypeToSceneLight()
-        amb.SetPositional(True)
-        amb.SetPosition(cx, cy, cz)
-        amb.SetFocalPoint(cx, cy + 1.0, cz)
-        amb.SetColor(0.85, 0.90, 1.00)  # very slight cool tint
-        amb.SetIntensity(0.10)
-        renderer.AddLight(amb)
-        created.append(amb)
-    return created
 
 
 # ─────────────────── UI-state replay (viewer ↔ movie) ────────────────────
@@ -698,6 +1225,7 @@ _UI_DISCRETE_FIELDS = (
     "fog_on",
     "ssao_on",
     "membranes_visible",
+    "lames_visible",
 )
 
 
@@ -786,9 +1314,11 @@ class _UiReplayBundle:
         pillars_mesh=None,
         fog_actors: list | None = None,
         plt=None,
+        vr_mode: str = "off",
         membranes_actor=None,
         membranes_threshold=None,
         membranes_n_steps: int = 0,
+        **kwargs,
     ) -> None:
         self.mesh = mesh
         self.alt_mesh = alt_mesh
@@ -799,10 +1329,22 @@ class _UiReplayBundle:
         # by ``main`` after construction) and toggled visible/invisible
         # in ``apply``; the threshold's lower/upper are advanced by one
         # step per frame while visible.
+        self._vr_mode = vr_mode
         self.membranes_actor = membranes_actor
         self.membranes_threshold = membranes_threshold
         self.membranes_n_steps = int(membranes_n_steps)
         self._membranes_step = 0
+        # Water lames (V2) animation.
+        self.lames_actor = kwargs.get("lames_actor")
+        self.lames_step_pds = kwargs.get("lames_step_pds") or []
+        self.lames_n_steps = int(kwargs.get("lames_n_steps") or 0)
+        self._lames_step = 0
+        # Gradient arrows (arrows_grid view-mode).
+        self.arrows_actor = kwargs.get("arrows_actor")
+        # Crown Dijkstra tracks — list of bin-actors (lines + arrows).
+        self.tracks_bin_actors = list(kwargs.get("tracks_bin_actors") or [])
+        # Axis info for per-frame bin visibility update.
+        self.tracks_axis_info = kwargs.get("tracks_axis_info")
         # Latched values so we don't re-apply identical state every frame.
         self._last: dict = {}
         # Fog / SSAO state mirrors viewer's ``_depth_state`` dict shape.
@@ -818,9 +1360,9 @@ class _UiReplayBundle:
     @staticmethod
     def _hue_shift(rgb_0_1, shift):
         import colorsys
-        h, l, s = colorsys.rgb_to_hls(*rgb_0_1)
+        h, s, v = colorsys.rgb_to_hsv(*rgb_0_1)
         h = (h + shift) % 1.0
-        return colorsys.hls_to_rgb(h, l, s)
+        return colorsys.hsv_to_rgb(h, s, v)
 
     def _apply_pillars(self, *, visible: bool, style: str, hue: float):
         pm = self.pillars_mesh
@@ -907,6 +1449,11 @@ class _UiReplayBundle:
         self._depth["fog_on"] = on
 
     def _set_ssao(self, on: bool):
+        # SSAO is incompatible with the panoramic cubemap pass: it would
+        # overwrite renderer.SetPass() and destroy VR rendering entirely.
+        # Simply ignore the request when VR mode is active.
+        if self._vr_mode != "off":
+            return
         if on == self._depth["ssao_on"] or self.plt is None:
             return
         if on:
@@ -968,38 +1515,112 @@ class _UiReplayBundle:
 
     # --- view-mode actor swap ---------------------------------------
     def _set_view_mode(self, mode: str):
-        # Movie cannot rebuild arrows on the fly (too expensive).  We map
-        # arrows_* to mesh_bridges for visibility purposes.
         if self.alt_mesh is None and mode == "mesh_all":
             mode = "mesh_bridges"
         try:
-            show_main = mode in ("mesh_bridges", "arrows_grid",
-                                  "arrows_tracks")
-            show_alt  = mode == "mesh_all"
+            show_main   = mode == "mesh_bridges"
+            show_alt    = mode == "mesh_all"
+            show_arrows = mode == "arrows_grid"
+            show_tracks = mode == "arrows_tracks"
             getattr(self.mesh, "actor", self.mesh).SetVisibility(
                 1 if show_main else 0)
             if self.alt_mesh is not None:
                 getattr(self.alt_mesh, "actor", self.alt_mesh).SetVisibility(
                     1 if show_alt else 0)
+            if self.arrows_actor is not None:
+                getattr(self.arrows_actor, "actor",
+                        self.arrows_actor).SetVisibility(
+                    1 if show_arrows else 0)
+            if not show_tracks:
+                for _ta in self.tracks_bin_actors:
+                    try:
+                        getattr(_ta, "actor", _ta).SetVisibility(0)
+                    except Exception:  # noqa: BLE001
+                        pass
+            # When show_tracks=True, update_tracks_bins() manages per-bin
+            # visibility every frame.
         except Exception as exc:  # noqa: BLE001
             logger.debug("view_mode swap failed: %s", exc)
+
+    # --- per-frame bin culling for arrow_tracks ----------------------------
+    def update_tracks_bins(self, cam_pos: "np.ndarray") -> None:
+        """Show/hide track bin actors based on camera position (mirrors viewer).
+
+        Bins within ±BIN_FULL of the camera bin are shown at full opacity;
+        bins between BIN_FULL and BIN_FADE fade linearly; beyond BIN_FADE
+        are hidden.  No-op when view_mode != arrows_tracks.
+        """
+        if (self.tracks_axis_info is None
+                or not self.tracks_bin_actors
+                or self._last.get("view_mode") != "arrows_tracks"):
+            return
+        try:
+            info      = self.tracks_axis_info
+            axis_col  = int(info["axis_col"])
+            axis_min  = float(info["axis_min"])
+            axis_len  = float(info["axis_len"])
+            n_bins    = int(info["n_bins"])
+            bin_full  = int(info["bin_full"])
+            bin_fade  = int(info["bin_fade"])
+            fade_span = max(bin_fade - bin_full, 1)
+            cam_a     = float(cam_pos[axis_col])
+            cam_bin   = int(np.clip(
+                int((cam_a - axis_min) / axis_len * n_bins),
+                0, n_bins - 1,
+            ))
+            for _a in self.tracks_bin_actors:
+                _d    = abs(_a._bin_idx - cam_bin)
+                _mult = (1.0 if _d <= bin_full
+                         else (1.0 - (_d - bin_full) / fade_span
+                               if _d <= bin_fade else 0.0))
+                _vis  = 1 if _mult > 0.0 else 0
+                try:
+                    getattr(_a, "actor", _a).SetVisibility(_vis)
+                except Exception:  # noqa: BLE001
+                    pass
+                if _vis:
+                    try:
+                        _a.alpha(_a._base_alpha * _mult)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tracks bin update failed: %s", exc)
 
     # --- entry point -------------------------------------------------
     def apply(self, ui_state: dict | None) -> None:
         if not ui_state:
             return
-        if ui_state.get("view_mode") != self._last.get("view_mode"):
+        # Save old view_mode BEFORE updating so the pillars block can detect the
+        # transition (needed for the VR view-mode guard below).
+        _old_vm = self._last.get("view_mode")
+        if ui_state.get("view_mode") != _old_vm:
             vm = ui_state.get("view_mode") or "mesh_bridges"
             self._set_view_mode(vm)
             self._last["view_mode"] = ui_state.get("view_mode")
-        # Pillars: any of the three triggers a re-apply.
-        if (ui_state.get("pillars_visible")  != self._last.get("pillars_visible")
-            or ui_state.get("pillars_style") != self._last.get("pillars_style")
-            or ui_state.get("pillars_hue_shift") !=
-               self._last.get("pillars_hue_shift")):
+        # Pillars: re-apply on pillars state change, or in VR when view_mode
+        # changes (because visibility depends on the current view_mode in VR).
+        _vr_vm_changed = (
+            self._vr_mode != "off"
+            and ui_state.get("view_mode") != _old_vm
+        )
+        if (_vr_vm_changed
+                or ui_state.get("pillars_visible")  != self._last.get("pillars_visible")
+                or ui_state.get("pillars_style") != self._last.get("pillars_style")
+                or ui_state.get("pillars_hue_shift") !=
+                   self._last.get("pillars_hue_shift")):
+            _vis = bool(ui_state.get("pillars_visible", False))
+            _sty = str(ui_state.get("pillars_style") or "glow")
+            if self._vr_mode != "off":
+                # In VR translucency is broken; hide pillars in cortex modes
+                # and force solid (opaque) when they are shown in arrow modes.
+                _VR_ARROWS = {"arrows_grid", "arrows_tracks"}
+                _cur_vm = ui_state.get("view_mode") or "mesh_bridges"
+                _vis = _vis and (_cur_vm in _VR_ARROWS)
+                if _sty == "glow":
+                    _sty = "solid"
             self._apply_pillars(
-                visible=bool(ui_state.get("pillars_visible", False)),
-                style=str(ui_state.get("pillars_style") or "glow"),
+                visible=_vis,
+                style=_sty,
                 hue=float(ui_state.get("pillars_hue_shift") or 0.0),
             )
             self._last["pillars_visible"]   = ui_state.get("pillars_visible")
@@ -1033,6 +1654,28 @@ class _UiReplayBundle:
                     self.membranes_threshold.Modified()
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("membranes threshold update failed: %s", exc)
+        # ── Water lames (V2) descending animation ─────────────────────
+        if self.lames_actor is not None and self.lames_n_steps > 0:
+            want_vis = bool(ui_state.get("lames_visible", False))
+            if want_vis != bool(self._last.get("lames_visible", False)):
+                try:
+                    self.lames_actor.SetVisibility(1 if want_vis else 0)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("lames visibility swap failed: %s", exc)
+                self._last["lames_visible"] = want_vis
+            if want_vis:
+                self._lames_step = (
+                    self._lames_step + 1
+                ) % self.lames_n_steps
+                step_pd = (self.lames_step_pds[self._lames_step]
+                           if self._lames_step < len(self.lames_step_pds)
+                           else None)
+                if step_pd is not None:
+                    try:
+                        self.lames_actor.GetMapper().SetInputData(step_pd)
+                        self.lames_actor.GetMapper().Modified()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("lames step update failed: %s", exc)
 
 
 def _apply_actor_state(actor, state: dict) -> None:
@@ -1071,6 +1714,26 @@ def _build_path_line(track: Sequence[dict], offset_frac: float,
     if as_tube:
         radius = median_dist * PATH_TUBE_RADIUS_FRAC
         obj = vedo.Tube(line_pts, r=radius, c=color, res=16)
+        # vedo.Tube stores parametric / vertex-index scalar data that VTK
+        # maps through a rainbow LUT, overriding the solid colour.  Strip
+        # all point- and cell-data arrays from the polydata, then turn off
+        # scalar visibility on the mapper and re-assert the colour.
+        try:
+            pd = obj.dataset
+        except AttributeError:
+            pd = obj.polydata()   # vedo < 2.x
+        for _attr in (pd.GetPointData(), pd.GetCellData()):
+            for _i in range(_attr.GetNumberOfArrays() - 1, -1, -1):
+                _attr.RemoveArray(_i)
+        try:
+            _mp = obj.mapper
+            if callable(_mp):     # vedo 1.x
+                _mp = _mp()
+            if _mp is not None:
+                _mp.ScalarVisibilityOff()
+        except Exception:         # noqa: BLE001
+            pass
+        obj.color(color)
     else:
         obj = vedo.Line(line_pts, c=color, lw=PATH_LINE_WIDTH)
     try:
@@ -1081,10 +1744,87 @@ def _build_path_line(track: Sequence[dict], offset_frac: float,
     return obj
 
 
+# ─────────────────────────── anti-aliasing helpers ───────────────────────────
+
+
+def _setup_antialiasing(plt, *, msaa: int, fxaa: bool,
+                        fxaa_contrast: float,
+                        fxaa_hard_contrast: float,
+                        vr_mode: str) -> None:
+    """Enable hardware MSAA (mono only) and FXAA on every renderer.
+
+    * **MSAA** is set on the OpenGL render window.  Must be called before
+      the first render so VTK allocates a multi-sampled framebuffer.  In
+      VR mode the panoramic projection pass uses its own off-screen FBOs
+      for the 6 cube faces, which silently ignore the window-level MSAA
+      flag — we still set it so any future code path benefits, but the
+      real quality lever in VR is ``--vr-cube-resolution``.
+    * **FXAA (mono only)**: in VR mode, ``renderer.SetUseFXAA`` is
+      silently ignored because ``_setup_panoramic_pass`` later calls
+      ``renderer.SetPass(pano)`` which replaces the whole pipeline.  For
+      VR, FXAA is wired directly inside ``_setup_panoramic_pass`` as a
+      ``vtkOpenGLFXAAPass`` wrapping the panoramic pass.
+    """
+    try:
+        if msaa and msaa > 0:
+            plt.window.SetMultiSamples(int(msaa))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("SetMultiSamples(%s) failed: %s", msaa, exc)
+
+    if not fxaa or vr_mode != "off":
+        # In VR, FXAA is handled inside _setup_panoramic_pass.
+        if msaa and msaa > 0:
+            suffix = "  (MSAA only; FXAA wired in pano pass)" if vr_mode != "off" else ""
+            print(f"      AA               : MSAA×{msaa}{suffix}")
+        return
+    for renderer in plt.renderers:
+        try:
+            renderer.SetUseFXAA(True)
+            opts = renderer.GetFXAAOptions()
+            if opts is not None:
+                if hasattr(opts, "SetRelativeContrastThreshold"):
+                    opts.SetRelativeContrastThreshold(float(fxaa_contrast))
+                if hasattr(opts, "SetHardContrastThreshold"):
+                    opts.SetHardContrastThreshold(float(fxaa_hard_contrast))
+                if hasattr(opts, "SetSubpixelBlendLimit"):
+                    opts.SetSubpixelBlendLimit(0.75)
+                if hasattr(opts, "SetSubpixelContrastThreshold"):
+                    opts.SetSubpixelContrastThreshold(0.25)
+                if hasattr(opts, "SetUseHighQualityEndpoints"):
+                    opts.SetUseHighQualityEndpoints(True)
+                if hasattr(opts, "SetEndpointSearchIterations"):
+                    opts.SetEndpointSearchIterations(12)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("FXAA setup failed on %s: %s", renderer, exc)
+    print(f"      AA               : MSAA×{msaa}"
+          + f"  + FXAA(rel={fxaa_contrast}, hard={fxaa_hard_contrast})")
+
+
+def _force_phong(*meshes) -> None:
+    """Force VTK Phong (per-fragment) interpolation on every mesh.
+
+    VTK's default is Gouraud (vertex-interpolated lighting); Phong
+    yields noticeably smoother specular highlights on curved surfaces
+    at a small cost.  Called once on every actor added to the movie
+    plotter so the rendered look matches the interactive viewer's
+    default shading.
+    """
+    for m in meshes:
+        if m is None:
+            continue
+        try:
+            _set_shading(m, 2)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("force_phong failed on %s: %s", m, exc)
+
+
 # ─────────────────────────── stereo VR helpers ───────────────────────────────
 
 
-def _setup_panoramic_pass(plt, angle_deg: float, cube_resolution: int):
+def _setup_panoramic_pass(plt, angle_deg: float, cube_resolution: int,
+                          *, fxaa: bool = False,
+                          fxaa_contrast: float = 0.0833,
+                          fxaa_hard_contrast: float = 0.0312):
     """Attach a :class:`vtkPanoramicProjectionPass` to every renderer of
     ``plt`` so each render produces an equirectangular image.
 
@@ -1095,6 +1835,12 @@ def _setup_panoramic_pass(plt, angle_deg: float, cube_resolution: int):
     tiny MP4 with absurdly low bitrate (every frame compresses to a
     near-empty P-frame).  See VTK's standard panoramic pass example.
 
+    When *fxaa* is True, the panoramic pass is wrapped inside a
+    :class:`vtkOpenGLFXAAPass` so FXAA is applied to the fully-remapped
+    equirectangular output (the only reliable AA path in VR: window-level
+    MSAA and ``renderer.SetUseFXAA`` are both silently ignored once a
+    custom ``renderer.SetPass(pano)`` is in place).
+
     Returns a list of pass objects to keep alive (they must outlive
     the renderer, otherwise VTK frees them mid-render).
     """
@@ -1103,9 +1849,11 @@ def _setup_panoramic_pass(plt, angle_deg: float, cube_resolution: int):
             vtkCameraPass,
             vtkLightsPass,
             vtkOpaquePass,
+            vtkOverlayPass,
             vtkPanoramicProjectionPass,
             vtkRenderPassCollection,
             vtkSequencePass,
+            vtkTranslucentPass,
         )
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
@@ -1116,18 +1864,89 @@ def _setup_panoramic_pass(plt, angle_deg: float, cube_resolution: int):
 
     keepalive: list = []
     for renderer in plt.renderers:
-        # Inner delegate: lights + opaque geometry only (no translucent /
-        # volumetric — we don't need them and they slow the cubemap
-        # render down 6×).
+        # Inner delegate: lights + opaque + translucent + overlay.
+        #
+        # NOTE on transparency in VR: we deliberately use plain
+        # vtkTranslucentPass (not WBOIT / vtkOrderIndependentTranslucentPass).
+        # WBOIT was tried to fix a "blend-state stale" issue across cube
+        # faces, but it composites its result onto what it assumes is the
+        # main window framebuffer — inside vtkPanoramicProjectionPass every
+        # face is rendered to a private off-screen FBO, so WBOIT's composite
+        # step lands on the wrong (empty) FBO and OVERWRITES the opaque
+        # render, making all opaque actors appear transparent.  That is far
+        # worse than the original translucency issue.
+        #
+        # To compensate for potential blend-state staleness across cube faces
+        # we force a GL blend-state reset on the render window's OpenGL state
+        # object right before each pass chain runs.  This is done by
+        # vtkTranslucentPass itself in VTK ≥ 9.1 (it calls
+        # GetState()->ResetGLBlendFunc() at entry), so in practice the stale-
+        # cache problem only affects older VTK builds.
         lights = vtkLightsPass()
         opaque = vtkOpaquePass()
+        translucent = vtkTranslucentPass()
+        overlay = vtkOverlayPass()
+
+        # ── VR blend-state fix ─────────────────────────────────────────
+        # vtkPanoramicProjectionPass renders 6 cube faces by calling the
+        # delegate chain once per face.  Between faces it issues raw GL
+        # calls (FBO bind, equirect composite) that bypass VTK's OpenGL
+        # state cache.  The cache then believes blend is still enabled /
+        # correctly configured, so vtkTranslucentPass skips its
+        # glEnable(GL_BLEND) / glBlendFuncSeparate calls on faces 2-6
+        # → translucent actors (pillars, lames, membranes) appear opaque.
+        # We insert a minimal Python pass that forces the toggle
+        # disable→enable→setfunc through the cache before every
+        # translucent pass invocation, ensuring the actual GL state and
+        # the cache agree on every face.
+        blend_reset = None
+        try:
+            from vtkmodules.vtkRenderingCore import (
+                vtkRenderPass as _vtkRenderPassBase,
+            )
+
+            class _VRBlendStateResetPass(_vtkRenderPassBase):
+                def Render(self, s):
+                    try:
+                        renderer = s.GetRenderer()
+                        state = renderer.GetRenderWindow().GetState()
+                        # Toggling disable→enable forces VTK to issue real
+                        # glDisable/glEnable calls even if the cache says
+                        # blend is already enabled.
+                        state.vtkglDisable(0x0BE2)    # GL_BLEND
+                        state.vtkglEnable(0x0BE2)     # GL_BLEND
+                        state.vtkglBlendFuncSeparate(
+                            0x0302, 0x0303,  # SRC_ALPHA, ONE_MINUS_SRC_ALPHA
+                            0x0001, 0x0000,  # ONE, ZERO (alpha channel)
+                        )
+                    except Exception:          # noqa: BLE001 best-effort
+                        pass
+
+                def ReleaseGraphicsResources(self, w):
+                    pass
+
+            blend_reset = _VRBlendStateResetPass()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "VR blend-state-reset pass unavailable (VTK Python "
+                "subclassing not supported in this build?): %s  "
+                "Translucent actors (pillars, lames) may appear opaque "
+                "on some cube faces.", exc,
+            )
+
         passes = vtkRenderPassCollection()
         passes.AddItem(lights)
         passes.AddItem(opaque)
+        if blend_reset is not None:
+            passes.AddItem(blend_reset)
+            keepalive.append(blend_reset)
+        passes.AddItem(translucent)
+        passes.AddItem(overlay)
         seq = vtkSequencePass()
         seq.SetPasses(passes)
         cam_pass = vtkCameraPass()
         cam_pass.SetDelegatePass(seq)
+        keepalive.extend([translucent, overlay])
         pano = vtkPanoramicProjectionPass()
         pano.SetCubeResolution(int(cube_resolution))
         if hasattr(pano, "SetAngle"):
@@ -1137,25 +1956,62 @@ def _setup_panoramic_pass(plt, angle_deg: float, cube_resolution: int):
         if hasattr(pano, "SetInterpolate"):
             pano.SetInterpolate(True)
         pano.SetDelegatePass(cam_pass)
-        renderer.SetPass(pano)
+        top_pass = pano  # may be wrapped by FXAA below
+        if fxaa:
+            try:
+                from vtkmodules.vtkRenderingOpenGL2 import vtkOpenGLFXAAPass
+                fxaa_pass = vtkOpenGLFXAAPass()
+                fxaa_pass.SetDelegatePass(pano)
+                opts = fxaa_pass.GetFXAAOptions()
+                if opts is not None:
+                    if hasattr(opts, "SetRelativeContrastThreshold"):
+                        opts.SetRelativeContrastThreshold(float(fxaa_contrast))
+                    if hasattr(opts, "SetHardContrastThreshold"):
+                        opts.SetHardContrastThreshold(float(fxaa_hard_contrast))
+                    if hasattr(opts, "SetSubpixelBlendLimit"):
+                        opts.SetSubpixelBlendLimit(0.75)
+                    if hasattr(opts, "SetSubpixelContrastThreshold"):
+                        opts.SetSubpixelContrastThreshold(0.25)
+                    if hasattr(opts, "SetUseHighQualityEndpoints"):
+                        opts.SetUseHighQualityEndpoints(True)
+                    if hasattr(opts, "SetEndpointSearchIterations"):
+                        opts.SetEndpointSearchIterations(12)
+                top_pass = fxaa_pass
+                keepalive.append(fxaa_pass)
+            except ImportError:
+                logger.warning(
+                    "vtkOpenGLFXAAPass not available in this VTK build; "
+                    "FXAA disabled for VR panoramic pass."
+                )
+        renderer.SetPass(top_pass)
         keepalive.extend([pano, cam_pass, seq, passes, opaque, lights])
     return keepalive
 
 
-def _eye_offset(state: dict, ipd_frac: float) -> np.ndarray:
+def _eye_offset(state: dict, ipd_frac: float,
+                ipd_abs: float = 0.0) -> np.ndarray:
     """Return the world-space half-IPD vector pointing to the camera's right.
 
     Both eyes shift their position AND focal point by ±this vector to
     yield true parallel stereo (no toe-in convergence), which is what
     VR equirectangular content expects.
+
+    When *ipd_abs* > 0 it is used as the full IPD in voxels (independent
+    of camera distance).  This is the physically-correct mode: set it to
+    ``ipd_metres / metres_per_voxel`` so that a 65 mm human IPD maps to
+    the right number of voxels.  When *ipd_abs* == 0 (default), the
+    legacy *ipd_frac* × cam→focal distance formula is used instead.
     """
     pos = np.asarray(state["camera"]["position"], dtype=float)
     foc = np.asarray(state["camera"]["focal_point"], dtype=float)
     up  = np.asarray(state["camera"]["view_up"],     dtype=float)
     look = _normalize(foc - pos)
     right = _normalize(np.cross(look, up))
-    dist = float(np.linalg.norm(foc - pos))
-    half_ipd = 0.5 * float(ipd_frac) * dist
+    if ipd_abs > 0.0:
+        half_ipd = 0.5 * float(ipd_abs)
+    else:
+        dist = float(np.linalg.norm(foc - pos))
+        half_ipd = 0.5 * float(ipd_frac) * dist
     return right * half_ipd
 
 
@@ -1260,6 +2116,53 @@ def main(argv: list[str] | None = None) -> int:
         else:  # vr360
             args.width, args.height = VR360_SBS_W, VR360_SBS_H
 
+    # ── Fast preview mode (--fast) ─────────────────────────────────────────
+    # Downgrades resolution and codec settings for quick iteration.
+    # Explicit --width / --height still take precedence over --fast.
+    if args.fast:
+        if not vr_user_set_size:
+            if vr_mode == "vr180":
+                args.width, args.height = 1024, 512
+                args.vr_cube_resolution = 1024
+            elif vr_mode == "vr360":
+                args.width, args.height = 2048, 512
+                args.vr_cube_resolution = 1024
+            else:  # flat
+                args.width, args.height = 960, 540
+        if args.crf is None:
+            args.crf = 28
+        if args.preset is None:
+            args.preset = "ultrafast"
+
+    # ── High-quality mode (--high) ──────────────────────────────────────
+    # Increases resolution and codec quality beyond the defaults.
+    # Explicit --width / --height / --crf / --preset still take precedence.
+    if args.high:
+        if not vr_user_set_size:
+            if vr_mode != "off":
+                # SBS canvas stays at default (8192×2048 / 4096×2048);
+                # cube-face resolution is the key quality lever for VR.
+                args.vr_cube_resolution = 4096
+            else:  # flat → 4K
+                args.width, args.height = 3840, 2160
+        if args.crf is None:
+            args.crf = 12 if vr_mode != "off" else 18
+
+    # ── Ultra-high-quality mode (--ultra-high) ──────────────────────────
+    # Superset of --high: 8192-px cube faces (4× SSAA vs default 2048),
+    # 5K flat, CRF 10.  Implies --high.
+    if args.ultra_high:
+        args.high = True
+        if not vr_user_set_size:
+            if vr_mode != "off":
+                args.vr_cube_resolution = 8192
+            else:  # flat → 5K
+                args.width, args.height = 5120, 2880
+        if args.crf is None:
+            args.crf = 10
+        if args.preset is None:
+            args.preset = "veryslow"
+
     if vr_mode != "off":
         if args.width % 2 != 0:
             logger.error("SBS canvas width must be even; got %d.", args.width)
@@ -1271,6 +2174,8 @@ def main(argv: list[str] | None = None) -> int:
 
     positions_path = _pick_positions_file(args.positions)
     control_points = _load_control_points(positions_path)
+    if args.trick is not None and args.trick > 0:
+        control_points = control_points[: args.trick]
     n_ctrl = len(control_points)
 
     # Output convention:
@@ -1281,8 +2186,18 @@ def main(argv: list[str] | None = None) -> int:
         out_path = Path(args.output).expanduser().resolve()
     else:
         mp4_dir = DEFAULT_MP4_DIR
+        if args.ultra_high:
+            quality_prefix = "ULTRA_"
+        elif args.high:
+            quality_prefix = "HIGH_"
+        elif args.fast:
+            quality_prefix = "FAST_"
+        else:
+            quality_prefix = "NORMAL_"
+        if args.stresstest:
+            quality_prefix = "STRESS_" + quality_prefix
         suffix = f"_{vr_mode}" if vr_mode != "off" else ""
-        out_path = mp4_dir / (positions_path.stem + suffix + ".mp4")
+        out_path = mp4_dir / (quality_prefix + positions_path.stem + suffix + ".mp4")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     frames_dir = out_path.parent / (out_path.stem + "_frames")
 
@@ -1312,8 +2227,14 @@ def main(argv: list[str] | None = None) -> int:
     if vr_mode != "off":
         print(f"  Stereo VR        : {vr_mode}  "
               f"(equirectangular {vr_angle:.0f}°, parallel SBS)")
-        print(f"  IPD fraction     : {args.ipd_frac}  "
-              f"(of cam→focal distance)")
+        if args.meters_per_voxel > 0.0:
+            _ipd_vox_preview = args.ipd_metres / args.meters_per_voxel
+            print(f"  IPD (physical)   : {args.ipd_metres * 1000:.1f} mm / "
+                  f"{args.meters_per_voxel} m·vox⁻¹ "
+                  f"= {_ipd_vox_preview:.4f} vox  [fixed]")
+        else:
+            print(f"  IPD fraction     : {args.ipd_frac}  "
+                  f"(of cam→focal distance)  [legacy]")
         print(f"  Cube resolution  : {args.vr_cube_resolution} px / face")
     # Codec / quality is resolved later (depends on vr_mode); print a
     # one-liner here so the banner is still complete.
@@ -1436,6 +2357,15 @@ def main(argv: list[str] | None = None) -> int:
                     _prop.SetAmbient(0.85)
                     _prop.SetDiffuse(0.10)
                     _prop.SetSpecular(0.0)
+                    if vr_mode != "off":
+                        # Translucency broken in VR (blend-state stale); render
+                        # membranes fully opaque with Phong shading instead.
+                        _prop.SetOpacity(1.0)
+                        _prop.SetAmbient(0.18)
+                        _prop.SetDiffuse(0.78)
+                        _prop.SetSpecular(0.55)
+                        _prop.SetSpecularPower(35)
+                        _prop.SetInterpolation(2)  # Phong
                     _prop.BackfaceCullingOff()
                     _prop.FrontfaceCullingOff()
                     membranes_actor.SetVisibility(0)
@@ -1454,9 +2384,332 @@ def main(argv: list[str] | None = None) -> int:
                 "(%s, %s)", mem_vtp, mem_meta,
             )
 
+    # ── Water lames (V2) descending animation (load-only) ─────────────
+    lames_actor = None
+    lames_step_pds: list = []
+    lames_n_steps = 0
+    if not args.ignore_ui_state and args.lames_vtp_cache and args.lames_meta_cache:
+        _lv = Path(args.lames_vtp_cache).expanduser().resolve()
+        _lm = Path(args.lames_meta_cache).expanduser().resolve()
+        try:
+            _lames_pd, _lames_meta = _load_lames(_lv, _lm)
+            if _lames_pd is not None and _lames_meta is not None:
+                lames_n_steps = int(_lames_meta.get("n_steps", 0))
+                if lames_n_steps > 0:
+                    _step_pds, _actor = _build_lames_step_polydatas(
+                        _lames_pd, lames_n_steps)
+                    lames_step_pds = _step_pds
+                    lames_actor = _actor
+                    if vr_mode != "off":
+                        # Translucency broken in VR (blend-state stale); render
+                        # lames fully opaque with Phong shading instead.
+                        _lp = _actor.GetProperty()
+                        _lp.SetOpacity(1.0)
+                        _lp.SetAmbient(0.18)
+                        _lp.SetDiffuse(0.78)
+                        _lp.SetSpecular(0.55)
+                        _lp.SetSpecularPower(35)
+                        _lp.SetInterpolation(2)  # Phong
+                    lames_actor.SetVisibility(0)
+                    print(f"      [ui_state] water lames loaded "
+                          f"(n_steps={lames_n_steps}, "
+                          f"{_lames_pd.GetNumberOfCells()} cells)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load lames caches %s / %s: %s",
+                           _lv, _lm, exc)
+
+    # ── Gradient arrows (arrows_grid view-mode) ────────────────────────────
+    arrows_actor = None
+    if not args.ignore_ui_state and args.arrows_cache:
+        _arr_path = Path(args.arrows_cache).expanduser().resolve()
+        if _arr_path.exists():
+            try:
+                import vedo as _vedo_arr
+                _arr_data = np.load(_arr_path)
+                _pts    = np.asarray(_arr_data["pts"],    dtype=np.float32)
+                _dirs   = np.asarray(_arr_data["dirs"],   dtype=np.float32)
+                _scores = np.asarray(_arr_data["scores"], dtype=np.float32)
+                _boost  = (np.asarray(_arr_data["boost"], dtype=np.float32)
+                           if "boost" in _arr_data
+                           else np.zeros(len(_pts), dtype=np.float32))
+                if len(_pts) > 0:
+                    # Pick cmap_mode + arrow_length from the first keyframe
+                    # where arrows_grid is active, or fall back to defaults.
+                    _arr_cmap   = "angle"
+                    _arr_length = DEFAULT_ARROW_LENGTH
+                    for _cp in control_points:
+                        _ui = (_cp.get("ui_state", {})
+                               if isinstance(_cp, dict) else {})
+                        if _ui.get("view_mode") == "arrows_grid":
+                            _arr_cmap   = _ui.get("cmap_mode", "angle") or "angle"
+                            _arr_length = float(
+                                _ui.get("arrow_length") or DEFAULT_ARROW_LENGTH)
+                            break
+                    _ends = _pts + _dirs * _arr_length
+                    # 5-stop perceptual ramp: blue → green → yellow → orange → red
+                    _stops = np.array([
+                        [0.45, 0.70, 1.00],
+                        [0.20, 0.80, 0.30],
+                        [0.95, 0.90, 0.15],
+                        [1.00, 0.55, 0.10],
+                        [0.90, 0.10, 0.10],
+                    ], dtype=np.float32)
+                    if _arr_cmap == "convergence" and len(_boost) > 1:
+                        _b   = np.nan_to_num(_boost, nan=0.0, posinf=1.0, neginf=0.0)
+                        _lo, _hi = np.percentile(_b, [5.0, 95.0])
+                        _rng = float(_hi - _lo)
+                        _t_c = (np.full(len(_b), 0.5, dtype=np.float32)
+                                if _rng < 1e-6
+                                else np.clip((_b - _lo) / _rng,
+                                             0.0, 1.0).astype(np.float32))
+                    else:
+                        _sc  = np.nan_to_num(_scores, nan=0.0, posinf=1.0, neginf=0.0)
+                        _t_c = np.clip(_sc, 0.0, 1.0).astype(np.float32)
+                    _seg_c = _t_c * (len(_stops) - 1)
+                    _i0_c  = np.clip(_seg_c.astype(int), 0, len(_stops) - 2)
+                    _f_c   = (_seg_c - _i0_c)[:, None]
+                    _rgb_c = _stops[_i0_c] * (1.0 - _f_c) + _stops[_i0_c + 1] * _f_c
+                    _colors_c = (_rgb_c * 255).astype(np.uint8)
+                    arrows_actor = _vedo_arr.Arrows(
+                        _pts, _ends,
+                        c=_colors_c,
+                        thickness=DEFAULT_ARROW_THICKNESS,
+                    )
+                    try:
+                        arrows_actor.lighting("off")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    getattr(arrows_actor, "actor", arrows_actor).SetVisibility(0)
+                    print(f"      [ui_state] gradient arrows loaded "
+                          f"({len(_pts)} arrows, cmap={_arr_cmap})")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not load arrows cache %s: %s",
+                               _arr_path, exc)
+        else:
+            logger.debug("--arrows-cache %s does not exist – "
+                         "arrows_grid mode will be empty", _arr_path)
+
+    # ── Crown Dijkstra tracks (arrows_tracks view-mode) ────────────────────
+    # Instead of one monolithic actor, we build N_BINS sub-actors grouped by
+    # position along the volume's longest axis — same system as the viewer.
+    # _UiReplayBundle.update_tracks_bins() shows/hides bin actors around the
+    # camera each frame, so only nearby paths are rendered at any one time.
+    tracks_bin_actors: list = []
+    tracks_axis_info         = None
+    if not args.ignore_ui_state and args.crown_tracks_cache:
+        _trk_path     = Path(args.crown_tracks_cache).expanduser().resolve()
+        _trk_arr_path = (
+            Path(args.crown_tracks_arrows_cache).expanduser().resolve()
+            if args.crown_tracks_arrows_cache else None
+        )
+        if _trk_path.exists():
+            try:
+                import vtk as _vtk_t
+                from vtkmodules.util.numpy_support import (
+                    vtk_to_numpy as _v2n,
+                    numpy_to_vtk  as _n2v,
+                )
+                import vedo as _vedo_trk
+                _rdr_t = _vtk_t.vtkXMLPolyDataReader()
+                _rdr_t.SetFileName(str(_trk_path))
+                _rdr_t.Update()
+                _pd_t = _rdr_t.GetOutput()
+                if _pd_t.GetNumberOfCells() > 0:
+                    _spl = _vtk_t.vtkSplineFilter()
+                    _spl.SetInputData(_pd_t)
+                    _spl.SetSubdivideToSpecified()
+                    _spl.SetNumberOfSubdivisions(64)
+                    _spl.Update()
+                    _pd_sm = _spl.GetOutput()
+                    # ── Axis + bin parameters (mirrors viewer constants) ──
+                    _N_BINS    = 100
+                    _BIN_FULL  = 8
+                    _BIN_FADE  = 16
+                    _WATER_RGB = (0.72, 0.90, 1.00)
+                    _b    = list(_pd_sm.GetBounds())
+                    _ex   = [_b[1]-_b[0], _b[3]-_b[2], _b[5]-_b[4]]
+                    _ac   = int(np.argmax(np.array(_ex, dtype=np.float64)))
+                    _amin = float(_b[2 * _ac])
+                    _alen = max(float(_b[2 * _ac + 1]) - _amin, 1.0)
+                    # ── Per-cell bin assignment (splined polylines) ───────
+                    _pts_sm  = _v2n(_pd_sm.GetPoints().GetData())
+                    _ca_sm   = _pd_sm.GetLines()
+                    _offs_sm = _v2n(_ca_sm.GetOffsetsArray()).astype(np.int64)
+                    _conn_sm = _v2n(
+                        _ca_sm.GetConnectivityArray()).astype(np.int64)
+                    _coord_pt = _pts_sm[_conn_sm, _ac].astype(np.float64)
+                    _seg_sum  = np.add.reduceat(_coord_pt, _offs_sm[:-1])
+                    _seg_cnt  = np.maximum(
+                        np.diff(_offs_sm).astype(np.float64), 1.0)
+                    _cell_bin = np.clip(
+                        ((_seg_sum / _seg_cnt - _amin) / _alen
+                         * _N_BINS).astype(int),
+                        0, _N_BINS - 1,
+                    )
+                    # ── Line bin actors ───────────────────────────────────
+                    _lba = []
+                    for _bi in range(_N_BINS):
+                        _ids = np.where(_cell_bin == _bi)[0]
+                        if len(_ids) == 0:
+                            continue
+                        _idl = _vtk_t.vtkIdList()
+                        _idl.SetNumberOfIds(len(_ids))
+                        for _k2, _cid in enumerate(_ids):
+                            _idl.SetId(_k2, int(_cid))
+                        _extr = _vtk_t.vtkExtractCells()
+                        _extr.SetInputData(_pd_sm)
+                        _extr.SetCellList(_idl)
+                        _extr.Update()
+                        _geo = _vtk_t.vtkGeometryFilter()
+                        _geo.SetInputConnection(_extr.GetOutputPort())
+                        _geo.Update()
+                        _a = _vedo_trk.Mesh(_geo.GetOutput())
+                        try:
+                            _a.mapper().ScalarVisibilityOff()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _a.c(_WATER_RGB).lw(4).alpha(0.18)
+                        try:
+                            _a.lighting("off")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _a._bin_idx    = _bi
+                        _a._base_alpha = 0.18
+                        getattr(_a, "actor", _a).SetVisibility(0)
+                        _lba.append(_a)
+                    print(f"      [ui_state] crown tracks lines: "
+                          f"{_pd_t.GetNumberOfCells()} paths → "
+                          f"{len(_lba)} populated line bins")
+                    # ── Arrow bin actors ──────────────────────────────────
+                    _aba = []
+                    if (_trk_arr_path is not None
+                            and _trk_arr_path.exists()):
+                        _rdr_a = _vtk_t.vtkXMLPolyDataReader()
+                        _rdr_a.SetFileName(str(_trk_arr_path))
+                        _rdr_a.Update()
+                        _pd_g = _rdr_a.GetOutput()
+                        if _pd_g.GetNumberOfPoints() > 0:
+                            _asrc = _vtk_t.vtkArrowSource()
+                            _asrc.SetTipLength(0.35)
+                            _asrc.SetTipRadius(0.12)
+                            _asrc.SetShaftRadius(0.06)
+                            _asrc.Update()
+                            # 5-stop LUT: blue → green → yellow → orange → red
+                            _slut = np.array([
+                                [0.45, 0.70, 1.00],
+                                [0.20, 0.80, 0.30],
+                                [0.95, 0.90, 0.15],
+                                [1.00, 0.55, 0.10],
+                                [0.90, 0.10, 0.10],
+                            ], dtype=np.float64)
+                            _lut = _vtk_t.vtkLookupTable()
+                            _lut.SetNumberOfTableValues(256)
+                            _lut.SetRange(0.0, 1.0)
+                            for _k in range(256):
+                                _tk  = _k / 255.0
+                                _sgk = _tk * 4.0
+                                _i0  = min(int(_sgk), 3)
+                                _fk  = _sgk - _i0
+                                _rgb = (_slut[_i0] * (1.0 - _fk)
+                                        + _slut[_i0 + 1] * _fk)
+                                _lut.SetTableValue(
+                                    _k, _rgb[0], _rgb[1], _rgb[2], 1.0)
+                            _lut.Build()
+                            # Per-point bin
+                            _tan_a = _pd_g.GetPointData().GetArray("tangents")
+                            _t_a   = _pd_g.GetPointData().GetArray("t")
+                            if _tan_a is not None and _t_a is not None:
+                                _pts_g  = _v2n(_pd_g.GetPoints().GetData())
+                                _tan_np = _v2n(_tan_a)
+                                _t_np   = _v2n(_t_a)
+                                _pt_bin = np.clip(
+                                    ((_pts_g[:, _ac] - _amin) / _alen
+                                     * _N_BINS).astype(int),
+                                    0, _N_BINS - 1,
+                                )
+                                for _bi in range(_N_BINS):
+                                    _idxs = np.where(_pt_bin == _bi)[0]
+                                    if len(_idxs) == 0:
+                                        continue
+                                    _sp = _vtk_t.vtkPolyData()
+                                    _spts = _vtk_t.vtkPoints()
+                                    _spts.SetDataTypeToDouble()
+                                    _spts.SetData(_n2v(
+                                        _pts_g[_idxs].astype(np.float64),
+                                        deep=True,
+                                        array_type=_vtk_t.VTK_DOUBLE,
+                                    ))
+                                    _sp.SetPoints(_spts)
+                                    _ta2 = _n2v(
+                                        _tan_np[_idxs].astype(np.float64),
+                                        deep=True,
+                                        array_type=_vtk_t.VTK_DOUBLE,
+                                    )
+                                    _ta2.SetName("tangents")
+                                    _sp.GetPointData().AddArray(_ta2)
+                                    _sp.GetPointData().SetActiveVectors(
+                                        "tangents")
+                                    _sa2 = _n2v(
+                                        _t_np[_idxs].astype(np.float32),
+                                        deep=True,
+                                        array_type=_vtk_t.VTK_FLOAT,
+                                    )
+                                    _sa2.SetName("t")
+                                    _sp.GetPointData().AddArray(_sa2)
+                                    _sp.GetPointData().SetActiveScalars("t")
+                                    _gl = _vtk_t.vtkGlyph3D()
+                                    _gl.SetSourceConnection(
+                                        _asrc.GetOutputPort())
+                                    _gl.SetInputData(_sp)
+                                    _gl.SetVectorModeToUseVector()
+                                    _gl.OrientOn()
+                                    try:
+                                        _gl.SetScaleModeToNoDataScaling()
+                                    except AttributeError:
+                                        _gl.SetScaleMode(3)  # VTK_DATA_SCALING_OFF
+                                    _gl.SetScaleFactor(
+                                        DEFAULT_ARROW_LENGTH * 1.2)
+                                    _gl.SetColorModeToColorByScalar()
+                                    _gl.Update()
+                                    _a = _vedo_trk.Mesh(_gl.GetOutput())
+                                    _mm = _a.mapper()
+                                    _mm.SetLookupTable(_lut)
+                                    _mm.SetScalarRange(0.0, 1.0)
+                                    _mm.ScalarVisibilityOn()
+                                    _mm.SetColorModeToMapScalars()
+                                    try:
+                                        _a.lighting("off")
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    _a._bin_idx    = _bi
+                                    _a._base_alpha = 1.0
+                                    getattr(_a, "actor", _a).SetVisibility(0)
+                                    _aba.append(_a)
+                                print(f"      [ui_state] crown tracks arrows: "
+                                      f"{_pd_g.GetNumberOfPoints()} glyph "
+                                      f"centres → {len(_aba)} arrow bins")
+                    tracks_bin_actors = _lba + _aba
+                    tracks_axis_info  = {
+                        "axis_col": _ac,
+                        "axis_min": _amin,
+                        "axis_len": _alen,
+                        "n_bins":   _N_BINS,
+                        "bin_full": _BIN_FULL,
+                        "bin_fade": _BIN_FADE,
+                    }
+                    print(f"      [ui_state] tracks culling: axis={_ac}, "
+                          f"{len(tracks_bin_actors)} bin actors total "
+                          f"(±{_BIN_FULL} full + ±{_BIN_FADE} fade)")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not load crown tracks from %s: %s",
+                               _trk_path, exc)
+        else:
+            logger.debug("--crown-tracks-cache %s does not exist – "
+                         "arrows_tracks mode will be empty", _trk_path)
+
     # ── 2. Interpolate camera + actor track ───────────────────────────────
     print("[2/4] Interpolating camera + actor track …")
-    track = build_track(
+    track, t_out_ui = build_track(
         control_points,
         frames_per_segment,
         hold_frames=hold_frames,
@@ -1469,7 +2722,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.stresstest:
         keep = min(total_frames, args.fps * 4)
-        track = track[:keep]
+        track    = track[:keep]
+        t_out_ui = t_out_ui[:keep]  # keep in sync with track
         total_frames = len(track)
         print(f"      [stresstest] truncated to first {total_frames} frames "
               f"({total_frames / args.fps:.2f}s)")
@@ -1485,20 +2739,22 @@ def main(argv: list[str] | None = None) -> int:
         print("      [VR] orientation locked to first keyframe "
               "(only translations are applied)")
 
+    # ── Stage C: zero-phase position smoothing ──────────────────────────
+    # Eliminates spline-residual jitter from the ortho-panel red dot and
+    # info-billboard.  Wider window for VR (comfort-critical) than flat.
+    _smooth_window = 1.0 if vr_mode != "off" else 0.6
+    _smooth_track_positions(track, args.fps, window_s=_smooth_window)
+    logger.info("Stage-C smoothing applied (window=%.1f s, %d frames)",
+                _smooth_window, len(track))
+
     # ── 2bis. UI-state replay track ──────────────────────────────────
     if args.ignore_ui_state:
         ui_track: List[dict | None] = [None] * len(track)
     else:
-        # Re-derive t_out so we don't have to expose it from build_track.
-        _t_out_for_ui = _build_time_axis(
-            len(control_points), frames_per_segment,
-            hold_frames=hold_frames,
-            ease_segments=min(args.ease_segments,
-                              max(0, len(control_points) - 1)),
-            ease_strength=args.ease_strength,
-        )
+        # t_out_ui comes directly from build_track and carries the
+        # arc-length-aware fractional control-point position per frame.
         ui_track = _build_ui_track(
-            control_points, _t_out_for_ui,
+            control_points, t_out_ui,
             fps=args.fps,
             frames_per_segment=frames_per_segment,
             transition_seconds=float(args.ui_transition_seconds),
@@ -1553,52 +2809,129 @@ def main(argv: list[str] | None = None) -> int:
         offscreen=True,
         size=(eye_w, eye_h),
     )
+    # Enable MSAA on the render window BEFORE any actor is added or
+    # rendered — VTK only allocates a multi-sampled framebuffer on the
+    # first render.
+    try:
+        if args.msaa and args.msaa > 0:
+            plt.window.SetMultiSamples(int(args.msaa))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Early SetMultiSamples failed: %s", exc)
+    # Force Phong shading on every mesh actor.  VTK's default is
+    # Gouraud (vertex-interpolated lighting) which produces visibly
+    # facetted highlights on curved silhouettes.
+    _force_phong(mesh, alt_mesh, pillars_mesh)
     plt.add(mesh)
     if alt_mesh is not None:
         plt.add(alt_mesh)
     if pillars_mesh is not None:
         plt.add(pillars_mesh)
+    if arrows_actor is not None:
+        plt.add(arrows_actor)
+    for _tba in tracks_bin_actors:
+        try:
+            plt.add(_tba)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not add track bin actor: %s", exc)
     if membranes_actor is not None:
         try:
             plt.renderer.AddActor(membranes_actor)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not add membranes actor: %s", exc)
+    if lames_actor is not None:
+        try:
+            plt.renderer.AddActor(lames_actor)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not add lames actor: %s", exc)
     if path_line is not None:
         plt.add(path_line)
     plt.show(interactive=False, resetcam=True)
 
+    # Enable FXAA on every renderer (post-process; works for both mono
+    # and VR — applied after the panoramic remap when present).
+    _setup_antialiasing(
+        plt,
+        msaa=args.msaa,
+        fxaa=not args.no_fxaa,
+        fxaa_contrast=args.fxaa_contrast,
+        fxaa_hard_contrast=args.fxaa_hard_contrast,
+        vr_mode=vr_mode,
+    )
+
     # UI-state replay bundle (holds actors + caches diff state across
     # frames so we don't reapply unchanged values).
-    fog_actors_bundle = [a for a in (mesh, alt_mesh, pillars_mesh)
-                         if a is not None]
+    fog_actors_bundle = [a for a in (
+        mesh, alt_mesh, pillars_mesh, arrows_actor,
+    ) if a is not None]
     ui_bundle = _UiReplayBundle(
         mesh=mesh,
         alt_mesh=alt_mesh,
         pillars_mesh=pillars_mesh,
         fog_actors=fog_actors_bundle,
         plt=plt,
+        vr_mode=vr_mode,
         membranes_actor=membranes_actor,
         membranes_threshold=membranes_threshold,
         membranes_n_steps=membranes_n_steps,
+        lames_actor=lames_actor,
+        lames_step_pds=lames_step_pds,
+        lames_n_steps=lames_n_steps,
+        arrows_actor=arrows_actor,
+        tracks_bin_actors=tracks_bin_actors,
+        tracks_axis_info=tracks_axis_info,
     )
 
-    # Attach the panoramic projection pass once (if VR).  Kept in a local
-    # variable so the Python object isn't garbage-collected mid-render.
+    # Install lighting that matches the interactive viewer.
+    #
+    # • Flat movie  → no custom lights; VTK's AutomaticLightCreation (ON by
+    #                 default, same in offscreen mode) creates one headlight
+    #                 at the camera position, exactly as in the interactor.
+    # • VR movie    → world-space SceneLight whose position is synced to
+    #                 the camera each frame (see _update_vr_headlight call
+    #                 in the render loop below).  A true CameraLight / the
+    #                 automatic headlight cannot be used here because the
+    #                 panoramic pass renders 6 cube faces with different
+    #                 orientations, and a camera-relative light shifts
+    #                 between faces → visible seams.
     pano_passes = None
     vr_lights = None
+    if not args.preview and vr_mode != "off":
+        vr_lights = _install_vr_headlight(plt)
+        _n_torch = len(vr_lights[0])
+        print(f"      installed {_n_torch * 3} world-space lights "
+              "(torch × 1 + green-fill × 1 + red-fill × 1, VR mode – updated per frame)")
     if vr_mode != "off":
-        # Scene-fixed lights BEFORE the panoramic pass: must be present
-        # in the renderer at the time vtkLightsPass executes (which is
-        # every cube-face render).
-        vr_lights = _install_scene_lights(plt)
-        print(f"      [VR] installed {len(vr_lights)} scene-fixed lights "
-              "(headlight disabled)")
+        # Panoramic projection pass AFTER the lights are in place.
+        # FXAA must be chained HERE (wrapping the pano pass) — calling
+        # renderer.SetUseFXAA() before SetPass(pano) is silently ignored.
         pano_passes = _setup_panoramic_pass(
             plt, vr_angle, args.vr_cube_resolution,
+            fxaa=not args.no_fxaa,
+            fxaa_contrast=args.fxaa_contrast,
+            fxaa_hard_contrast=args.fxaa_hard_contrast,
+        )
+
+    # World-up and per-frame travel directions — needed by both the VR
+    # headlight update and the ortho billboard.  Computed once here so
+    # they are available even when the ortho panel is disabled.
+    vr_world_up: np.ndarray | None = None
+    vr_travel_dirs: np.ndarray | None = None
+    if vr_mode != "off" and track:
+        vr_world_up = np.asarray(
+            track[0]["camera"].get("view_up", [0.0, 1.0, 0.0]),
+            dtype=float,
+        )
+        _up_n = float(np.linalg.norm(vr_world_up))
+        vr_world_up = vr_world_up / _up_n if _up_n > 1e-9 else np.array([0.0, 1.0, 0.0])
+        _vel_win = max(1, args.fps // 4)
+        vr_travel_dirs = _compute_travel_dirs(
+            track, vr_world_up, velocity_window=_vel_win, alpha=0.12,
         )
 
     # Optional orthogonal-slice locator panel — baked into every frame.
     ortho_overlay = None
+    ortho_billboard = None
+    _focal_dist = 100.0  # default; overwritten by the ortho-panel block below
     if not args.no_ortho_panel:
         raw_path = (
             Path(args.raw).expanduser().resolve()
@@ -1608,23 +2941,70 @@ def main(argv: list[str] | None = None) -> int:
         if raw_path.exists():
             try:
                 from marvel_view.visualization.ortho_panel import (
-                    OrthoPanelOverlay, load_raw_volume,
+                    OrthoPanel3DBillboard, OrthoPanelOverlay, load_raw_volume,
                 )
                 raw_volume = load_raw_volume(raw_path)
-                # In SBS VR the per-eye image is the full plotter canvas,
-                # so the same normalized viewport works for both eyes.
-                ortho_overlay = OrthoPanelOverlay(
-                    plt, raw_volume,
-                    viewport=(0.0, 0.5, 0.4, 1.0),
-                    cell_pixels=320,
-                )
-                print(f"      ortho panel attached  (Raw={raw_path.name}, "
-                      f"shape={raw_volume.shape})")
+                if vr_mode != "off":
+                    # ── VR mode: 3-D billboard in layer-0 renderer ──────────────
+                    # Estimate a representative focal distance from the track.
+                    _foc_dists = np.linalg.norm(
+                        np.array([s["camera"]["focal_point"] for s in track], dtype=float)
+                        - np.array([s["camera"]["position"] for s in track], dtype=float),
+                        axis=1,
+                    )
+                    _focal_dist = float(np.median(_foc_dists)) if _foc_dists.size else 100.0
+                    # vr_world_up and vr_travel_dirs are already computed above.
+                    ortho_billboard = OrthoPanel3DBillboard(
+                        plt, raw_volume,
+                        focal_dist=_focal_dist,
+                        cell_pixels=256,
+                        meters_per_voxel=args.meters_per_voxel,
+                    )
+                    print(f"      ortho billboard attached  (Raw={raw_path.name}, "
+                          f"shape={raw_volume.shape}, focal_dist={_focal_dist:.1f})")
+                else:
+                    # ── Flat mode: 2-D HUD anchored vertically centered ─────────
+                    ortho_overlay = OrthoPanelOverlay(
+                        plt, raw_volume,
+                        viewport=(0.02, 0.15, 0.34, 0.69),
+                        cell_pixels=round(92 * eye_h / 540),
+                        center_vertically=True,
+                    )
+                    print(f"      ortho panel attached  (Raw={raw_path.name}, "
+                          f"shape={raw_volume.shape})")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to attach ortho panel: %s", exc)
         else:
             logger.info("Raw volume not found (%s) – ortho panel disabled.",
                         raw_path)
+
+    # ── Info panel (title + mode subtitle) ──────────────────────────────────
+    info_overlay   = None
+    info_billboard = None
+    try:
+        from marvel_view.visualization.ortho_panel import (
+            InfoBillboard3D as _InfoBB, InfoPanelOverlay as _InfoPO,
+        )
+        from marvel_view.scripts.water_conductance.constants import (
+            PANEL_TITLE         as _PANEL_TITLE,
+            VIEW_MODE_SUBTITLES as _VIEW_MODE_SUBTITLES,
+        )
+        _init_mode = (track[0].get("ui_state") or {}).get("view_mode", "mesh_bridges")
+        _init_sub  = _VIEW_MODE_SUBTITLES.get(_init_mode, "")
+        if vr_mode != "off":
+            info_billboard = _InfoBB(
+                plt, _PANEL_TITLE, _init_sub,
+                focal_dist=_focal_dist,
+                meters_per_voxel=args.meters_per_voxel,
+                angular_width_deg=34.0,
+                tile_scale=1.7,
+            )
+            print("      info billboard attached")
+        else:
+            info_overlay = _InfoPO(plt, _PANEL_TITLE, _init_sub, opacity=0.72)
+            print("      info overlay attached")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to attach info panel: %s", exc)
 
     actor = getattr(mesh, "actor", None) or mesh
 
@@ -1665,12 +3045,43 @@ def main(argv: list[str] | None = None) -> int:
     right_eye_png = frames_dir / "_eye_right.png"
 
     t_start = time.time()
+    # Compute physical IPD once — used in the VR stereo offset per frame.
+    # When --meters-per-voxel is set, the IPD is fixed in voxels regardless
+    # of camera distance (physically correct).  Otherwise fall back to the
+    # legacy ipd_frac × dist formula (ipd_abs=0 signals the fallback).
+    _ipd_abs = 0.0
+    if vr_mode != "off" and args.meters_per_voxel > 0.0:
+        _ipd_abs = args.ipd_metres / args.meters_per_voxel
+        print(f"      [VR] physical IPD  : {_ipd_abs:.4f} vox  "
+              f"({args.ipd_metres * 1000:.1f} mm / "
+              f"{args.meters_per_voxel} m·vox⁻¹)")
+
+    # Pre-compute per-frame travel speed (µm/s) for the info panel speed line.
+    _track_speeds_um_s: np.ndarray = np.zeros(len(track))
+    if len(track) > 1 and (info_billboard is not None or info_overlay is not None):
+        try:
+            from marvel_view.scripts.water_conductance.constants import (
+                VOXEL_SIZE_UM as _VOXEL_SIZE_UM,
+            )
+        except ImportError:
+            _VOXEL_SIZE_UM = 6.71
+        _tpos     = np.array([s["camera"]["position"] for s in track], dtype=float)
+        _raw_spd  = np.linalg.norm(np.diff(_tpos, axis=0), axis=1) * args.fps * _VOXEL_SIZE_UM
+        _raw_spd  = np.concatenate([_raw_spd, [_raw_spd[-1]]])
+        _spd_win  = max(1, args.fps // 4)
+        _kern     = np.ones(_spd_win) / _spd_win
+        _track_speeds_um_s = np.convolve(_raw_spd, _kern, mode="same")
+
     for i, state in enumerate(track):
         _apply_actor_state(actor, state["actor"])
         # Per-frame UI-state replay (visibility swap, pillars, fog/SSAO).
         ui_bundle.apply(state.get("ui_state"))
+        # Camera-based culling: slide clip planes to camera position so
+        # only nearby tracks are rendered (avoids visual overload).
+        ui_bundle.update_tracks_bins(
+            np.asarray(state["camera"]["position"], dtype=float))
 
-        if ortho_overlay is not None:
+        if ortho_billboard is not None or ortho_overlay is not None:
             # Always use the un-shifted (mono) camera position — the red
             # dot represents the viewer's location, not the per-eye shift.
             cam_state = state["camera"]
@@ -1682,7 +3093,21 @@ def main(argv: list[str] | None = None) -> int:
                 mono_dir = mono_dir / nrm
             else:
                 mono_dir = np.array([0.0, 0.0, -1.0])
-            ortho_overlay.update(mono_pos, mono_dir)
+            if ortho_billboard is not None:
+                ortho_billboard.update(mono_pos, mono_dir, vr_travel_dirs[i], vr_world_up)
+            else:
+                ortho_overlay.update(mono_pos, mono_dir)
+
+        # ── Info panel update (pose + subtitle) ─────────────────────────────
+        if info_billboard is not None or info_overlay is not None:
+            _ui_st    = state.get("ui_state") or {}
+            _sub_text = _VIEW_MODE_SUBTITLES.get(_ui_st.get("view_mode", ""), "")
+            _spd_text = f"Travelling speed:  {_track_speeds_um_s[i]:.1f} um/s"
+            if info_billboard is not None:
+                _ipos = np.asarray(state["camera"]["position"], dtype=float)
+                info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text, _spd_text)
+            elif info_overlay is not None:
+                info_overlay.update(_sub_text, _spd_text)
 
         if vr_mode == "off":
             if debug_idx_text is not None:
@@ -1700,9 +3125,14 @@ def main(argv: list[str] | None = None) -> int:
             plt.render()
             plt.screenshot(str(frames_dir / f"frame_{i:05d}.png"))
         else:
-            offset = _eye_offset(state, args.ipd_frac)
+            offset = _eye_offset(state, args.ipd_frac, _ipd_abs)
             left_state  = _shift_camera_state(state, -offset)
             right_state = _shift_camera_state(state,  offset)
+
+            # Sync the world-space lights to the mono camera once per frame
+            # (same lights for both eyes — avoids any stereo shading discrepancy).
+            _td = vr_travel_dirs[i] if vr_travel_dirs is not None else None
+            _update_vr_headlight(vr_lights, state["camera"], _td, vr_world_up)
 
             # Left eye — render & write to disk (same code path as mono).
             for renderer in plt.renderers:
@@ -1747,6 +3177,23 @@ def main(argv: list[str] | None = None) -> int:
     del pano_passes  # explicit – release the panoramic pass references
     print(f"      rendered {total_frames} frames in "
           f"{_format_eta(time.time() - t_start)}")
+
+    # Save the middle frame as a standalone, uncompressed PNG next to
+    # the future MP4 so the user can verify whether residual aliasing
+    # is a rendering artefact (visible in the PNG) or only a video-
+    # encoding artefact (visible in the MP4 but not in the PNG).
+    if args.save_mid_png and total_frames > 0:
+        try:
+            import shutil
+            mid_idx = total_frames // 2
+            src = frames_dir / f"frame_{mid_idx:05d}.png"
+            if src.exists():
+                dst = out_path.with_name(out_path.stem + "_midframe.png")
+                shutil.copy2(src, dst)
+                print(f"      mid-frame PNG    : {dst}  "
+                      f"(frame {mid_idx + 1}/{total_frames}, pre-encoding)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not save mid-frame PNG: %s", exc)
 
     # ── 4. Assemble MP4 with ffmpeg ───────────────────────────────────────
     # Resolve codec / CRF / preset defaults.  In VR mode we default to

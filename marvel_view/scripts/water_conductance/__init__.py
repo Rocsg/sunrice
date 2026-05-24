@@ -36,6 +36,7 @@ from .pipeline import (  # noqa: F401
     _load_lames,
     _load_or_build_arrows,
     _load_or_build_crown_tracks,
+    _load_or_build_dual_arrows,
     _load_or_build_membranes,
     _load_or_build_mesh,
     _load_or_build_overlay_mesh,
@@ -47,6 +48,7 @@ from .pipeline import (  # noqa: F401
 # ── Styling helpers ────────────────────────────────────────────────────────
 from .styling import (  # noqa: F401
     _hue_shifted_rgb,
+    _install_scene_lights,
     _set_lighting,
     _set_shading,
     _style_mesh,
@@ -65,6 +67,7 @@ __all__ = [
     "_load_lames",
     "_load_or_build_arrows",
     "_load_or_build_crown_tracks",
+    "_load_or_build_dual_arrows",
     "_load_or_build_membranes",
     "_load_or_build_mesh",
     "_load_or_build_overlay_mesh",
@@ -73,6 +76,7 @@ __all__ = [
     "_write_tracks_vtp",
     # styling
     "_hue_shifted_rgb",
+    "_install_scene_lights",
     "_set_lighting",
     "_set_shading",
     "_style_mesh",

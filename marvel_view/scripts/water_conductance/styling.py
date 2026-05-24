@@ -8,6 +8,8 @@ from __future__ import annotations
 import colorsys
 import logging
 
+import numpy as np
+
 from .constants import (
     AMBIENT,
     BODY_COLOR,
@@ -81,3 +83,90 @@ def _set_shading(mesh, mode_value: int) -> None:
         except AttributeError:
             return
     prop.SetInterpolation(int(mode_value))
+
+
+def _install_scene_lights(plt) -> list:
+    """Replace VTK's camera-following headlight with a cinematic 3-point
+    scene-fixed lighting rig.
+
+    Used by both the interactive viewer (``marvel-water-conductance``) and
+    the movie renderer (``marvel-water-movie``) so both produce the same
+    look — letting the flat interactor serve as a reliable VR preview.
+
+    Scene-fixed lights are mandatory for VR cubemap rendering to avoid
+    seam artefacts (a camera-attached headlight moves with each cube face
+    direction, producing slightly different shading per face and visible
+    seams after the equirectangular remap).
+
+    Returns the created :class:`vtkLight` objects; the caller must keep
+    them referenced so VTK does not free them mid-render.
+    """
+    import vtkmodules.vtkRenderingCore as _vtkrc
+    created: list = []
+    for renderer in plt.renderers:
+        try:
+            renderer.AutomaticLightCreationOff()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            renderer.RemoveAllLights()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            bounds = renderer.ComputeVisiblePropBounds()
+            xmin, xmax, ymin, ymax, zmin, zmax = bounds
+            cx = 0.5 * (xmin + xmax)
+            cy = 0.5 * (ymin + ymax)
+            cz = 0.5 * (zmin + zmax)
+            diag = float(np.linalg.norm(
+                [xmax - xmin, ymax - ymin, zmax - zmin]
+            ))
+            if not np.isfinite(diag) or diag <= 0:
+                raise ValueError("bad bounds")
+        except Exception:  # noqa: BLE001
+            cx = cy = cz = 0.0
+            diag = 1.0
+        radius = max(diag, 1.0) * 1.8
+
+        # ── 3-point cinematic rig ─────────────────────────────────────
+        # The root grows along the world X axis; Y is "up" in the cross-
+        # section view.  The key is placed above-right-front so it casts
+        # shadows diagonally — very close to what the interactive
+        # viewer's camera headlight produces when flying along X.
+        light_defs = [
+            # (direction from centre, intensity, RGB colour)
+            # Key: strong, from above-right, warm white
+            (np.array([ 0.55,  1.70,  0.60]), 0.90, (1.00, 0.97, 0.92)),
+            # Fill: weak, from below-left, cool blue (matches specular tint)
+            (np.array([-0.80, -0.55,  0.35]), 0.22, (0.78, 0.88, 1.00)),
+            # Rim: from behind, neutral — edge-separates mesh from bg
+            (np.array([-0.25,  0.50, -1.40]), 0.28, (1.00, 1.00, 1.00)),
+        ]
+        for direction, intensity, color in light_defs:
+            n = np.linalg.norm(direction)
+            if n < 1e-9:
+                continue
+            d = direction / n
+            lt = _vtkrc.vtkLight()
+            lt.SetLightTypeToSceneLight()
+            lt.SetPositional(False)
+            lt.SetPosition(cx + d[0] * radius,
+                           cy + d[1] * radius,
+                           cz + d[2] * radius)
+            lt.SetFocalPoint(cx, cy, cz)
+            lt.SetColor(*color)
+            lt.SetIntensity(intensity)
+            renderer.AddLight(lt)
+            created.append(lt)
+
+        # Ambient fill — very low so it does not flatten the contrast.
+        amb = _vtkrc.vtkLight()
+        amb.SetLightTypeToSceneLight()
+        amb.SetPositional(True)
+        amb.SetPosition(cx, cy, cz)
+        amb.SetFocalPoint(cx, cy + 1.0, cz)
+        amb.SetColor(0.85, 0.90, 1.00)
+        amb.SetIntensity(0.08)
+        renderer.AddLight(amb)
+        created.append(amb)
+    return created

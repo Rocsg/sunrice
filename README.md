@@ -353,3 +353,21 @@ marvel_view/
     ├── preprocess_all.py        # CLI preprocessing
     └── visualize_scene.py       # CLI visualisation
 ```
+
+Music credits : 
+Music: Antonio Vivaldi, The Four Seasons, “Summer”, RV 315, III. Presto. Performed by The Modena Chamber Orchestra. Source: Musopen / Wikimedia Commons. Public Domain Mark 1.0.
+
+Laetha by Spheriá | https://soundcloud.com/spheriamusic
+Music promoted by https://www.chosic.com/free-music/all/
+Creative Commons CC BY-SA 3.0
+https://creativecommons.org/licenses/by-sa/3.0/
+
+Otjánbird Pt. I by Spheriá | https://soundcloud.com/spheriamusic
+Music promoted by https://www.chosic.com/free-music/all/
+Creative Commons CC BY-SA 3.0
+https://creativecommons.org/licenses/by-sa/3.0/
+
+Reverie by Scott Buckley | www.scottbuckley.com.au
+Music promoted by https://www.chosic.com/free-music/all/
+Creative Commons CC BY 4.0
+https://creativecommons.org/licenses/by/4.0/

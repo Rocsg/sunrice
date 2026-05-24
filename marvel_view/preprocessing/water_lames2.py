@@ -20,7 +20,7 @@ follows a central iso-distance; instead it has three phases:
 
 * Phase B — *hold*.  ``d0`` and ``d1`` remain at their phase-A end
   values for a number of frames equal to ``hold_ratio * (N_A + N_C)``
-  (default 0.25 → 20 % of the total when A and C share 40 % each).
+  (default 0.064 → ≈ 6 % of the total when A and C share ≈ 47 % each).
   No marching cubes is performed; the last phase-A mesh is reused.
 
 * Phase C — *growth of d0*.  ``d1 = d_max_col - 0.1`` is held while
@@ -66,7 +66,7 @@ DEFAULT_N_SEEDS:               int   = 300
 # Doubled w.r.t. V2 to accommodate the longer per-column lifetime.
 DEFAULT_PHASE_FACTOR:          int   = 10
 DEFAULT_STEP_GROWTH:           float = 2.0
-DEFAULT_HOLD_RATIO:            float = 0.25       # B = 25 % of (A + C)
+DEFAULT_HOLD_RATIO:            float = 0.064      # B ≈ 6 % of total (≈ 47/6/47 split)
 DEFAULT_TARGET_TRIS_PER_SHELL: int   = 1500
 DEFAULT_SMOOTH_ITER:           int   = _v2.DEFAULT_SMOOTH_ITER
 # Short glow envelope: 3 frames at start of A and 3 frames at end of C.

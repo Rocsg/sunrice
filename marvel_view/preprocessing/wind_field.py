@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FPS: int = 25
 DEFAULT_SECONDS: float = 40.0
-DEFAULT_LIFESPAN_S: float = 4.0
+DEFAULT_LIFESPAN_S: float = 16.0
 DEFAULT_N_TEMPLATES: int = 4000  # shared trajectory pool (per species)
 
 # Laplace solver
@@ -367,8 +367,9 @@ def compute_wind_field(
     wall_dist = distance_transform_edt(area).astype(np.float32)
 
     logger.info(
-        "Wind field: area=%d voxels  |∇u| range=[%.3g, %.3g] (p50=%.3g, p95=%.3g)",
+        "Wind field: area=%d voxels  |∇u| mean=%.4g  range=[%.3g, %.3g] (p50=%.3g, p95=%.3g)",
         int(area.sum()),
+        float(speed[area].mean()) if area.any() else 0.0,
         float(speed[area].min()) if area.any() else 0.0,
         float(speed[area].max()) if area.any() else 0.0,
         float(np.percentile(speed[area], 50)) if area.any() else 0.0,
@@ -480,6 +481,7 @@ def build_particle_templates(
     lifespan_s: float = DEFAULT_LIFESPAN_S,
     speed_vox_per_frame: float = DEFAULT_SPEED_VOX_PER_FRAME,
     seed: int = 0,
+    n_substeps: int = 1,
 ) -> dict:
     """Build the (positions, alive) template tables for one species.
 
@@ -555,13 +557,17 @@ def build_particle_templates(
             positions[:, f, :] = cur
             alive[:, f] = is_alive.astype(np.uint8)
 
-            # Trilinear sample of the unit-direction vector and speed.
-            v = _trilinear_batch(vec_field, cur)   # (N, 3)
-            sp = _trilinear_batch(speed_field, cur)  # (N,)
-            sp_norm = np.clip(sp / s_p95, 0.0, 2.0).astype(np.float32)
-
-            step = v * (direction_sign * speed_vox_per_frame * sp_norm[:, None])
-            nxt = cur + step
+            # Sub-step integration: advance n_substeps Euler steps through
+            # the field, re-sampling at each intermediate position so the
+            # particle follows the field curvature rather than overshooting.
+            nxt = cur
+            sp_norm = np.ones(n_templates, dtype=np.float32)
+            for _ss in range(n_substeps):
+                v = _trilinear_batch(vec_field, nxt)          # (N, 3)
+                sp = _trilinear_batch(speed_field, nxt)        # (N,)
+                sp_norm = np.clip(sp / s_p95, 0.0, 2.0).astype(np.float32)
+                nxt = (nxt + v * (direction_sign * speed_vox_per_frame
+                                  * sp_norm[:, None])).astype(np.float32)
 
             # Bounds check.
             sz, sy, sx = shape

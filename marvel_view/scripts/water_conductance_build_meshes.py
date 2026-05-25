@@ -47,6 +47,11 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_DENSITY_SIGMA,
     DEFAULT_DENSITY_STEP_PX,
     DEFAULT_DENSITY_UPSAMPLE,
+    DEFAULT_RADIAL_GRADIENT_ALL_CACHE,
+    DEFAULT_RADIAL_GRADIENT_BRIDGES_CACHE,
+    DEFAULT_RADIAL_LT_BIN_SCALE,
+    DEFAULT_RADIAL_N_RBINS,
+    DEFAULT_RADIAL_SIGMA,
     DEFAULT_DILATATION_TIFF_PATH,
     DEFAULT_FINE_STRIDE,
     DEFAULT_GEODDIST_PATH,
@@ -91,6 +96,7 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     _build_arrow_field,
     _build_crown_dijkstra_tracks,
     _build_density_facet_scalars,
+    _build_radial_gradient_facet_scalars,
     _build_mesh,
     _write_tracks_arrows_vtp,
     _write_tracks_vtp,
@@ -462,6 +468,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default=DEFAULT_DENSITY_SIGMA,
                    help="Gaussian sigma (upsampled-pixel units) for the "
                         "density-map smoothing (wrap on θ).")
+    # Radial gradient colormap caches.
+    p.add_argument("--skip-radial-gradient", action="store_true",
+                   help="Don't build the per-cell radial-gradient colormap caches.")
+    p.add_argument("--radial-gradient-bridges-output",
+                   default=str(DEFAULT_RADIAL_GRADIENT_BRIDGES_CACHE),
+                   help="Where to write the bridges-mesh per-cell radial-gradient (.npy).")
+    p.add_argument("--radial-gradient-all-output",
+                   default=str(DEFAULT_RADIAL_GRADIENT_ALL_CACHE),
+                   help="Where to write the all-mesh per-cell radial-gradient (.npy).")
+    p.add_argument("--radial-n-rbins", type=int,
+                   default=DEFAULT_RADIAL_N_RBINS,
+                   help="Number of radial shells per (L, θ) sector for the "
+                        "radial-gradient computation.")
+    p.add_argument("--radial-lt-bin-scale", type=float,
+                   default=DEFAULT_RADIAL_LT_BIN_SCALE,
+                   help="Scale factor applied to step_px when computing L and θ bin counts "
+                        "for the radial-gradient (larger → fewer, bigger sectors).")
+    p.add_argument("--radial-sigma", type=float,
+                   default=DEFAULT_RADIAL_SIGMA,
+                   help="Gaussian sigma (upsampled-pixel units) for radial-gradient smoothing.")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Enable DEBUG-level logging.")
     return p.parse_args(argv)
@@ -751,6 +777,92 @@ def main(argv: list[str] | None = None) -> int:
                     )
     else:
         logger.info("Skipping density build (--skip-density).")
+
+    # ── Radial-gradient colormap caches ─────────────────────────────────
+    if not args.skip_radial_gradient:
+        # Load meshes from cache if they were skipped earlier.
+        if mesh is None and Path(args.output).expanduser().resolve().exists():
+            try:
+                import vedo as _vedo_rg
+                mesh = _vedo_rg.Mesh(
+                    str(Path(args.output).expanduser().resolve()))
+                logger.info("Radial gradient: loaded bridges mesh from cache %s",
+                            args.output)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Radial gradient: could not load bridges mesh from %s: %s",
+                    args.output, exc,
+                )
+        if all_mesh is None and all_output.exists():
+            try:
+                import vedo as _vedo_rg2
+                all_mesh = _vedo_rg2.Mesh(str(all_output))
+                logger.info("Radial gradient: loaded all-mesh from cache %s",
+                            all_output)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Radial gradient: could not load all-mesh from %s: %s",
+                    all_output, exc,
+                )
+
+        if mesh is None and all_mesh is None:
+            logger.warning(
+                "Radial gradient: no meshes available -- skipping build."
+            )
+        else:
+            axis_p = Path(args.central_axis).expanduser().resolve()
+            paths_p = Path(args.paths_domain).expanduser().resolve()
+            missing = [str(p) for p in (axis_p, paths_p) if not p.exists()]
+            if missing:
+                logger.warning(
+                    "Radial gradient: missing input files %s -- skipping.", missing,
+                )
+            else:
+                logger.info(
+                    "Radial gradient: building (paths=%s  axis=%s  "
+                    "R=%.1f px  step=%.2f px  n_rbins=%d)",
+                    paths_p, axis_p,
+                    args.density_radius, args.density_step,
+                    args.radial_n_rbins,
+                )
+                res_rg = _build_radial_gradient_facet_scalars(
+                    paths_domain_path=paths_p,
+                    central_axis_path=axis_p,
+                    bridges_mesh=mesh,
+                    all_mesh=all_mesh,
+                    radius_px=args.density_radius,
+                    step_px=args.density_step,
+                    n_rbins=args.radial_n_rbins,
+                    lt_bin_scale=args.radial_lt_bin_scale,
+                    upsample=args.density_upsample,
+                    sigma_up=args.radial_sigma,
+                )
+                import numpy as np  # noqa: PLC0415
+                for key, out_arg in (
+                    ("bridges", args.radial_gradient_bridges_output),
+                    ("all",     args.radial_gradient_all_output),
+                ):
+                    arr = res_rg.get(key)
+                    if arr is None:
+                        continue
+                    p = Path(out_arg).expanduser().resolve()
+                    if p.exists() and not args.force:
+                        logger.error(
+                            "Radial-gradient cache already exists: %s  "
+                            "(use --force to overwrite or "
+                            "--skip-radial-gradient to keep it).", p,
+                        )
+                        return 2
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(p, arr)
+                    logger.info(
+                        "Radial gradient (%s) written to %s  shape=%s  "
+                        "range=[%.3f, %.3f]",
+                        key, p, arr.shape,
+                        float(arr.min()), float(arr.max()),
+                    )
+    else:
+        logger.info("Skipping radial-gradient build (--skip-radial-gradient).")
 
     # ── Glowing green Pillars isosurface ────────────────────────────────
     pillars_input = Path(args.pillars_input).expanduser().resolve()

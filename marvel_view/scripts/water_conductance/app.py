@@ -75,6 +75,7 @@ from .pipeline import (  # noqa: F401
     _load_or_build_membranes,
     _load_lames,
     _build_lames_step_polydatas,
+    load_lame2_normals_cache,
     _load_or_build_dual_arrows,
 )
 from .styling import (  # noqa: F401
@@ -103,11 +104,13 @@ def _attach_controls(
     pillars_mesh=None,
     tracks_data=None,
     density_scalars=None,
+    radial_scalars=None,
     membranes_data=None,
     lames_data=None,
     mask_overlay_meshes=None,
     wind_data=None,
     dual_arrows_data=None,
+    lame2_normals_dir=None,
 ) -> None:
     """Add shading button + opacity / lighting / hue sliders.
 
@@ -1306,11 +1309,15 @@ def _attach_controls(
     # "Gauges" button placed next to the keyboard-navigation toggle.
     _gauge_state = {"on": False}   # gauges start hidden
 
-    # ── Density colormap (per-cell scalars) ──────────────────────────────
-    _density_btn = None  # populated below if scalars are present
-    _density_state = {"on": False}
+    # ── Mesh colormap overlay (per-cell scalars, 3-state toggle) ─────────
+    # mode 0 = off, mode 1 = density (viridis), mode 2 = radial gradient (coolwarm)
+    _cmap_mesh_btn = None   # populated below if at least one scalar set is present
+    _cmap_mesh_state = {"mode": 0}
+
+    # Validate density scalars.
     if density_scalars is None:
         _density_has_data = False
+        _density_ok: dict = {}
     else:
         _b = density_scalars.get("bridges")
         _a = density_scalars.get("all")
@@ -1331,6 +1338,35 @@ def _attach_controls(
                 int(_a.shape[0]), getattr(alt_mesh, "ncells", -1),
             )
         _density_has_data = bool(_ok_b or _ok_a)
+        _density_ok = {"bridges": _ok_b, "all": _ok_a}
+
+    # Validate radial gradient scalars.
+    if radial_scalars is None:
+        _radial_has_data = False
+        _radial_ok: dict = {}
+    else:
+        _rb = radial_scalars.get("bridges")
+        _ra = radial_scalars.get("all")
+        _ok_rb = (_rb is not None and mesh is not None
+                  and getattr(mesh, "ncells", -1) == int(_rb.shape[0]))
+        _ok_ra = (_ra is not None and alt_mesh is not None
+                  and getattr(alt_mesh, "ncells", -1) == int(_ra.shape[0]))
+        if _rb is not None and not _ok_rb:
+            logger.warning(
+                "Radial gradient: bridges scalars length=%d does not match "
+                "mesh (%d faces); disabling.",
+                int(_rb.shape[0]), getattr(mesh, "ncells", -1),
+            )
+        if _ra is not None and not _ok_ra:
+            logger.warning(
+                "Radial gradient: all-mesh scalars length=%d does not match "
+                "mesh (%d faces); disabling.",
+                int(_ra.shape[0]), getattr(alt_mesh, "ncells", -1),
+            )
+        _radial_has_data = bool(_ok_rb or _ok_ra)
+        _radial_ok = {"bridges": _ok_rb, "all": _ok_ra}
+
+    _cmap_mesh_has_data = _density_has_data or _radial_has_data
 
     def _plt_add(actor_or_list) -> None:
         """Add a single actor or a list of actors to the plotter."""
@@ -1362,6 +1398,7 @@ def _attach_controls(
         "arrow_score_min": float(astate["score_min"]),
         "arrow_score_max": float(astate["score_max"]),
         "cmap_mode":  astate["cmap_mode"],
+        "cmap_mesh_mode": _cmap_mesh_state.get("mode", 0),
     })
     _ui_capturers.append(lambda: {
         "pillars_visible":   bool(pillars_state["visible"]),
@@ -1568,8 +1605,27 @@ def _attach_controls(
     if _lames_pd is not None and _lames_meta is not None:
         try:
             n_steps_l = int(_lames_meta.get("n_steps", 0))
-            step_pds_l, actor_l = _build_lames_step_polydatas(
-                _lames_pd, n_steps_l)
+            # Try pre-baked normals cache first; fall back to on-the-fly.
+            _normals_dir = (
+                Path(lame2_normals_dir).expanduser().resolve()
+                if lame2_normals_dir is not None else None
+            )
+            step_pds_l, actor_l = (
+                load_lame2_normals_cache(_normals_dir, n_steps_l)
+                if _normals_dir is not None
+                else (None, None)
+            )
+            if step_pds_l is None:
+                step_pds_l, actor_l = _build_lames_step_polydatas(
+                    _lames_pd, n_steps_l)
+            # Apply opaque Phong shading — same parameters as water_movie.
+            _lp = actor_l.GetProperty()
+            _lp.SetOpacity(1.0)
+            _lp.SetAmbient(0.18)
+            _lp.SetDiffuse(0.78)
+            _lp.SetSpecular(0.55)
+            _lp.SetSpecularPower(35)
+            _lp.SetInterpolation(2)  # Phong
             lames_state["n_steps"]  = n_steps_l
             lames_state["step_pds"] = step_pds_l
             lames_state["actor"]    = actor_l
@@ -2194,7 +2250,7 @@ def _attach_controls(
         wind_sliders.append(_wsr_sw)
         _set_widget_visible(_wsr_sw, False)
 
-    def _make_arrows_actor(data, color_override=None, domain=None):
+    def _make_arrows_actor(data, color_override=None, domain=None, length_scale=1.0):
         """Build a uniform-length / uniform-thickness vedo Arrows actor
         from a data dict produced by :func:`_build_arrow_field` or
         :func:`_build_track_arrow_field`.  Only the colour varies, driven
@@ -2215,7 +2271,7 @@ def _attach_controls(
                                 dtype=np.float32)
             if len(pts) == 0:
                 return None
-            base_length = float(astate["length"])
+            base_length = float(astate["length"]) * float(length_scale)
             ends = pts + dirs * base_length
 
             # 5-stop perceptual ramp blue → green → yellow → orange → red.
@@ -2930,10 +2986,12 @@ def _attach_controls(
             water_dual_actor = _make_arrows_actor(
                 dual_arrows_data.get("water"),
                 domain="water",
+                length_scale=1.3,
             )
             air_dual_actor = _make_arrows_actor(
                 dual_arrows_data.get("air"),
                 domain="air",
+                length_scale=1.3,
             )
 
         def _actor_for(name):
@@ -2963,6 +3021,16 @@ def _attach_controls(
             if cur == "arrows_dual":
                 _plt_remove(water_dual_actor)
                 _plt_remove(air_dual_actor)
+                if _cbar_water is not None:
+                    _cbar_water.set_visible(False)
+                if _cbar_air is not None:
+                    _cbar_air.set_visible(False)
+            # Hide mesh colorbars when leaving a mesh mode.
+            if cur in ("mesh_bridges", "mesh_all"):
+                if _cbar_density is not None:
+                    _cbar_density.set_visible(False)
+                if _cbar_radial is not None:
+                    _cbar_radial.set_visible(False)
             view_mode["name"] = new_mode
             # Keep `active["mesh"]` in sync (used by `_pillars_should_show`
             # and the status banner).
@@ -2989,6 +3057,17 @@ def _attach_controls(
             if new_mode == "arrows_dual":
                 _plt_add(water_dual_actor)
                 _plt_add(air_dual_actor)
+                if _cbar_water is not None:
+                    _cbar_water.set_visible(True)
+                if _cbar_air is not None:
+                    _cbar_air.set_visible(True)
+            # Re-show mesh colorbar when entering a mesh mode.
+            if new_mode in ("mesh_bridges", "mesh_all"):
+                _mode = _cmap_mesh_state.get("mode", 0)
+                if _mode == 1 and _cbar_density is not None:
+                    _cbar_density.set_visible(True)
+                elif _mode == 2 and _cbar_radial is not None:
+                    _cbar_radial.set_visible(True)
             _refresh_pillars_visibility()
             in_arrows = _is_arrows_mode(new_mode)
             for s in mesh_sliders:
@@ -3003,11 +3082,11 @@ def _attach_controls(
                 _set_widget_visible(s, _gauge_state["on"])
             _set_button_visible(_cmap_btn, in_arrows
                                 and new_mode != "arrows_dual")
-            if _density_btn is not None:
+            if _cmap_mesh_btn is not None:
                 _set_button_visible(
-                    _density_btn,
+                    _cmap_mesh_btn,
                     (new_mode in ("mesh_bridges", "mesh_all"))
-                    and _density_has_data,
+                    and _cmap_mesh_has_data,
                 )
             if new_mode in ("mesh_bridges", "mesh_all"):
                 _show_status(_active_mesh_title())
@@ -3144,12 +3223,70 @@ def _attach_controls(
     else:
         logger.info("No arrow field available – mesh/arrows toggle disabled.")
 
-    # ─── Density colormap toggle ────────────────────────────────────────
-    # Applies a viridis colormap to per-face density scalars on the
-    # cortical-bridges mesh and on the all-watered-tissues mesh. Visible
-    # only in the corresponding mesh modes.
-    if _density_has_data:
-        _density_body_rgb = tuple(c / 255.0 for c in BODY_COLOR)
+    # ─── Colormap bars (2-D HUD overlays) ──────────────────────────────
+    # Instantiated unconditionally so that `_cbar_*` variables are always
+    # defined; the bars start hidden and are shown only when the
+    # corresponding colormap mode is active.
+    import numpy as _np_cbar
+    _WATER_CMAP_STOPS = _np_cbar.array([
+        [0.10, 0.12, 0.72],   # deep ultramarine
+        [0.25, 0.45, 1.00],   # light blue
+        [0.70, 0.35, 0.90],   # light violet
+        [0.90, 0.05, 0.05],   # scarlet red
+    ], dtype=_np_cbar.float32)
+    _AIR_CMAP_STOPS = _np_cbar.array([
+        [0.05, 0.38, 0.10],   # fir / forest green
+        [0.28, 0.68, 0.12],   # mid green
+        [0.72, 0.88, 0.12],   # yellow-green
+    ], dtype=_np_cbar.float32)
+    _cbar_density = None
+    _cbar_radial  = None
+    _cbar_water   = None
+    _cbar_air     = None
+    try:
+        from marvel_view.visualization.colormap_bar import ColormapBar2D  # noqa: PLC0415
+        if _density_has_data:
+            _cbar_density = ColormapBar2D(
+                plt,
+                cmap="viridis",
+                vmin=0.0, vmax=1.0,
+                title="Density",
+                pos=(0.87, 0.30),
+            )
+            _cbar_density.set_visible(False)
+        if _radial_has_data:
+            _cbar_radial = ColormapBar2D(
+                plt,
+                cmap="coolwarm",
+                vmin=-1.0, vmax=1.0,
+                title="Slope of radial density",
+                pos=(0.87, 0.30),
+            )
+            _cbar_radial.set_visible(False)
+        # Arrows-dual colorbars (water + air) — stacked on the right.
+        _cbar_water = ColormapBar2D(
+            plt,
+            cmap=_WATER_CMAP_STOPS,
+            vmin=0.0, vmax=1.0,
+            title="Water bridge orientation",
+            pos=(0.87, 0.52),
+        )
+        _cbar_water.set_visible(False)
+        _cbar_air = ColormapBar2D(
+            plt,
+            cmap=_AIR_CMAP_STOPS,
+            vmin=0.0, vmax=1.0,
+            title="Gas diffusion",
+            pos=(0.87, 0.12),
+        )
+        _cbar_air.set_visible(False)
+    except Exception as _cbar_exc:  # noqa: BLE001
+        logger.warning("Could not create colormap bars: %s", _cbar_exc)
+
+    # ─── Mesh colormap toggle (3 states: off / density / radial gradient) ──
+    # Applies a per-face scalar overlay to the cortical-bridges and
+    # all-watered-tissues meshes.  Visible only in the corresponding mesh modes.
+    if _cmap_mesh_has_data:
 
         def _apply_density_to(target_mesh, scalars):
             if target_mesh is None or scalars is None:
@@ -3159,6 +3296,15 @@ def _attach_controls(
                                  vmin=0.0, vmax=1.0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Density: could not apply cmap: %s", exc)
+
+        def _apply_radial_gradient_to(target_mesh, scalars):
+            if target_mesh is None or scalars is None:
+                return
+            try:
+                target_mesh.cmap("coolwarm", scalars, on="cells",
+                                 vmin=-1.0, vmax=1.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Radial gradient: could not apply cmap: %s", exc)
 
         def _restore_solid(target_mesh):
             if target_mesh is None:
@@ -3208,37 +3354,80 @@ def _attach_controls(
             except Exception:  # noqa: BLE001
                 pass
 
-        def _toggle_density_cb(_obj=None, _ev=None):
-            new_on = not _density_state["on"]
-            _density_state["on"] = new_on
-            if new_on:
-                _apply_density_to(mesh, density_scalars.get("bridges"))
-                _apply_density_to(alt_mesh, density_scalars.get("all"))
-                _show_status("Density colormap: on (viridis)")
-            else:
+        def _toggle_cmap_mesh_cb(_obj=None, _ev=None):
+            new_mode = (_cmap_mesh_state["mode"] + 1) % 3
+            _cmap_mesh_state["mode"] = new_mode
+            if new_mode == 0:
                 _restore_solid(mesh)
                 _restore_solid(alt_mesh)
-                _show_status("Density colormap: off")
+                _show_status("Colormap: off")
+                if _cbar_density is not None:
+                    _cbar_density.set_visible(False)
+                if _cbar_radial is not None:
+                    _cbar_radial.set_visible(False)
+            elif new_mode == 1:
+                if density_scalars is not None:
+                    _apply_density_to(mesh, density_scalars.get("bridges"))
+                    _apply_density_to(alt_mesh, density_scalars.get("all"))
+                else:
+                    # No density data — skip to mode 2 automatically.
+                    _cmap_mesh_state["mode"] = 2
+                    _toggle_cmap_mesh_cb()
+                    return
+                _show_status("Colormap: density (viridis)")
+                if _cbar_density is not None:
+                    _cbar_density.set_visible(True)
+                if _cbar_radial is not None:
+                    _cbar_radial.set_visible(False)
+            elif new_mode == 2:
+                if radial_scalars is not None:
+                    _apply_radial_gradient_to(mesh, radial_scalars.get("bridges"))
+                    _apply_radial_gradient_to(alt_mesh, radial_scalars.get("all"))
+                else:
+                    # No radial data — cycle back to off.
+                    _cmap_mesh_state["mode"] = 0
+                    _restore_solid(mesh)
+                    _restore_solid(alt_mesh)
+                    _show_status("Colormap: off")
+                    if _cbar_density is not None:
+                        _cbar_density.set_visible(False)
+                    if _cbar_radial is not None:
+                        _cbar_radial.set_visible(False)
+                    try:
+                        _cmap_mesh_btn.switch()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    plt.render()
+                    return
+                _show_status("Colormap: radial gradient (coolwarm)")
+                if _cbar_density is not None:
+                    _cbar_density.set_visible(False)
+                if _cbar_radial is not None:
+                    _cbar_radial.set_visible(True)
             try:
-                _density_btn.switch()
+                _cmap_mesh_btn.switch()
             except Exception:  # noqa: BLE001
                 pass
             plt.render()
 
-        _density_btn = plt.add_button(
-            _toggle_density_cb,
-            states=["Cortical bridges density ▸ off", "Cortical bridges density ▸ on"],
-            c=["white", "white"],
-            bc=["#263238", "#0277bd"],
+        _cmap_mesh_btn = plt.add_button(
+            _toggle_cmap_mesh_cb,
+            states=["Colormap ▸ off", "Colormap ▸ density", "Colormap ▸ radial grad."],
+            c=["white", "white", "white"],
+            bc=["#263238", "#0277bd", "#6a1b9a"],
             pos=(0.88, 0.31),
             size=14,
             bold=True,
         )
         # Visible only in Mesh modes; default mode is mesh_bridges so
         # show it immediately.
-        _set_button_visible(_density_btn, True)
+        _set_button_visible(_cmap_mesh_btn, True)
     else:
-        logger.info("Density colormap data unavailable – toggle disabled.")
+        logger.info("Mesh colormap data unavailable – toggle disabled.")
+        _toggle_cmap_mesh_cb = None
+        _apply_density_to = None
+        _apply_radial_gradient_to = None
+        _restore_solid = None
 
     # Switch to "All watered tissues" as the default startup view.
     if alt_mesh is not None and "mesh_all" in modes:
@@ -5349,6 +5538,37 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning("Could not load density scalar caches: %s", exc)
         density_scalars = None
 
+    # ── Try to load pre-computed per-cell radial-gradient scalars ──────
+    radial_scalars: dict | None = None
+    try:
+        import numpy as np
+        _rb_cache = Path(args.radial_gradient_bridges_cache).expanduser().resolve()
+        _ra_cache = Path(args.radial_gradient_all_cache).expanduser().resolve()
+        _rb_arr = None
+        _ra_arr = None
+        if _rb_cache.exists():
+            _rb_arr = np.load(_rb_cache)
+            logger.info(
+                "Loaded radial-gradient bridges scalars from %s (%d cells).",
+                _rb_cache, int(_rb_arr.shape[0]),
+            )
+        if _ra_cache.exists():
+            _ra_arr = np.load(_ra_cache)
+            logger.info(
+                "Loaded radial-gradient all-mesh scalars from %s (%d cells).",
+                _ra_cache, int(_ra_arr.shape[0]),
+            )
+        if _rb_arr is not None or _ra_arr is not None:
+            radial_scalars = {"bridges": _rb_arr, "all": _ra_arr}
+        else:
+            logger.info(
+                "Radial-gradient caches not found (%s, %s) – mode 2 disabled.",
+                _rb_cache, _ra_cache,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not load radial-gradient scalar caches: %s", exc)
+        radial_scalars = None
+
     # ── Water "membranes" V1 removed (no longer loaded) ─────────────────
     membranes_data = None
 
@@ -5474,10 +5694,12 @@ def main(argv: list[str] | None = None) -> int:
         pillars_mesh=pillars_mesh,
         tracks_data=tracks_data,
         density_scalars=density_scalars,
+        radial_scalars=radial_scalars,
         membranes_data=membranes_data,
         lames_data=lames_data,
         mask_overlay_meshes=mask_overlay_meshes,
         wind_data=wind_data,
+        lame2_normals_dir=getattr(args, "lame2_normals_dir", None),
     )
     # ── Tear down the loading overlay ───────────────────────────────────
     if _loading_overlay_ren is not None:

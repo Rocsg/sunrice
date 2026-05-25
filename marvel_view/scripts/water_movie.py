@@ -52,6 +52,9 @@ from marvel_view.scripts.water_conductance import (
     DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_VTP_CACHE,
     DEFAULT_INPUT_PATH,
+    DEFAULT_LAME2_META_CACHE,
+    DEFAULT_LAME2_VTP_CACHE,
+    DEFAULT_LAME2_NORMALS_CACHE_DIR,
     DEFAULT_LAMES_META_CACHE,
     DEFAULT_LAMES_VTP_CACHE,
     DEFAULT_LEVEL,
@@ -62,6 +65,7 @@ from marvel_view.scripts.water_conductance import (
     DEFAULT_SMOOTH_ITER,
     _build_lames_step_polydatas,
     _load_lames,
+    load_lame2_normals_cache,
     _load_or_build_mesh,
     _set_shading,
     _style_mesh,
@@ -104,11 +108,10 @@ PATH_LINE_WIDTH = 4                      # only used in mono / preview
 # A real 3D tube (vs. a screen-space Line) is needed for VR because
 # vtkPanoramicProjectionPass remaps 6 cube faces to equirect, and a
 # 4-px-wide Line shrinks to sub-pixel — invisible — after that remap.
-PATH_TUBE_RADIUS_FRAC = 0.0035
-# Fraction of the camera-to-focal distance used to offset the line upward
-# along the world-up axis.  Just enough to make it visible without
-# leaving the frame.
-PATH_VERTICAL_OFFSET_FRAC = 0.03
+PATH_TUBE_RADIUS_FRAC    = 0.0008   # flat / preview
+PATH_TUBE_RADIUS_FRAC_VR = 0.00005  # VR (panoramic remap makes tube look larger)
+# Fixed world-space offset above the camera path along the world-up axis.
+PATH_VERTICAL_OFFSET = 3.0
 
 
 # ──────────────────────────────────── CLI ────────────────────────────────────
@@ -307,16 +310,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="JSON sidecar with the membranes n_steps / phases. "
                         "Required alongside --membranes-vtp-cache.")
     p.add_argument("--lames-vtp-cache",
-                   default=str(DEFAULT_LAMES_VTP_CACHE),
+                   default=str(DEFAULT_LAME2_VTP_CACHE),
                    help="Path to the cached water-lames .vtp.  When "
                         "provided AND keyframes set lames_visible=true, "
                         "the descending-lames animation is replayed. "
-                        f"(default: {DEFAULT_LAMES_VTP_CACHE})")
+                        f"(default: {DEFAULT_LAME2_VTP_CACHE})")
     p.add_argument("--lames-meta-cache",
-                   default=str(DEFAULT_LAMES_META_CACHE),
+                   default=str(DEFAULT_LAME2_META_CACHE),
                    help="JSON sidecar with the lames n_steps. "
                         "Required alongside --lames-vtp-cache. "
-                        f"(default: {DEFAULT_LAMES_META_CACHE})")
+                        f"(default: {DEFAULT_LAME2_META_CACHE})")
     p.add_argument("--arrows-cache",
                    default=str(DEFAULT_ARROWS_CACHE_PATH),
                    help="Path to the cached geodesic-distance arrows .npz.  "
@@ -418,7 +421,9 @@ def _interp_vec(values: np.ndarray, t_out: np.ndarray, *,
             from scipy.interpolate import CubicSpline
             cs = CubicSpline(t_ctrl, values, bc_type="natural", axis=0)
             return cs(t_out)
-        except ImportError:
+        except (ImportError, ValueError):
+            # ValueError: non-strictly-increasing knots (e.g. idle keyframes
+            # at the same position) — fall back to linear interpolation.
             pass
 
     out = np.empty((n_frames, d), dtype=float)
@@ -1296,6 +1301,11 @@ def _build_ui_track(
         switch = (ramp >= 0.5) if r > 0.0 else (s > 0.0)
         for k in _UI_DISCRETE_FIELDS:
             val = b.get(k) if switch else a.get(k)
+            # If the active side doesn't set this field, carry forward the
+            # value from the other side so discrete modes are "sticky" across
+            # keyframes that don't explicitly override them.
+            if val is None and switch:
+                val = a.get(k)
             if val is not None:
                 frame_state[k] = val
         out.append(frame_state)
@@ -1520,7 +1530,7 @@ class _UiReplayBundle:
         try:
             show_main   = mode == "mesh_bridges"
             show_alt    = mode == "mesh_all"
-            show_arrows = mode == "arrows_grid"
+            show_arrows = mode in ("arrows_grid", "arrows_dual")
             show_tracks = mode == "arrows_tracks"
             getattr(self.mesh, "actor", self.mesh).SetVisibility(
                 1 if show_main else 0)
@@ -1580,7 +1590,11 @@ class _UiReplayBundle:
                     pass
                 if _vis:
                     try:
-                        _a.alpha(_a._base_alpha * _mult)
+                        # In VR the panoramic pass can't handle translucency;
+                        # force fully opaque (same logic as pillars solid mode).
+                        _alpha = (1.0 if self._vr_mode != "off"
+                                  else _a._base_alpha * _mult)
+                        _a.alpha(_alpha)
                     except Exception:  # noqa: BLE001
                         pass
         except Exception as exc:  # noqa: BLE001
@@ -1613,7 +1627,7 @@ class _UiReplayBundle:
             if self._vr_mode != "off":
                 # In VR translucency is broken; hide pillars in cortex modes
                 # and force solid (opaque) when they are shown in arrow modes.
-                _VR_ARROWS = {"arrows_grid", "arrows_tracks"}
+                _VR_ARROWS = {"arrows_grid", "arrows_tracks", "arrows_dual"}
                 _cur_vm = ui_state.get("view_mode") or "mesh_bridges"
                 _vis = _vis and (_cur_vm in _VR_ARROWS)
                 if _sty == "glow":
@@ -1691,8 +1705,8 @@ def _world_up_from_track(track: Sequence[dict]) -> np.ndarray:
     return _normalize(np.asarray(avg, dtype=float))
 
 
-def _build_path_line(track: Sequence[dict], offset_frac: float,
-                     *, as_tube: bool = False):
+def _build_path_line(track: Sequence[dict], offset: float,
+                     *, as_tube: bool = False, radius_frac: float = PATH_TUBE_RADIUS_FRAC):
     """Return a green trajectory above the camera path.
 
     When ``as_tube`` is true a real 3-D :class:`vedo.Tube` is returned
@@ -1707,12 +1721,11 @@ def _build_path_line(track: Sequence[dict], offset_frac: float,
     foc_positions = np.array([t["camera"]["focal_point"] for t in track])
     distances = np.linalg.norm(foc_positions - cam_positions, axis=1)
     median_dist = float(np.median(distances))
-    offset = median_dist * offset_frac
     up = _world_up_from_track(track)
     line_pts = cam_positions + up * offset
     color = [c / 255.0 for c in PATH_COLOR]
     if as_tube:
-        radius = median_dist * PATH_TUBE_RADIUS_FRAC
+        radius = median_dist * radius_frac
         obj = vedo.Tube(line_pts, r=radius, c=color, res=16)
         # vedo.Tube stores parametric / vertex-index scalar data that VTK
         # maps through a rainbow LUT, overriding the solid colour.  Strip
@@ -2396,20 +2409,24 @@ def main(argv: list[str] | None = None) -> int:
             if _lames_pd is not None and _lames_meta is not None:
                 lames_n_steps = int(_lames_meta.get("n_steps", 0))
                 if lames_n_steps > 0:
-                    _step_pds, _actor = _build_lames_step_polydatas(
-                        _lames_pd, lames_n_steps)
+                    _normals_dir = DEFAULT_LAME2_NORMALS_CACHE_DIR
+                    _step_pds, _actor = load_lame2_normals_cache(
+                        _normals_dir, lames_n_steps)
+                    if _step_pds is None:
+                        _step_pds, _actor = _build_lames_step_polydatas(
+                            _lames_pd, lames_n_steps)
                     lames_step_pds = _step_pds
                     lames_actor = _actor
-                    if vr_mode != "off":
-                        # Translucency broken in VR (blend-state stale); render
-                        # lames fully opaque with Phong shading instead.
-                        _lp = _actor.GetProperty()
-                        _lp.SetOpacity(1.0)
-                        _lp.SetAmbient(0.18)
-                        _lp.SetDiffuse(0.78)
-                        _lp.SetSpecular(0.55)
-                        _lp.SetSpecularPower(35)
-                        _lp.SetInterpolation(2)  # Phong
+                    # Render lames fully opaque with Phong shading (flat and VR).
+                    # Translucency is also broken in VR, so this is doubly needed there.
+                    # Point normals available when cache loaded.
+                    _lp = _actor.GetProperty()
+                    _lp.SetOpacity(1.0)
+                    _lp.SetAmbient(0.18)
+                    _lp.SetDiffuse(0.78)
+                    _lp.SetSpecular(0.55)
+                    _lp.SetSpecularPower(35)
+                    _lp.SetInterpolation(2)  # Phong
                     lames_actor.SetVisibility(0)
                     print(f"      [ui_state] water lames loaded "
                           f"(n_steps={lames_n_steps}, "
@@ -2580,6 +2597,17 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"      [ui_state] crown tracks lines: "
                           f"{_pd_t.GetNumberOfCells()} paths → "
                           f"{len(_lba)} populated line bins")
+                    # Commit line actors immediately so that a failure in the
+                    # arrow loading block below does not leave tracks empty.
+                    tracks_bin_actors = list(_lba)
+                    tracks_axis_info  = {
+                        "axis_col": _ac,
+                        "axis_min": _amin,
+                        "axis_len": _alen,
+                        "n_bins":   _N_BINS,
+                        "bin_full": _BIN_FULL,
+                        "bin_fade": _BIN_FADE,
+                    }
                     # ── Arrow bin actors ──────────────────────────────────
                     _aba = []
                     if (_trk_arr_path is not None
@@ -2688,15 +2716,8 @@ def main(argv: list[str] | None = None) -> int:
                                 print(f"      [ui_state] crown tracks arrows: "
                                       f"{_pd_g.GetNumberOfPoints()} glyph "
                                       f"centres → {len(_aba)} arrow bins")
-                    tracks_bin_actors = _lba + _aba
-                    tracks_axis_info  = {
-                        "axis_col": _ac,
-                        "axis_min": _amin,
-                        "axis_len": _alen,
-                        "n_bins":   _N_BINS,
-                        "bin_full": _BIN_FULL,
-                        "bin_fade": _BIN_FADE,
-                    }
+                    if _aba:
+                        tracks_bin_actors.extend(_aba)
                     print(f"      [ui_state] tracks culling: axis={_ac}, "
                           f"{len(tracks_bin_actors)} bin actors total "
                           f"(±{_BIN_FULL} full + ±{_BIN_FADE} fade)")
@@ -2777,8 +2798,9 @@ def main(argv: list[str] | None = None) -> int:
     path_line = None
     if show_path:
         path_line = _build_path_line(
-            track, PATH_VERTICAL_OFFSET_FRAC,
+            track, PATH_VERTICAL_OFFSET,
             as_tube=(vr_mode != "off"),
+            radius_frac=PATH_TUBE_RADIUS_FRAC_VR if vr_mode != "off" else PATH_TUBE_RADIUS_FRAC,
         )
         kind = "tube" if vr_mode != "off" else "line"
         print(f"      built green path {kind} over {total_frames} samples")
@@ -3006,6 +3028,68 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to attach info panel: %s", exc)
 
+    # ── Colormap legend bars ─────────────────────────────────────────────────
+    # Static legend overlays that match the per-face scalar colormaps applied
+    # by the interactive viewer.  Visibility is toggled per frame based on the
+    # ui_state["view_mode"] and ui_state["cmap_mesh_mode"] values in the track.
+    import numpy as _np_cbar_mv
+    _WATER_CMAP_STOPS_MV = _np_cbar_mv.array([
+        [0.10, 0.12, 0.72], [0.25, 0.45, 1.00],
+        [0.70, 0.35, 0.90], [0.90, 0.05, 0.05],
+    ], dtype=_np_cbar_mv.float32)
+    _AIR_CMAP_STOPS_MV = _np_cbar_mv.array([
+        [0.05, 0.38, 0.10], [0.28, 0.68, 0.12], [0.72, 0.88, 0.12],
+    ], dtype=_np_cbar_mv.float32)
+    _cbar_mv_density  = None
+    _cbar_mv_radial   = None
+    _cbar_mv_water    = None
+    _cbar_mv_air      = None
+    try:
+        if vr_mode != "off":
+            from marvel_view.visualization.colormap_bar import ColormapBar3DBillboard as _CB3D  # noqa: PLC0415
+            _cbar_mv_density = _CB3D(
+                plt, cmap="viridis",  vmin=0.0, vmax=1.0, title="Density",
+                focal_dist=_focal_dist, left_frac=0.55, vert_frac=0.15,
+            )
+            _cbar_mv_radial = _CB3D(
+                plt, cmap="coolwarm", vmin=-1.0, vmax=1.0, title="Slope of radial density",
+                focal_dist=_focal_dist, left_frac=0.55, vert_frac=-0.05,
+            )
+            _cbar_mv_water = _CB3D(
+                plt, cmap=_WATER_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Water",
+                focal_dist=_focal_dist, left_frac=0.55, vert_frac=0.15,
+            )
+            _cbar_mv_air = _CB3D(
+                plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Air",
+                focal_dist=_focal_dist, left_frac=0.55, vert_frac=-0.05,
+            )
+            print("      colormap billboards attached")
+        else:
+            from marvel_view.visualization.colormap_bar import ColormapBar2D as _CB2D  # noqa: PLC0415
+            _cbar_mv_density = _CB2D(
+                plt, cmap="viridis",  vmin=0.0, vmax=1.0, title="Density",
+                pos=(0.87, 0.30),
+            )
+            _cbar_mv_radial = _CB2D(
+                plt, cmap="coolwarm", vmin=-1.0, vmax=1.0, title="Slope of radial density",
+                pos=(0.87, 0.30),
+            )
+            _cbar_mv_water = _CB2D(
+                plt, cmap=_WATER_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Water bridge orientation",
+                pos=(0.87, 0.52),
+            )
+            _cbar_mv_air = _CB2D(
+                plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Gas diffusion",
+                pos=(0.87, 0.12),
+            )
+            print("      colormap overlays attached")
+        # Start all hidden; per-frame loop shows/hides as needed.
+        for _b in (_cbar_mv_density, _cbar_mv_radial, _cbar_mv_water, _cbar_mv_air):
+            if _b is not None:
+                _b.set_visible(False)
+    except Exception as _cbar_mv_exc:  # noqa: BLE001
+        logger.warning("Failed to attach colormap bars: %s", _cbar_mv_exc)
+
     actor = getattr(mesh, "actor", None) or mesh
 
     # Optional debug overlay: indicative keyframe index in [0, N-1].
@@ -3097,6 +3181,36 @@ def main(argv: list[str] | None = None) -> int:
                 ortho_billboard.update(mono_pos, mono_dir, vr_travel_dirs[i], vr_world_up)
             else:
                 ortho_overlay.update(mono_pos, mono_dir)
+
+        # ── Colormap bars: show/hide + pose ──────────────────────────────────
+        if any(b is not None for b in (_cbar_mv_density, _cbar_mv_radial,
+                                        _cbar_mv_water, _cbar_mv_air)):
+            _ui_st_cb  = state.get("ui_state") or {}
+            _vm_cb     = _ui_st_cb.get("view_mode", "")
+            _cm_mode   = _ui_st_cb.get("cmap_mesh_mode", 0)
+            _is_dual   = (_vm_cb == "arrows_dual")
+            _is_mesh   = (_vm_cb in ("mesh_bridges", "mesh_all"))
+            _show_den  = _is_mesh and _cm_mode == 1
+            _show_rad  = _is_mesh and _cm_mode == 2
+            for _b, _vis in (
+                (_cbar_mv_density, _show_den),
+                (_cbar_mv_radial,  _show_rad),
+                (_cbar_mv_water,   _is_dual),
+                (_cbar_mv_air,     _is_dual),
+            ):
+                if _b is not None:
+                    _b.set_visible(_vis)
+            # VR mode: update billboard poses.
+            if vr_mode != "off":
+                _cb_pos = np.asarray(state["camera"]["position"], dtype=float)
+                for _b, _vis in (
+                    (_cbar_mv_density, _show_den),
+                    (_cbar_mv_radial,  _show_rad),
+                    (_cbar_mv_water,   _is_dual),
+                    (_cbar_mv_air,     _is_dual),
+                ):
+                    if _b is not None and _vis:
+                        _b.update_pose(_cb_pos, vr_travel_dirs[i], vr_world_up)
 
         # ── Info panel update (pose + subtitle) ─────────────────────────────
         if info_billboard is not None or info_overlay is not None:

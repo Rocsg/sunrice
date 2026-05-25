@@ -17,11 +17,14 @@ from .constants import (
     DEFAULT_CROWN_TRACKS_VTP_CACHE,
     DEFAULT_DENSITY_ALL_CACHE,
     DEFAULT_DENSITY_BRIDGES_CACHE,
+    DEFAULT_RADIAL_GRADIENT_ALL_CACHE,
+    DEFAULT_RADIAL_GRADIENT_BRIDGES_CACHE,
     DEFAULT_FINE_STRIDE,
     DEFAULT_GEODDIST_PATH,
     DEFAULT_INPUT_PATH,
     DEFAULT_LAME2_META_CACHE,
     DEFAULT_LAME2_VTP_CACHE,
+    DEFAULT_LAME2_NORMALS_CACHE_DIR,
     DEFAULT_LAMES_META_CACHE,
     DEFAULT_LAMES_VTP_CACHE,
     DEFAULT_LEVEL,
@@ -120,6 +123,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--density-all-cache",
                    default=str(DEFAULT_DENSITY_ALL_CACHE),
                    help="Per-cell density scalar .npy for the all-watered-tissues mesh.")
+    p.add_argument("--radial-gradient-bridges-cache",
+                   default=str(DEFAULT_RADIAL_GRADIENT_BRIDGES_CACHE),
+                   help="Per-cell radial-gradient scalar .npy for the "
+                        "cortical-bridges mesh (built by "
+                        "marvel-water-conductance-build-meshes).")
+    p.add_argument("--radial-gradient-all-cache",
+                   default=str(DEFAULT_RADIAL_GRADIENT_ALL_CACHE),
+                   help="Per-cell radial-gradient scalar .npy for the "
+                        "all-watered-tissues mesh.")
     # Glowing green "Pillars" overlay (only shown on the cortex mesh).
     p.add_argument("--pillars-input", default=str(DEFAULT_PILLARS_TIFF_PATH),
                    help="8-bit TIFF (Pillars.tif) used to build the glowing green overlay.")
@@ -167,6 +179,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-lame2", action="store_true",
                    help="Don't load the V3 water-lame2 animation.  Falls "
                         "back to V2 lames when present.")
+    p.add_argument("--lame2-normals-dir",
+                   default=str(DEFAULT_LAME2_NORMALS_CACHE_DIR),
+                   help="Directory of pre-baked per-step VTPs with point normals "
+                        "(built by marvel-lame2-normals-build).  When present, "
+                        "used instead of computing normals at startup.")
     # Stele / Outside mask overlays (displayed alongside the lames).
     p.add_argument("--stele-mask-cache",
                    default=str(DEFAULT_STELE_MASK_CACHE),

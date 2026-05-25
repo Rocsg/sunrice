@@ -25,6 +25,9 @@ from .constants import (
     DEFAULT_LONG_AXIS_STRIDE,
     DEFAULT_N_SOURCE_POINTS,
     DEFAULT_OVERLAY_LEVEL,
+    DEFAULT_RADIAL_LT_BIN_SCALE,
+    DEFAULT_RADIAL_N_RBINS,
+    DEFAULT_RADIAL_SIGMA,
     DEFAULT_SPACING,
 )
 
@@ -262,6 +265,339 @@ def _build_density_facet_scalars(
         "axis_cy": float(cy),
     }
 
+
+def _build_radial_gradient_facet_scalars(
+    *,
+    paths_domain_path: Path,
+    central_axis_path: Path,
+    bridges_mesh=None,
+    all_mesh=None,
+    radius_px: float = DEFAULT_DENSITY_RADIUS_PX,
+    step_px: float = DEFAULT_DENSITY_STEP_PX,
+    n_rbins: int = DEFAULT_RADIAL_N_RBINS,
+    lt_bin_scale: float = DEFAULT_RADIAL_LT_BIN_SCALE,
+    upsample: int = DEFAULT_DENSITY_UPSAMPLE,
+    sigma_up: float = DEFAULT_RADIAL_SIGMA,
+) -> dict:
+    """Compute per-cell radial-gradient scalars (centred at 0) for two meshes.
+
+    For each (L, θ) sector the possible-paths voxels are binned by radial
+    distance R from the central axis into ``n_rbins`` shells.  A linear
+    regression of count vs R gives ``slope_actual``; the scalar is then
+
+        scalar(L, θ) = slope_actual / expected_slope(L) − 1
+
+    where ``expected_slope(L)`` is the mean of all non-zero slopes in the
+    same L-band.  The result is centred at 0: positive values indicate
+    sectors with *better-than-average* radial connectivity (more paths
+    toward the centre than expected), negative values flag bottlenecks.
+
+    The scalar grid is upsampled and smoothed with the same parameters
+    as :func:`_build_density_facet_scalars`, then sampled at face
+    centroids of both meshes.
+    """
+    import numpy as np
+    import tifffile
+    from scipy.ndimage import gaussian_filter, zoom
+
+    cx, cy = _parse_central_axis(Path(central_axis_path))
+    logger.info(
+        "Radial gradient: central axis at (X=%.3f, Y=%.3f) px", cx, cy,
+    )
+
+    paths = tifffile.imread(str(paths_domain_path))
+    if paths.ndim != 3:
+        raise ValueError(
+            f"Radial gradient: expected 3-D volume, got shape {paths.shape}"
+        )
+    nz, ny, nx = paths.shape
+
+    # ── Angular and longitudinal bin counts (larger bins via lt_bin_scale) ─
+    eff_step = float(step_px) * float(lt_bin_scale)
+    n_L = max(1, int(round(nz / eff_step)))
+    n_T = max(1, int(round(2.0 * np.pi * float(radius_px) / eff_step)))
+    n_R = max(2, int(n_rbins))
+    logger.info(
+        "Radial gradient: L bins=%d  θ bins=%d  R bins=%d  lt_bin_scale=%.2f  (vol shape=%s)",
+        n_L, n_T, n_R, float(lt_bin_scale), paths.shape,
+    )
+
+    # ── Collect all possible-paths voxels and compute their coords ──────
+    paths_bool = paths > 0
+    zz, yy, xx = np.nonzero(paths_bool)
+    if zz.size == 0:
+        logger.warning(
+            "Radial gradient: empty possible-paths domain at %s — "
+            "returning zero scalars.", paths_domain_path,
+        )
+        return {"bridges": None, "all": None, "grid": np.zeros((n_L, n_T), dtype=np.float32)}
+
+    # Longitudinal bin
+    Lf = zz.astype(np.float64) / max(nz - 1, 1)
+    Lb = np.clip((Lf * n_L).astype(np.int64), 0, n_L - 1)
+
+    # Azimuthal bin
+    dy = yy.astype(np.float64) - float(cy)
+    dx = xx.astype(np.float64) - float(cx)
+    theta = np.arctan2(dy, dx)
+    Tf = (theta + np.pi) / (2.0 * np.pi)
+    Tb = np.clip((Tf * n_T).astype(np.int64), 0, n_T - 1)
+
+    # ── Radial distance per voxel (px from central axis) ─────────────────
+    R = np.sqrt(dy ** 2 + dx ** 2).astype(np.float64)
+
+    # Flat sector index: position in the (n_L × n_T) grid
+    flat_2d = (Lb * n_T + Tb).astype(np.int64)              # (n_voxels,)
+
+    # ── Per-sector R_min and R_max (vectorised scatter) ───────────────────
+    # Each (L, θ) sector gets its own radial range from its actual voxels.
+    sector_R_max = np.full(n_L * n_T, -np.inf)
+    np.maximum.at(sector_R_max, flat_2d, R)
+    sector_R_min = np.full(n_L * n_T, np.inf)
+    np.minimum.at(sector_R_min, flat_2d, R)
+    sector_R_max   = sector_R_max.reshape(n_L, n_T)
+    sector_R_min   = sector_R_min.reshape(n_L, n_T)
+    sector_R_range = (sector_R_max - sector_R_min).clip(min=0.0)  # (n_L, n_T)
+
+    # ── Per-voxel bin index within its sector ────────────────────────────
+    # Bin 0 = outermost (sclerenchyma side, R close to sector_R_max)
+    # Bin n_R-1 = innermost (stele side,    R close to sector_R_min)
+    R_max_v   = sector_R_max.ravel()[flat_2d]               # (n_voxels,)
+    R_range_v = sector_R_range.ravel()[flat_2d]             # (n_voxels,)
+    # Normalised position: 0 at outer edge, 1 at inner edge
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Rf_sect = np.where(
+            R_range_v > 1e-6,
+            (R_max_v - R) / (R_range_v + 1e-12),
+            0.0,
+        )
+    Rb_sect = np.clip((Rf_sect * n_R).astype(np.int64), 0, n_R - 1)
+
+    # ── 3-D histogram (L, θ, radial_bin) ─────────────────────────────────
+    flat_3d   = flat_2d * n_R + Rb_sect
+    counts_3d = np.bincount(flat_3d, minlength=n_L * n_T * n_R)
+    counts_3d = counts_3d.reshape(n_L, n_T, n_R).astype(np.float64)
+
+    # Representative R of each per-sector bin (px):
+    #   R_centre[l, t, k] = R_max[l,t] − (k + 0.5)/n_R × R_range[l,t]
+    bin_frac    = (np.arange(n_R, dtype=np.float64) + 0.5) / n_R   # (n_R,)
+    R_max_3d    = sector_R_max[:, :, np.newaxis]                    # (n_L, n_T, 1)
+    R_range_3d  = sector_R_range[:, :, np.newaxis]                  # (n_L, n_T, 1)
+    R_centre_3d = R_max_3d - bin_frac * R_range_3d                  # (n_L, n_T, n_R)
+    R_centre_3d = np.where(R_centre_3d > 0, R_centre_3d, 1.0)      # avoid /0
+
+    # ── Sanity check: aggregate all per-sector bin counts ────────────────
+    # 1. Sum bin counts across all valid sectors  → one "aggregate sector"
+    # 2. R_min / R_max come from the median of per-sector values
+    #    (robust to corner sectors with tiny R ranges)
+    # 3. Re-bin voxels into N_SANITY bins using the median range,
+    #    normalise count/R_centre, then normalise so mean = 1.
+    # The result should be roughly flat if the count/R geometry is correct.
+    _N_SANITY  = 20
+    _valid_2d  = counts_3d.sum(axis=2) > 0                              # (n_L, n_T)
+    _rmin_med  = float(np.median(sector_R_min[_valid_2d])) if _valid_2d.any() else 0.0
+    _rmax_med  = float(np.median(sector_R_max[_valid_2d])) if _valid_2d.any() else 1.0
+    if _valid_2d.any():
+        _rrange = _rmax_med - _rmin_med
+        if _rrange > 1e-6:
+            _bf_s    = (np.arange(_N_SANITY, dtype=np.float64) + 0.5) / _N_SANITY
+            _Rf_s    = (R - _rmin_med) / (_rrange + 1e-12)             # 0=inner 1=outer
+            _Rf_s    = np.clip(1.0 - _Rf_s, 0.0, 1.0)                 # flip: 0=outer 1=inner
+            _Rb_s    = np.clip((_Rf_s * _N_SANITY).astype(np.int64), 0, _N_SANITY - 1)
+            _gc_s    = np.bincount(_Rb_s, minlength=_N_SANITY).astype(np.float64)
+            _Rc_s    = _rmax_med - _bf_s * _rrange                     # (N_SANITY,)
+            _Rc_s    = np.where(_Rc_s > 0, _Rc_s, 1.0)
+            _nc_s    = _gc_s / _Rc_s
+            _mean_s  = float(_nc_s.mean()) if _nc_s.mean() > 0 else 1.0
+            _nc_norm = _nc_s / _mean_s
+            _xs      = np.linspace(0.0, 1.0, _N_SANITY)
+            _xd      = _xs - _xs.mean()
+            _sanity_slope = float(
+                ((_nc_norm - _nc_norm.mean()) * _xd).sum() / ((_xd ** 2).sum() + 1e-30)
+            )
+            logger.info(
+                "Radial gradient SANITY  "
+                "(%d bins; aggregate of %d valid sectors; "
+                "R_min_med=%.1f  R_max_med=%.1f px; "
+                "count/R normalised so mean=1; slope=%+.4f; "
+                "r0=outer/sclerenchyma  r%d=inner/stele — "
+                "flat ≈ uniform density): %s",
+                _N_SANITY, int(_valid_2d.sum()), _rmin_med, _rmax_med,
+                _sanity_slope, _N_SANITY - 1,
+                "  ".join(f"r{i}={v:.3f}" for i, v in enumerate(_nc_norm)),
+            )
+
+    # ── Normalise per-sector bins by their representative R ──────────────
+    # In the uniform camembert model count ∝ R, so count/R is flat.
+    norm_counts = counts_3d / R_centre_3d                           # (n_L, n_T, n_R)
+
+    # ── Normalise per-sector so the mean density = 1 ─────────────────────
+    # This makes the regression slopes dimensionless and comparable across
+    # sectors and datasets: a slope of +0.1 means "density rises by 10 % of
+    # the sector mean per unit of normalised radius".
+    nc_sector_mean = norm_counts.mean(axis=2, keepdims=True)        # (n_L, n_T, 1)
+    # Guard against empty sectors (mean ≈ 0).
+    nc_sector_mean = np.where(nc_sector_mean > 1e-30, nc_sector_mean, 1.0)
+    norm_counts = norm_counts / nc_sector_mean                      # mean = 1 per sector
+
+    # ── OLS regression of norm_counts vs normalised radius ──────────────
+    # x ∈ [0, 1]: 0 = outermost shell (sclerenchyma side, R ≈ R_max)
+    #             1 = innermost shell  (stele side,        R ≈ R_min)
+    # y mean = 1 per sector (normalised above).
+    # Positive slope → density increases inward → more paths near stele.
+    # Negative slope → density decreases inward → more paths near sclerenchyma.
+    # Slope unit: fraction of sector-mean density per unit normalised radius.
+    x     = np.linspace(0.0, 1.0, n_R, dtype=np.float64)           # (n_R,)
+    x_dev = x - x.mean()                                           # (n_R,)
+    denom = float((x_dev ** 2).sum())
+
+    nc_mean = norm_counts.mean(axis=2)                             # (n_L, n_T)
+    nc_dev  = norm_counts - nc_mean[..., np.newaxis]               # (n_L, n_T, n_R)
+    slopes  = (nc_dev * x_dev).sum(axis=2) / (denom + 1e-30)      # (n_L, n_T)
+
+    # Valid mask: sectors with at least one voxel
+    total_per_sector = counts_3d.sum(axis=2)                # (n_L, n_T)
+    valid_mask = total_per_sector > 0
+
+    # Scalar = raw slope (no expected_slope normalisation).
+    # Sectors without data get 0.
+    scalar_grid = np.where(valid_mask, slopes, 0.0).astype(np.float32)
+
+    logger.info(
+        "Radial gradient: slope range=[%.4f, %.4f]  "
+        "scalar range=[%.4f, %.4f]  valid sectors=%d/%d",
+        float(slopes[valid_mask].min()) if valid_mask.any() else 0.0,
+        float(slopes[valid_mask].max()) if valid_mask.any() else 0.0,
+        float(scalar_grid.min()), float(scalar_grid.max()),
+        int(valid_mask.sum()), n_L * n_T,
+    )
+    if valid_mask.any():
+        _sv = slopes[valid_mask]
+        _pcts = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+        _vals = np.percentile(_sv, _pcts)
+        logger.info(
+            "Radial gradient slope distribution (valid sectors only):\n"
+            "  p1=%+.3f  p5=%+.3f  p10=%+.3f  p25=%+.3f  p50=%+.3f\n"
+            "  p75=%+.3f  p90=%+.3f  p95=%+.3f  p99=%+.3f\n"
+            "  mean=%+.3f  std=%.3f",
+            *_vals, float(_sv.mean()), float(_sv.std()),
+        )
+        # Histogram with ~12 equal-width bins across [p1, p99] to show shape.
+        _lo, _hi = float(_vals[0]), float(_vals[-1])
+        if _hi > _lo:
+            _edges = np.linspace(_lo, _hi, 21)
+            _counts, _ = np.histogram(_sv, bins=_edges)
+            _bar_max = int(_counts.max()) or 1
+            _bar_w = 30
+            _hist_lines = ["  Histogram of slopes  [p1 … p99]:"]
+            for _i, (_c, _e0, _e1) in enumerate(
+                zip(_counts, _edges[:-1], _edges[1:])
+            ):
+                _bar = "#" * int(round(_c / _bar_max * _bar_w))
+                _hist_lines.append(
+                    f"  [{_e0:+.3f}, {_e1:+.3f})  {_bar:<{_bar_w}}  {_c}"
+                )
+            logger.info("\n".join(_hist_lines))
+
+    # ── Upsample × upsample and Gaussian-smooth (wrap on θ) ──────────────
+    up = max(1, int(upsample))
+    grid_up = zoom(scalar_grid, zoom=up, order=1, mode="nearest")
+    pad_t = int(np.ceil(3.0 * float(sigma_up)))
+    if pad_t > 0:
+        padded = np.concatenate(
+            [grid_up[:, -pad_t:], grid_up, grid_up[:, :pad_t]], axis=1
+        )
+    else:
+        padded = grid_up
+    smoothed = gaussian_filter(padded, sigma=(sigma_up, sigma_up), mode="nearest")
+    if pad_t > 0:
+        smoothed = smoothed[:, pad_t:pad_t + grid_up.shape[1]]
+    grid_smooth = smoothed.astype(np.float32)
+    n_L_up, n_T_up = grid_smooth.shape
+    logger.info(
+        "Radial gradient: upsampled to (%d, %d), sigma=%.2f px",
+        n_L_up, n_T_up, float(sigma_up),
+    )
+    # Distribution of the smoothed grid values (what the mesh colours will be).
+    _gs_flat = grid_smooth.ravel()
+    _gs_pcts = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+    _gs_vals = np.percentile(_gs_flat, _gs_pcts)
+    logger.info(
+        "Radial gradient smoothed-grid distribution:\n"
+        "  p1=%+.3f  p5=%+.3f  p10=%+.3f  p25=%+.3f  p50=%+.3f\n"
+        "  p75=%+.3f  p90=%+.3f  p95=%+.3f  p99=%+.3f\n"
+        "  mean=%+.3f  std=%.3f",
+        *_gs_vals, float(_gs_flat.mean()), float(_gs_flat.std()),
+    )
+
+    # ── Sample at face centroids (same helper as density) ─────────────────
+    def _scalars_for(mesh) -> "np.ndarray | None":
+        if mesh is None:
+            return None
+        try:
+            import vtk
+            from vtkmodules.util.numpy_support import vtk_to_numpy
+            try:
+                pd = mesh.dataset
+            except AttributeError:
+                pd = mesh.polydata()
+            cc = vtk.vtkCellCenters()
+            cc.SetInputData(pd)
+            cc.Update()
+            out = cc.GetOutput()
+            cents = vtk_to_numpy(out.GetPoints().GetData()).astype(np.float64)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Radial gradient: vtkCellCenters failed (%s); falling back.", exc,
+            )
+            try:
+                verts = np.asarray(mesh.vertices)
+            except Exception:  # noqa: BLE001
+                verts = np.asarray(mesh.points())
+            try:
+                cells = np.asarray(mesh.cells)
+            except Exception:  # noqa: BLE001
+                cells = np.asarray(mesh.cells())
+            if cells.ndim != 2 or cells.shape[1] < 3:
+                cents = np.array(
+                    [verts[np.asarray(c, dtype=np.int64)].mean(axis=0) for c in cells],
+                    dtype=np.float64,
+                )
+            else:
+                cents = verts[cells[:, :3].astype(np.int64)].mean(axis=1)
+        zc = cents[:, 0]
+        yc = cents[:, 1]
+        xc = cents[:, 2]
+        Lfc = np.clip(zc / max(nz - 1, 1), 0.0, 1.0 - 1e-9)
+        Lbc = np.clip((Lfc * n_L_up).astype(np.int64), 0, n_L_up - 1)
+        th = np.arctan2(yc - float(cy), xc - float(cx))
+        Tfc = (th + np.pi) / (2.0 * np.pi)
+        Tbc = np.clip((Tfc * n_T_up).astype(np.int64), 0, n_T_up - 1)
+        return grid_smooth[Lbc, Tbc].astype(np.float32)
+
+    bridges_sc = _scalars_for(bridges_mesh)
+    all_sc     = _scalars_for(all_mesh)
+    if bridges_sc is not None:
+        logger.info(
+            "Radial gradient: bridges-mesh scalars shape=%s  range=[%.3f, %.3f]",
+            bridges_sc.shape, float(bridges_sc.min()), float(bridges_sc.max()),
+        )
+    if all_sc is not None:
+        logger.info(
+            "Radial gradient: all-mesh scalars shape=%s  range=[%.3f, %.3f]",
+            all_sc.shape, float(all_sc.min()), float(all_sc.max()),
+        )
+    return {
+        "bridges": bridges_sc,
+        "all":     all_sc,
+        "grid":    grid_smooth,
+        "n_L":     int(n_L),
+        "n_T":     int(n_T),
+        "n_R":     int(n_R),
+        "R_max":   _rmax_med,
+        "axis_cx": float(cx),
+        "axis_cy": float(cy),
+    }
 
 
 def _load_or_build_mesh(
@@ -1424,6 +1760,184 @@ def _build_lames_step_polydatas(packed_pd, n_steps: int):
                 n_built, n_steps)
 
     # ── Single actor — geometry swapped at each tick ────────────────
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetScalarModeToUseCellFieldData()
+    mapper.SelectColorArray("rgb")
+    mapper.SetColorModeToDirectScalars()
+    mapper.ScalarVisibilityOn()
+
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    prop = actor.GetProperty()
+    prop.SetOpacity(float(DEFAULT_LAMES_ALPHA))
+    prop.SetAmbient(0.85)
+    prop.SetDiffuse(0.10)
+    prop.SetSpecular(0.0)
+    prop.BackfaceCullingOff()
+    prop.FrontfaceCullingOff()
+    actor.SetVisibility(False)
+
+    return step_pds, actor
+
+
+# ── Normals-cache helpers ─────────────────────────────────────────────────────
+
+_LAME2_NORMALS_META_NAME = "_normals_meta.json"
+
+
+def _lame2_cache_subdir(base_dir: Path, n_steps: int) -> Path:
+    """Return the n_steps-specific subdirectory inside *base_dir*.
+
+    Using a subdirectory keyed by step-count lets different lame2 VTP
+    variants (e.g. 1000-step test vs 2290-step full) share the same base
+    cache directory without conflicts.
+    """
+    return base_dir / f"steps_{n_steps}"
+
+
+def _lame2_step_vtp_path(normals_dir: Path, step: int) -> Path:
+    return normals_dir / f"step_{step:04d}.vtp"
+
+
+def _compute_normals_one_step(args):
+    """Worker: compact unused points, run vtkPolyDataNormals, write to disk."""
+    import vtk
+    s, pd, normals_dir = args
+    # Each step_pd shares the full packed point array — strip unused points
+    # first so the VTP only contains the points referenced by this step's cells.
+    cleaner = vtk.vtkCleanPolyData()
+    cleaner.SetInputData(pd)
+    cleaner.ConvertPolysToLinesOff()
+    cleaner.ConvertLinesToPointsOff()
+    cleaner.ConvertStripsToPolysOff()
+    cleaner.PointMergingOff()
+    cleaner.Update()
+    nf = vtk.vtkPolyDataNormals()
+    nf.SetInputConnection(cleaner.GetOutputPort())
+    nf.ComputePointNormalsOn()
+    nf.ComputeCellNormalsOff()
+    nf.SplittingOff()
+    nf.ConsistencyOn()
+    nf.SetFeatureAngle(60.0)
+    nf.Update()
+    pd_with_normals = nf.GetOutput()
+    p = _lame2_step_vtp_path(normals_dir, s)
+    w = vtk.vtkXMLPolyDataWriter()
+    w.SetFileName(str(p))
+    w.SetInputData(pd_with_normals)
+    w.SetDataModeToBinary()
+    w.SetCompressorTypeToZLib()
+    w.Write()
+    return s
+
+
+def save_lame2_normals_cache(step_pds: list, normals_dir: Path) -> None:
+    """Compute point normals on each per-step PolyData and write them to
+    *normals_dir/steps_{n}/* as individual binary VTPs.
+
+    A small ``_normals_meta.json`` sentinel is written last so that an
+    interrupted save is never mistaken for a complete one.
+    """
+    import os
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    n_steps = len(step_pds)
+    normals_dir = _lame2_cache_subdir(normals_dir, n_steps)   # versioned subdir
+    normals_dir.mkdir(parents=True, exist_ok=True)
+    n_steps   = len(step_pds)
+    n_workers = min(os.cpu_count() or 4, n_steps)
+    logger.info(
+        "Lame2 normals: processing %d steps with %d parallel workers …",
+        n_steps, n_workers,
+    )
+
+    n_written = 0
+    _t0 = _time.perf_counter()
+
+    tasks = [(s, pd, normals_dir) for s, pd in enumerate(step_pds) if pd is not None]
+    with ThreadPoolExecutor(max_workers=n_workers) as exe:
+        futures = {exe.submit(_compute_normals_one_step, t): t[0] for t in tasks}
+        for fut in as_completed(futures):
+            fut.result()   # re-raise any worker exception
+            n_written += 1
+            _elapsed = _time.perf_counter() - _t0
+            _rate    = _elapsed / n_written
+            _remain  = _rate * (n_steps - n_written)
+            logger.info(
+                "Lame2 normals: step %d/%d  —  elapsed %.1f s  —  ETA ~%.0f s",
+                n_written, n_steps, _elapsed, _remain,
+            )
+
+    import json as _json
+    (_normals_meta_path := normals_dir / _LAME2_NORMALS_META_NAME).write_text(
+        _json.dumps({"n_steps": n_steps, "n_written": n_written}, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(
+        "Lame2 normals cache: wrote %d/%d step VTPs → %s",
+        n_written, n_steps, normals_dir,
+    )
+
+
+def load_lame2_normals_cache(normals_dir: Path, n_steps: int):
+    """Load pre-baked per-step PolyDatas from *normals_dir/steps_{n_steps}/*.
+
+    Returns ``(step_pds, actor)`` in the same form as
+    :func:`_build_lames_step_polydatas`, or ``(None, None)`` if the cache
+    is absent / incomplete.
+    """
+    import vtk
+
+    normals_dir = _lame2_cache_subdir(normals_dir, n_steps)   # versioned subdir
+    meta_path = normals_dir / _LAME2_NORMALS_META_NAME
+    if not meta_path.exists():
+        logger.info("Lame2 normals cache not found at %s — will compute.", normals_dir)
+        return None, None
+
+    try:
+        import json as _json
+        meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read lame2 normals meta: %s", exc)
+        return None, None
+
+    cached_n = int(meta.get("n_steps", 0))
+    if cached_n != n_steps:
+        logger.warning(
+            "Lame2 normals cache at %s has n_steps=%d but expected %d — ignoring.",
+            normals_dir, cached_n, n_steps,
+        )
+        return None, None
+
+    step_pds: list = [None] * n_steps
+    n_loaded = 0
+    for s in range(n_steps):
+        p = _lame2_step_vtp_path(normals_dir, s)
+        if not p.exists():
+            continue
+        try:
+            reader = vtk.vtkXMLPolyDataReader()
+            reader.SetFileName(str(p))
+            reader.Update()
+            pd = reader.GetOutput()
+            if pd is not None and pd.GetNumberOfCells() > 0:
+                step_pds[s] = pd
+                n_loaded += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load step VTP %s: %s", p, exc)
+
+    if n_loaded == 0:
+        logger.warning("Lame2 normals cache is empty — ignoring.")
+        return None, None
+
+    logger.info(
+        "Lame2 normals cache loaded: %d/%d steps from %s",
+        n_loaded, n_steps, normals_dir,
+    )
+
+    # Build a single actor with the same configuration as
+    # _build_lames_step_polydatas (geometry swapped at each tick).
     mapper = vtk.vtkPolyDataMapper()
     mapper.SetScalarModeToUseCellFieldData()
     mapper.SelectColorArray("rgb")

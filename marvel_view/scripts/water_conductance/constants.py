@@ -128,6 +128,13 @@ DEFAULT_LAME2_BG_DIST_PATH: Path = DEFAULT_MEMBRANES_BG_DIST_PATH
 DEFAULT_LAME2_ALPHA: float = 0.30
 LAME2_TICK_MS: int = 40
 
+# Pre-baked per-step VTPs with point normals already computed.
+# Built by ``marvel-lame2-normals-build``; loaded by the viewer at startup
+# instead of recomputing normals on the fly (speeds up cold-start).
+DEFAULT_LAME2_NORMALS_CACHE_DIR: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lame2_normals_cache"
+)
+
 # ── Wind / gas particles (O₂ + CH₄) ─────────────────────────────────────
 # Two toggles drive small "Shadow-of-Colossus" particles that flow
 # through the aerenchyma along the gradient of a *harmonic potential*
@@ -305,7 +312,24 @@ DEFAULT_DENSITY_ALL_CACHE: Path = (
 DEFAULT_DENSITY_RADIUS_PX: float = 130.0   # object radius (px) for θ-bin sizing
 DEFAULT_DENSITY_STEP_PX: float = 3.0       # ≈ bin edge length at the surface (px)
 DEFAULT_DENSITY_UPSAMPLE: int = 3
-DEFAULT_DENSITY_SIGMA: float = 5.0         # Gaussian sigma in upsampled pixels
+DEFAULT_DENSITY_SIGMA: float = 13.0        # Gaussian sigma in upsampled pixels
+
+# ── "Radial gradient" colormap overlay ───────────────────────────────────────
+# Measures how the possible-paths density varies radially within each (L, θ)
+# sector versus what is expected from a uniform distribution.  A linear
+# regression of count(R) vs R gives a slope per sector; the scalar is
+# (slope_actual / mean_slope_over_θ) − 1, centred at 0.  Values > 0 mean
+# better-than-average connectivity toward the centre (well-connected sector);
+# values < 0 flag bottlenecks.  Coloured with a diverging coolwarm palette.
+DEFAULT_RADIAL_GRADIENT_BRIDGES_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "radial_gradient_facets_bridges.npy"
+)
+DEFAULT_RADIAL_GRADIENT_ALL_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "radial_gradient_facets_all.npy"
+)
+DEFAULT_RADIAL_N_RBINS: int = 10       # R bins per (L, θ) sector
+DEFAULT_RADIAL_LT_BIN_SCALE: float = 2.0  # multiply step_px for L/θ bins (larger → fewer sectors)
+DEFAULT_RADIAL_SIGMA: float = 13.0    # Gaussian sigma in upsampled pixels
 
 # Cool light grey body with a slight blue cast in the highlights.
 BODY_COLOR = (185, 188, 195)        # RGB 0-255 — neutral grey (default / "all" mesh)
@@ -338,8 +362,9 @@ PANEL_TITLE = "Specimen Dolores. 3 cm from apex of root 4."
 
 # Mode subtitle shown on the second line of the info panel.
 VIEW_MODE_SUBTITLES: dict = {
-    "mesh_bridges":  "Cortical bridges mesh",
-    "mesh_all":      "All watered tissues",
-    "arrows_grid":   "Water gradient field",
-    "arrows_tracks": "Conduction shortest paths",
+    "mesh_bridges":  "Cortical bridges (without stele and sclerenchyme)",
+    "mesh_all":      "All tissues",
+    "arrows_grid":   "Coupled water & gas gradient fields",
+    "arrows_dual":   "Coupled water & gas gradient fields",
+    "arrows_tracks": "Water conduction shortest paths",
 }

@@ -348,6 +348,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Ignore any 'ui_state' block in the positions JSON "
                         "and render with a fixed configuration (legacy "
                         "behaviour).")
+    p.add_argument("--egl", action="store_true",
+                   help="Force VTK to use the EGL render window backend "
+                        "(vtkEGLRenderWindow) instead of the default X11/GLX "
+                        "window.  Required on headless servers where no X "
+                        "display is available.  VTK must have been built with "
+                        "EGL support (vtkEGLRenderWindow must exist).")
     return p.parse_args(argv)
 
 
@@ -2822,6 +2828,19 @@ def main(argv: list[str] | None = None) -> int:
     frames_dir.mkdir(parents=True, exist_ok=True)
     for old in frames_dir.glob("frame_*.png"):
         old.unlink()
+
+    if args.egl:
+        try:
+            import vedo.vtkclasses as _vtki_egl
+            import vtkmodules.vtkRenderingOpenGL2 as _vtkgl_egl
+            if hasattr(_vtkgl_egl, "vtkEGLRenderWindow"):
+                _vtki_egl.vtkRenderWindow = _vtkgl_egl.vtkEGLRenderWindow
+                logger.info("EGL render window forced (--egl)")
+            else:
+                logger.warning("--egl requested but vtkEGLRenderWindow not "
+                               "found in this VTK build; falling back to default")
+        except Exception as _egl_exc:  # noqa: BLE001
+            logger.warning("Could not force EGL backend: %s", _egl_exc)
 
     import vedo
     plt = vedo.Plotter(

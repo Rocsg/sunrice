@@ -1149,6 +1149,8 @@ def _attach_controls(
     # shows/hides the green-glow Pillars overlay (Pillars are only
     # displayed on the Cortical bridges mesh).
     pillars_state = {"visible": False, "style": None, "hue_shift": 0.0}
+    # User-controlled visibility toggle (off by default at launch).
+    _pillars_user_enabled = {"on": False}
 
     # Base colours (teal-leaning green-blue) for the two pillars styles.
     # The user-facing "pillars hue" slider rotates these in HSV space so
@@ -1231,6 +1233,8 @@ def _attach_controls(
 
     def _pillars_should_show() -> bool:
         if pillars_mesh is None:
+            return False
+        if not _pillars_user_enabled["on"]:
             return False
         # Visible whenever we're in any Arrows view, or when the
         # Cortical bridges mesh is the active mesh.  Hidden on the
@@ -3073,11 +3077,7 @@ def _attach_controls(
             for s in mesh_sliders:
                 _set_widget_visible(s, not in_arrows and _gauge_state["on"])
             for s in arrow_sliders:
-                # Dual-arrow mode doesn't use the arrow-length slider
-                # (fixed colour, no cmap toggle needed).
-                _set_widget_visible(s, in_arrows
-                                    and new_mode != "arrows_dual"
-                                    and _gauge_state["on"])
+                _set_widget_visible(s, in_arrows and _gauge_state["on"])
             for s in wind_sliders:
                 _set_widget_visible(s, _gauge_state["on"])
             _set_button_visible(_cmap_btn, in_arrows
@@ -4613,9 +4613,7 @@ def _attach_controls(
         for s in mesh_sliders:
             _set_widget_visible(s, on and not in_arrows)
         for s in arrow_sliders:
-            # Dual mode uses fixed colours — no length/cmap sliders.
-            _set_widget_visible(s, on and in_arrows
-                                and view_mode.get("name") != "arrows_dual")
+            _set_widget_visible(s, on and in_arrows)
         for s in wind_sliders:
             _set_widget_visible(s, on)
         _gauge_btn.switch()
@@ -4631,6 +4629,23 @@ def _attach_controls(
         size=14,
         bold=True,
     )
+
+    if pillars_mesh is not None:
+        def _toggle_pillars_cb(*_a, **_kw):
+            _pillars_user_enabled["on"] = not _pillars_user_enabled["on"]
+            _refresh_pillars_visibility()
+            _pillars_btn.switch()
+            plt.render()
+
+        _pillars_btn = plt.add_button(
+            _toggle_pillars_cb,
+            states=["Pillars ▸ off", "Pillars ▸ on"],
+            c=["#9e9e9e", "white"],
+            bc=["#263238", "#00695c"],
+            pos=(0.88, 0.38),
+            size=14,
+            bold=True,
+        )
 
     # KeySym sets. We accept both NumLock-on and NumLock-off variants of
     # the numpad keys so the roll bindings work either way.

@@ -109,7 +109,7 @@ PATH_LINE_WIDTH = 4                      # only used in mono / preview
 # vtkPanoramicProjectionPass remaps 6 cube faces to equirect, and a
 # 4-px-wide Line shrinks to sub-pixel — invisible — after that remap.
 PATH_TUBE_RADIUS_FRAC    = 0.0008   # flat / preview
-PATH_TUBE_RADIUS_FRAC_VR = 0.00005  # VR (panoramic remap makes tube look larger)
+PATH_TUBE_RADIUS_FRAC_VR = 0.000025  # VR (panoramic remap makes tube look larger)
 # Fixed world-space offset above the camera path along the world-up axis.
 PATH_VERTICAL_OFFSET = 3.0
 

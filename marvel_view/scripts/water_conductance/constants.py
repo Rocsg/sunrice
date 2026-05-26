@@ -368,3 +368,38 @@ VIEW_MODE_SUBTITLES: dict = {
     "arrows_dual":   "Coupled water & gas gradient fields",
     "arrows_tracks": "Water conduction shortest paths",
 }
+
+# ── Crown tracks — tortuosity colormap ────────────────────────────────────────
+# Tortuosity = arc-length of a Dijkstra path / (R_start − R_end), where R is
+# the radial distance from the central axis.  A perfectly radial path gives
+# tortuosity = 1; tortuous paths have higher values.
+# Colormap: white → yellow → orange → scarlet red → light purple.
+import numpy as _np_tort
+TORTUOSITY_VMIN: float = 1.0
+TORTUOSITY_VMAX: float = 2.5
+TORTUOSITY_CMAP_STOPS: "_np_tort.ndarray" = _np_tort.array([
+    [1.00, 1.00, 1.00],   # white       (ratio = 1 → perfectly straight)
+    [1.00, 0.95, 0.10],   # bright yellow
+    [1.00, 0.45, 0.00],   # orange
+    [0.80, 0.05, 0.05],   # scarlet red
+    [0.62, 0.20, 0.80],   # light purple (high tortuosity)
+], dtype=_np_tort.float32)
+del _np_tort
+
+# Pre-splined tracks VTP (64 subdivisions baked at build time).
+# When this file exists the viewer and movie loader skip the
+# vtkSplineFilter step, dramatically reducing the first-click delay.
+DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_splined.vtp"
+)
+
+# Line width for track lines: interactor uses a thin line (4 pt),
+# movies use a thicker one for visibility on screen / in VR.
+TRACK_LINE_WIDTH_INTERACTOR: int = 4
+TRACK_LINE_WIDTH_MOVIE: int = 8
+
+# Bin-based track visibility (mirrors the viewer + movie bin-culling system).
+# Increasing RADIUS values shows more of the root depth at any one time.
+TRACK_BIN_N:           int = 100   # total number of longitudinal bins
+TRACK_BIN_RADIUS_FULL: int = 18    # bins within ±FULL of camera bin → full opacity
+TRACK_BIN_RADIUS_FADE: int = 32    # bins between FULL and FADE → linear fade

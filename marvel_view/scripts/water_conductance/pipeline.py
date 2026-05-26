@@ -29,6 +29,9 @@ from .constants import (
     DEFAULT_RADIAL_N_RBINS,
     DEFAULT_RADIAL_SIGMA,
     DEFAULT_SPACING,
+    TORTUOSITY_CMAP_STOPS,
+    TORTUOSITY_VMAX,
+    TORTUOSITY_VMIN,
 )
 
 logger = logging.getLogger("marvel_view.water_conductance")
@@ -1073,7 +1076,73 @@ def _build_crown_dijkstra_tracks(
     }
 
 
-def _build_tracks_polydata(data):
+def _compute_per_path_tortuosity(
+    segs_start,
+    segs_end,
+    path_lengths,
+    cx: float,
+    cy: float,
+) -> "np.ndarray":
+    """Compute per-path tortuosity = arc_length / (R_start − R_end).
+
+    Parameters
+    ----------
+    segs_start, segs_end : (n_segs, 3) float32 arrays — world coords (z, y, x).
+    path_lengths         : (n_paths,) int64 — number of segments per path.
+    cx, cy               : float — central-axis x/y world coordinates.
+
+    Returns
+    -------
+    (n_paths,) float32 — tortuosity values, clamped so denom ≥ 0.5.
+    """
+    import numpy as np
+
+    segs_start   = np.asarray(segs_start,   dtype=np.float64)
+    segs_end     = np.asarray(segs_end,     dtype=np.float64)
+    path_lengths = np.asarray(path_lengths, dtype=np.int64)
+
+    n_paths     = len(path_lengths)
+    path_starts = np.concatenate(([0], np.cumsum(path_lengths)[:-1])).astype(np.intp)
+
+    # Arc length: sum of segment Euclidean distances per path.
+    seg_lengths   = np.linalg.norm(segs_end - segs_start, axis=1)  # (n_segs,)
+    path_arc_len  = np.add.reduceat(seg_lengths, path_starts)       # (n_paths,)
+
+    # Radial distance from central axis at start / end of each path.
+    first_pts = segs_start[path_starts]                             # (n_paths, 3) z,y,x
+    last_idx  = (path_starts + path_lengths - 1).astype(np.intp)
+    last_pts  = segs_end[last_idx]                                  # (n_paths, 3)
+
+    start_r = np.sqrt((first_pts[:, 1] - cy) ** 2 + (first_pts[:, 2] - cx) ** 2)
+    end_r   = np.sqrt((last_pts[:, 1]  - cy) ** 2 + (last_pts[:, 2]  - cx) ** 2)
+
+    denom = start_r - end_r
+    neg_mask = denom <= 0
+    if neg_mask.any():
+        logger.warning(
+            "Tortuosity: %d path(s) have denom ≤ 0 (start_r ≤ end_r); "
+            "clamping denominator to 0.5 for those paths.",
+            int(neg_mask.sum()),
+        )
+    denom = np.where(denom > 0, denom, 0.5)
+
+    tortuosity = (path_arc_len / denom).astype(np.float32)
+
+    # Log distribution statistics.
+    med = float(np.median(tortuosity))
+    mad = float(np.median(np.abs(tortuosity - med)))
+    logger.info(
+        "Tortuosity distribution (%d paths): "
+        "min=%.3f  max=%.3f  mean=%.3f  std=%.3f  median=%.3f  MAD=%.3f",
+        n_paths,
+        float(tortuosity.min()), float(tortuosity.max()),
+        float(tortuosity.mean()), float(tortuosity.std()),
+        med, mad,
+    )
+    return tortuosity
+
+
+def _build_tracks_polydata(data, *, cx: float | None = None, cy: float | None = None):
     """Convert a crown-tracks dict to a ``vtkPolyData`` with one
     ``vtkPolyLine`` per Dijkstra path.
 
@@ -1159,7 +1228,16 @@ def _build_tracks_polydata(data):
 
     pd.GetCellData().AddArray(boost_vtk)
     pd.GetCellData().AddArray(scores_vtk)
-    pd.GetCellData().SetActiveScalars("boost")
+
+    # Optional per-path tortuosity = arc_length / (R_start − R_end).
+    if cx is not None and cy is not None:
+        tort = _compute_per_path_tortuosity(segs_start, segs_end, path_lengths, cx, cy)
+        tort_vtk = numpy_to_vtk(tort, deep=True, array_type=vtk.VTK_FLOAT)
+        tort_vtk.SetName("tortuosity")
+        pd.GetCellData().AddArray(tort_vtk)
+        pd.GetCellData().SetActiveScalars("tortuosity")
+    else:
+        pd.GetCellData().SetActiveScalars("boost")
 
     logger.info(
         "Crown tracks polydata: %d polylines, %d points",
@@ -1168,15 +1246,19 @@ def _build_tracks_polydata(data):
     return pd
 
 
-def _write_tracks_vtp(data, vtp_path: Path) -> None:
+def _write_tracks_vtp(data, vtp_path: Path, *,
+                      cx: float | None = None, cy: float | None = None) -> None:
     """Build a ``vtkPolyData`` of crown-track polylines and write it as a
     binary ``.vtp`` (XML VTK PolyData) file.  At load time the viewer can
     read this with ``vtkXMLPolyDataReader`` — a near-memcopy — instead of
     reconstructing all cells in Python.
+
+    When *cx* and *cy* are provided the polydata will also carry a
+    ``"tortuosity"`` CellData array (see :func:`_compute_per_path_tortuosity`).
     """
     import vtk
 
-    pd = _build_tracks_polydata(data)
+    pd = _build_tracks_polydata(data, cx=cx, cy=cy)
     vtp_path.parent.mkdir(parents=True, exist_ok=True)
     writer = vtk.vtkXMLPolyDataWriter()
     writer.SetFileName(str(vtp_path))
@@ -1186,6 +1268,56 @@ def _write_tracks_vtp(data, vtp_path: Path) -> None:
     logger.info(
         "Crown tracks VTP written to %s  (%d polylines, %d points)",
         vtp_path, pd.GetNumberOfCells(), pd.GetNumberOfPoints(),
+    )
+
+
+def _write_splined_tracks_vtp(
+    vtp_path: Path,
+    splined_vtp_path: Path,
+    *,
+    n_subdivisions: int = 64,
+) -> None:
+    """Read the raw polylines VTP, run ``vtkSplineFilter`` and write the
+    result as a binary ``.vtp`` cache.
+
+    This pre-bakes the expensive spline step so the viewer and movie loader
+    can skip it at runtime (the first-click 5-second delay).
+
+    ``vtkSplineFilter`` preserves CellData (one value per polyline cell),
+    so the ``"tortuosity"``, ``"boost"`` and ``"scores"`` arrays survive.
+    """
+    import vtk
+
+    reader = vtk.vtkXMLPolyDataReader()
+    reader.SetFileName(str(vtp_path))
+    reader.Update()
+    pd_raw = reader.GetOutput()
+    if pd_raw.GetNumberOfCells() == 0:
+        logger.warning(
+            "_write_splined_tracks_vtp: polylines VTP has no cells: %s", vtp_path,
+        )
+        return
+
+    spl = vtk.vtkSplineFilter()
+    spl.SetInputData(pd_raw)
+    spl.SetSubdivideToSpecified()
+    spl.SetNumberOfSubdivisions(n_subdivisions)
+    spl.Update()
+    pd_sm = spl.GetOutput()
+
+    splined_vtp_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetFileName(str(splined_vtp_path))
+    writer.SetInputData(pd_sm)
+    writer.SetDataModeToBinary()
+    writer.Write()
+    logger.info(
+        "Splined crown tracks VTP written to %s  (%d polylines, %d points, "
+        "%d subdivisions)",
+        splined_vtp_path,
+        pd_sm.GetNumberOfCells(),
+        pd_sm.GetNumberOfPoints(),
+        n_subdivisions,
     )
 
 
@@ -1311,6 +1443,8 @@ def _load_or_build_crown_tracks(
     cache_path: Path | None,
     vtp_path: Path | None = None,
     arrows_vtp_path: Path | None = None,
+    splined_vtp_path: Path | None = None,
+    central_axis_path: Path | None = None,
     n_source_points: int = DEFAULT_N_SOURCE_POINTS,
     rebuild: bool = False,
     compr_volume=None,
@@ -1424,6 +1558,12 @@ def _load_or_build_crown_tracks(
                     # Pre-computed arrow glyphs VTP (positions, tangents, t).
                     # When present, skips the Python for-loop at render time.
                     "arrows_vtp_path":  arrows_vtp_path,
+                    # Pre-splined polylines VTP (64 subdivisions).
+                    # When present, the viewer/movie skip vtkSplineFilter.
+                    "splined_vtp_path": splined_vtp_path,
+                    # Path to the central-axis coordinates file (forwarded
+                    # so callers can parse cx/cy for colourmap purposes).
+                    "central_axis_path": central_axis_path,
                 }
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to read crown tracks cache %s: %s "

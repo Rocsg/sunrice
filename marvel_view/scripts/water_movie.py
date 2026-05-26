@@ -50,6 +50,7 @@ from marvel_view.scripts.water_conductance import (
     DEFAULT_ARROW_THICKNESS,
     DEFAULT_ARROWS_CACHE_PATH,
     DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_VTP_CACHE,
     DEFAULT_INPUT_PATH,
     DEFAULT_LAME2_META_CACHE,
@@ -58,6 +59,13 @@ from marvel_view.scripts.water_conductance import (
     DEFAULT_LAMES_META_CACHE,
     DEFAULT_LAMES_VTP_CACHE,
     DEFAULT_LEVEL,
+    TORTUOSITY_CMAP_STOPS,
+    TORTUOSITY_VMAX,
+    TORTUOSITY_VMIN,
+    TRACK_BIN_N,
+    TRACK_BIN_RADIUS_FADE,
+    TRACK_BIN_RADIUS_FULL,
+    TRACK_LINE_WIDTH_MOVIE,
     DEFAULT_MESH_CACHE_PATH,
     DEFAULT_MP4_DIR,
     DEFAULT_PILLARS_CACHE_PATH,
@@ -176,13 +184,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Keep individual PNG frames next to the MP4.")
 
     # ── stereo VR ─────────────────────────────────────────────────────────
-    p.add_argument("--vr", choices=["off", "vr180", "vr360"], default="off",
+    p.add_argument("--vr", action="store_true",
                    help="Render as stereo equirectangular side-by-side (SBS) "
-                        "for VR headsets.  'vr180' = forward hemisphere "
-                        "(recommended for fly-throughs), 'vr360' = full "
-                        "sphere.  Each frame renders twice (left + right "
-                        "eye) and roughly 6× slower than mono per eye "
-                        "(panoramic cubemap projection).")
+                        "for VR headsets (full 360° sphere).  Each frame "
+                        "renders twice (left + right eye) and roughly 6× "
+                        "slower than mono per eye (panoramic cubemap "
+                        "projection).")
     p.add_argument("--ipd-frac", type=float, default=VR_IPD_FRAC,
                    help="Interocular distance as a fraction of the camera→"
                         "focal-point distance (0.03 = subtle, 0.05 = "
@@ -338,6 +345,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "centres .vtp (pre-built by "
                         "marvel-water-conductance-build-meshes).  "
                         f"(default: {DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE})")
+    p.add_argument("--crown-tracks-splined-cache",
+                   default=str(DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE),
+                   help="Path to the pre-splined crown tracks .vtp (64 "
+                        "subdivisions, pre-built by build-meshes).  When "
+                        "present, skips vtkSplineFilter at load time.  "
+                        f"(default: {DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE})")
     p.add_argument("--ui-transition-seconds", type=float, default=0.5,
                    help="Duration of the smooth ramp at every keyframe "
                         "transition for UI-state values (opacity, hue, "
@@ -2125,25 +2138,19 @@ def main(argv: list[str] | None = None) -> int:
     hold_frames = max(0, int(round(args.fps * args.hold_seconds)))
 
     # ── VR mode: pick canvas dimensions & per-eye geometry ─────────────────
-    vr_mode = args.vr
-    vr_angle = {"vr180": 180.0, "vr360": 360.0}.get(vr_mode)
+    vr_mode = "vr360" if args.vr else "off"
+    vr_angle = 360.0 if vr_mode == "vr360" else None
     vr_user_set_size = any(f in (argv or sys.argv[1:])
                            for f in ("--width", "--height"))
     if vr_mode != "off" and not vr_user_set_size:
-        if vr_mode == "vr180":
-            args.width, args.height = VR180_SBS_W, VR180_SBS_H
-        else:  # vr360
-            args.width, args.height = VR360_SBS_W, VR360_SBS_H
+        args.width, args.height = VR360_SBS_W, VR360_SBS_H
 
     # ── Fast preview mode (--fast) ─────────────────────────────────────────
     # Downgrades resolution and codec settings for quick iteration.
     # Explicit --width / --height still take precedence over --fast.
     if args.fast:
         if not vr_user_set_size:
-            if vr_mode == "vr180":
-                args.width, args.height = 1024, 512
-                args.vr_cube_resolution = 1024
-            elif vr_mode == "vr360":
+            if vr_mode == "vr360":
                 args.width, args.height = 2048, 512
                 args.vr_cube_resolution = 1024
             else:  # flat
@@ -2525,6 +2532,10 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.crown_tracks_arrows_cache).expanduser().resolve()
             if args.crown_tracks_arrows_cache else None
         )
+        _trk_spl_path = (
+            Path(args.crown_tracks_splined_cache).expanduser().resolve()
+            if getattr(args, "crown_tracks_splined_cache", None) else None
+        )
         if _trk_path.exists():
             try:
                 import vtk as _vtk_t
@@ -2538,17 +2549,52 @@ def main(argv: list[str] | None = None) -> int:
                 _rdr_t.Update()
                 _pd_t = _rdr_t.GetOutput()
                 if _pd_t.GetNumberOfCells() > 0:
-                    _spl = _vtk_t.vtkSplineFilter()
-                    _spl.SetInputData(_pd_t)
-                    _spl.SetSubdivideToSpecified()
-                    _spl.SetNumberOfSubdivisions(64)
-                    _spl.Update()
-                    _pd_sm = _spl.GetOutput()
+                    # ── Spline (or load pre-splined cache) ───────────────
+                    if (_trk_spl_path is not None
+                            and _trk_spl_path.exists()):
+                        _rdr_spl = _vtk_t.vtkXMLPolyDataReader()
+                        _rdr_spl.SetFileName(str(_trk_spl_path))
+                        _rdr_spl.Update()
+                        _pd_sm = _rdr_spl.GetOutput()
+                        print(f"      [ui_state] pre-splined tracks loaded: "
+                              f"{_pd_sm.GetNumberOfCells()} polylines, "
+                              f"{_pd_sm.GetNumberOfPoints()} pts")
+                    else:
+                        _spl = _vtk_t.vtkSplineFilter()
+                        _spl.SetInputData(_pd_t)
+                        _spl.SetSubdivideToSpecified()
+                        _spl.SetNumberOfSubdivisions(64)
+                        _spl.Update()
+                        _pd_sm = _spl.GetOutput()
                     # ── Axis + bin parameters (mirrors viewer constants) ──
-                    _N_BINS    = 100
-                    _BIN_FULL  = 8
-                    _BIN_FADE  = 16
+                    _N_BINS    = TRACK_BIN_N
+                    _BIN_FULL  = TRACK_BIN_RADIUS_FULL
+                    _BIN_FADE  = TRACK_BIN_RADIUS_FADE
                     _WATER_RGB = (0.72, 0.90, 1.00)
+                    # ── Tortuosity LUT ───────────────────────────────────
+                    _tort_lut_mv = None
+                    _tort_arr_mv = _pd_sm.GetCellData().GetArray("tortuosity")
+                    if _tort_arr_mv is not None:
+                        import numpy as _np_tort_mv
+                        _tort_stops_mv = _np_tort_mv.asarray(
+                            TORTUOSITY_CMAP_STOPS, dtype=_np_tort_mv.float64
+                        )
+                        _tort_lut_mv = _vtk_t.vtkLookupTable()
+                        _tort_lut_mv.SetNumberOfTableValues(256)
+                        _tort_lut_mv.SetRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
+                        for _k in range(256):
+                            _tk  = _k / 255.0
+                            _sg  = _tk * (len(_tort_stops_mv) - 1)
+                            _i0  = min(int(_sg), len(_tort_stops_mv) - 2)
+                            _fk  = _sg - _i0
+                            _rgb = (_tort_stops_mv[_i0] * (1.0 - _fk)
+                                    + _tort_stops_mv[_i0 + 1] * _fk)
+                            _tort_lut_mv.SetTableValue(
+                                _k, float(_rgb[0]), float(_rgb[1]),
+                                float(_rgb[2]), 1.0,
+                            )
+                        _tort_lut_mv.Build()
+                        print("      [ui_state] tortuosity LUT built for tracks")
                     _b    = list(_pd_sm.GetBounds())
                     _ex   = [_b[1]-_b[0], _b[3]-_b[2], _b[5]-_b[4]]
                     _ac   = int(np.argmax(np.array(_ex, dtype=np.float64)))
@@ -2587,17 +2633,28 @@ def main(argv: list[str] | None = None) -> int:
                         _geo.SetInputConnection(_extr.GetOutputPort())
                         _geo.Update()
                         _a = _vedo_trk.Mesh(_geo.GetOutput())
-                        try:
-                            _a.mapper().ScalarVisibilityOff()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        _a.c(_WATER_RGB).lw(4).alpha(0.18)
+                        if _tort_lut_mv is not None:
+                            _sub_cd = _geo.GetOutput().GetCellData()
+                            if _sub_cd.GetArray("tortuosity") is not None:
+                                _sub_cd.SetActiveScalars("tortuosity")
+                            _mm = _a.mapper()
+                            _mm.SetLookupTable(_tort_lut_mv)
+                            _mm.SetScalarRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
+                            _mm.ScalarVisibilityOn()
+                            _mm.SetColorModeToMapScalars()
+                        else:
+                            try:
+                                _a.mapper().ScalarVisibilityOff()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            _a.c(_WATER_RGB)
+                        _a.lw(TRACK_LINE_WIDTH_MOVIE).alpha(0.40)
                         try:
                             _a.lighting("off")
                         except Exception:  # noqa: BLE001
                             pass
                         _a._bin_idx    = _bi
-                        _a._base_alpha = 0.18
+                        _a._base_alpha = 0.40
                         getattr(_a, "actor", _a).SetVisibility(0)
                         _lba.append(_a)
                     print(f"      [ui_state] crown tracks lines: "
@@ -3063,6 +3120,7 @@ def main(argv: list[str] | None = None) -> int:
     _cbar_mv_radial   = None
     _cbar_mv_water    = None
     _cbar_mv_air      = None
+    _cbar_mv_tortuosity = None
     try:
         if vr_mode != "off":
             from marvel_view.visualization.colormap_bar import ColormapBar3DBillboard as _CB3D  # noqa: PLC0415
@@ -3081,6 +3139,12 @@ def main(argv: list[str] | None = None) -> int:
             _cbar_mv_air = _CB3D(
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Air",
                 focal_dist=_focal_dist, left_frac=0.55, vert_frac=-0.05,
+            )
+            _cbar_mv_tortuosity = _CB3D(
+                plt, cmap=TORTUOSITY_CMAP_STOPS,
+                vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
+                title="Tortuosity",
+                focal_dist=_focal_dist, left_frac=0.55, vert_frac=0.15,
             )
             print("      colormap billboards attached")
         else:
@@ -3101,9 +3165,16 @@ def main(argv: list[str] | None = None) -> int:
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Gas diffusion",
                 pos=(0.87, 0.12),
             )
+            _cbar_mv_tortuosity = _CB2D(
+                plt, cmap=TORTUOSITY_CMAP_STOPS,
+                vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
+                title="Tortuosity",
+                pos=(0.87, 0.30),
+            )
             print("      colormap overlays attached")
         # Start all hidden; per-frame loop shows/hides as needed.
-        for _b in (_cbar_mv_density, _cbar_mv_radial, _cbar_mv_water, _cbar_mv_air):
+        for _b in (_cbar_mv_density, _cbar_mv_radial, _cbar_mv_water,
+                   _cbar_mv_air, _cbar_mv_tortuosity):
             if _b is not None:
                 _b.set_visible(False)
     except Exception as _cbar_mv_exc:  # noqa: BLE001
@@ -3203,19 +3274,22 @@ def main(argv: list[str] | None = None) -> int:
 
         # ── Colormap bars: show/hide + pose ──────────────────────────────────
         if any(b is not None for b in (_cbar_mv_density, _cbar_mv_radial,
-                                        _cbar_mv_water, _cbar_mv_air)):
+                                        _cbar_mv_water, _cbar_mv_air,
+                                        _cbar_mv_tortuosity)):
             _ui_st_cb  = state.get("ui_state") or {}
             _vm_cb     = _ui_st_cb.get("view_mode", "")
             _cm_mode   = _ui_st_cb.get("cmap_mesh_mode", 0)
             _is_dual   = (_vm_cb == "arrows_dual")
             _is_mesh   = (_vm_cb in ("mesh_bridges", "mesh_all"))
+            _is_tracks = (_vm_cb == "arrows_tracks")
             _show_den  = _is_mesh and _cm_mode == 1
             _show_rad  = _is_mesh and _cm_mode == 2
             for _b, _vis in (
-                (_cbar_mv_density, _show_den),
-                (_cbar_mv_radial,  _show_rad),
-                (_cbar_mv_water,   _is_dual),
-                (_cbar_mv_air,     _is_dual),
+                (_cbar_mv_density,    _show_den),
+                (_cbar_mv_radial,     _show_rad),
+                (_cbar_mv_water,      _is_dual),
+                (_cbar_mv_air,        _is_dual),
+                (_cbar_mv_tortuosity, _is_tracks),
             ):
                 if _b is not None:
                     _b.set_visible(_vis)
@@ -3223,10 +3297,11 @@ def main(argv: list[str] | None = None) -> int:
             if vr_mode != "off":
                 _cb_pos = np.asarray(state["camera"]["position"], dtype=float)
                 for _b, _vis in (
-                    (_cbar_mv_density, _show_den),
-                    (_cbar_mv_radial,  _show_rad),
-                    (_cbar_mv_water,   _is_dual),
-                    (_cbar_mv_air,     _is_dual),
+                    (_cbar_mv_density,    _show_den),
+                    (_cbar_mv_radial,     _show_rad),
+                    (_cbar_mv_water,      _is_dual),
+                    (_cbar_mv_air,        _is_dual),
+                    (_cbar_mv_tortuosity, _is_tracks),
                 ):
                     if _b is not None and _vis:
                         _b.update_pose(_cb_pos, vr_travel_dirs[i], vr_world_up)
@@ -3525,20 +3600,9 @@ def _tag_spatial_media(mp4_path: Path, vr_mode: str) -> bool:
 
     metadata = metadata_utils.Metadata()
     metadata.stereo_mode = "left-right"
-    if vr_mode == "vr180":
-        # Crop bounds expressed as 32-bit fractions of UINT32_MAX:
-        # left/right each 25 % so the visible content spans 180° of the
-        # 360°-wide equirect canvas (per eye).
-        quarter = int(0.25 * 0xFFFFFFFF)
-        metadata.bounds = [0, 0, quarter, quarter]  # top, bottom, left, right
-        metadata.projection = metadata_utils.generate_spherical_xml(
-            stereo="left-right",
-            crop=None,
-        )
-    else:  # vr360
-        metadata.projection = metadata_utils.generate_spherical_xml(
-            stereo="left-right",
-        )
+    metadata.projection = metadata_utils.generate_spherical_xml(
+        stereo="left-right",
+    )
 
     try:
         metadata_utils.inject_metadata(

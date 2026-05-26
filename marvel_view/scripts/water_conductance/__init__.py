@@ -36,6 +36,7 @@ from .pipeline import (  # noqa: F401
     load_lame2_normals_cache,
     _build_mesh,
     _build_tracks_polydata,
+    _compute_per_path_tortuosity,
     _load_lames,
     _load_or_build_arrows,
     _load_or_build_crown_tracks,
@@ -44,6 +45,7 @@ from .pipeline import (  # noqa: F401
     _load_or_build_mesh,
     _load_or_build_overlay_mesh,
     _parse_central_axis,
+    _write_splined_tracks_vtp,
     _write_tracks_arrows_vtp,
     _write_tracks_vtp,
 )
@@ -51,6 +53,7 @@ from .pipeline import (  # noqa: F401
 # ── Styling helpers ────────────────────────────────────────────────────────
 from .styling import (  # noqa: F401
     _hue_shifted_rgb,
+    _install_camera_nav_lights,
     _install_scene_lights,
     _set_lighting,
     _set_shading,
@@ -80,6 +83,7 @@ __all__ = [
     "_write_tracks_vtp",
     # styling
     "_hue_shifted_rgb",
+    "_install_camera_nav_lights",
     "_install_scene_lights",
     "_set_lighting",
     "_set_shading",

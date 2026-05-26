@@ -170,3 +170,53 @@ def _install_scene_lights(plt) -> list:
         renderer.AddLight(amb)
         created.append(amb)
     return created
+
+
+def _install_camera_nav_lights(plt) -> list:
+    """Replace renderer lights with soft camera-space navigation lights.
+
+    Three CameraLight sources that always follow the camera (ideal for
+    the Avion fly-through mode):
+
+    - A warm-white front fill  — main diffuse illumination
+    - A dim red light from rear-left  (port / left wing marker)
+    - A dim green light from rear-right (starboard / right wing marker)
+
+    In VTK camera space: +X = right, +Y = up, -Z = forward toward scene,
+    +Z = behind the camera.  All three lights are directional
+    (SetPositional False) so there is no distance attenuation.
+
+    Returns the created vtkLight objects so the caller can hold a
+    reference and keep them alive.
+    """
+    import vtkmodules.vtkRenderingCore as _vtkrc
+    # (cam-space position, focal, intensity, RGB)
+    _light_defs = [
+        # Front fill — warm white, from slightly above/right of the cam
+        ((0.3,  0.5,  1.0), (0.0, 0.0, 0.0), 0.65, (1.00, 0.97, 0.90)),
+        # Port / rear-left — deep red, very dim
+        ((-1.5, 0.0,  1.8), (0.0, 0.0, 0.0), 0.20, (1.00, 0.25, 0.25)),
+        # Starboard / rear-right — green, very dim
+        (( 1.5, 0.0,  1.8), (0.0, 0.0, 0.0), 0.20, (0.25, 1.00, 0.35)),
+    ]
+    created: list = []
+    for renderer in plt.renderers:
+        try:
+            renderer.AutomaticLightCreationOff()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            renderer.RemoveAllLights()
+        except Exception:  # noqa: BLE001
+            pass
+        for pos, fp, intensity, color in _light_defs:
+            lt = _vtkrc.vtkLight()
+            lt.SetLightTypeToCameraLight()
+            lt.SetPositional(False)
+            lt.SetPosition(*pos)
+            lt.SetFocalPoint(*fp)
+            lt.SetColor(*color)
+            lt.SetIntensity(intensity)
+            renderer.AddLight(lt)
+            created.append(lt)
+    return created

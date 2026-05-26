@@ -14,6 +14,7 @@ from .constants import (
     DEFAULT_ARROWS_CACHE_PATH,
     DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_CACHE,
+    DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_VTP_CACHE,
     DEFAULT_DENSITY_ALL_CACHE,
     DEFAULT_DENSITY_BRIDGES_CACHE,
@@ -225,6 +226,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "tangents and arc-length fractions (produced by "
                         "build-meshes).  When present, skips the Python for-loop "
                         "in _make_tracks_actor_curves.")
+    p.add_argument("--tracks-splined-vtp-cache",
+                   default=str(DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE),
+                   help="Cached binary .vtp of pre-splined crown-track polylines "
+                        "(64 subdivisions, produced by build-meshes).  When "
+                        "present, the viewer and movie skip vtkSplineFilter.")
     p.add_argument("--dual-water-cache",
                    default=str(DEFAULT_WATER_DUAL_ARROWS_CACHE),
                    help="Path to water_dual_arrows.npz (built by marvel-water-harmonic-build).")

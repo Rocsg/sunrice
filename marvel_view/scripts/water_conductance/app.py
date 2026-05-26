@@ -212,6 +212,18 @@ def _attach_controls(
     except ImportError:
         _VOXEL_SIZE_UM = 6.71
 
+    # ── Look-around HUD (centre of screen, appears while a look key is held) ──
+    _look_hud_text2d = None
+    try:
+        _look_hud_text2d = _vedo_mod.Text2D(
+            "", pos=(0.5, 0.65), s=1.3, c="white", bg="black", alpha=0.0,
+            justify="top-center",
+        )
+        plt.add(_look_hud_text2d)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not create look-around HUD Text2D: %s", exc)
+        _look_hud_text2d = None
+
     def _hide_status():
         t = status_state["text2d"]
         if t is None:
@@ -1149,8 +1161,8 @@ def _attach_controls(
     # shows/hides the green-glow Pillars overlay (Pillars are only
     # displayed on the Cortical bridges mesh).
     pillars_state = {"visible": False, "style": None, "hue_shift": 0.0}
-    # User-controlled visibility toggle (off by default at launch).
-    _pillars_user_enabled = {"on": False}
+    # User-controlled visibility toggle (on by default: auto-shown in arrow modes).
+    _pillars_user_enabled = {"on": True}
 
     # Base colours (teal-leaning green-blue) for the two pillars styles.
     # The user-facing "pillars hue" slider rotates these in HSV space so
@@ -1236,13 +1248,10 @@ def _attach_controls(
             return False
         if not _pillars_user_enabled["on"]:
             return False
-        # Visible whenever we're in any Arrows view, or when the
-        # Cortical bridges mesh is the active mesh.  Hidden on the
-        # 'All watered tissues' mesh.
-        if view_mode.get("name") in ("arrows_grid", "arrows_tracks",
-                                      "arrows_dual"):
-            return True
-        return view_mode.get("name") == "mesh_bridges"
+        # Visible only in arrow views (water/air conduction modes).
+        # Hidden on both mesh modes (Cortical bridges and All watered tissues).
+        return view_mode.get("name") in ("arrows_grid", "arrows_tracks",
+                                          "arrows_dual")
 
     def _refresh_pillars_visibility():
         if pillars_mesh is None:
@@ -2424,21 +2433,68 @@ def _attach_controls(
                         id_list.GetNumberOfIds(), n_cells, ds,
                     )
 
-                # ── Spline interpolation: replace voxel-grid staircase ────
-                # ``SetSubdivideToSpecified`` with N=3 emits only 3
-                # segments for the *whole* polyline — that's why tracks
-                # looked angular instead of softly curved.  64 gives a
-                # genuinely smooth Kochanek spline at negligible cost.
-                spline = vtk.vtkSplineFilter()
-                spline.SetInputData(pd)
-                spline.SetSubdivideToSpecified()
-                spline.SetNumberOfSubdivisions(64)
-                spline.Update()
-                pd_smooth = spline.GetOutput()
-                logger.info(
-                    "Crown tracks splined: %d pts → %d pts",
-                    pd.GetNumberOfPoints(), pd_smooth.GetNumberOfPoints(),
-                )
+                # ── Spline interpolation (or load pre-splined cache) ─────
+                # When the pre-baked splined .vtp exists (ds == 1), load
+                # it directly to skip the vtkSplineFilter work that was
+                # causing the ~5s first-click delay.
+                splined_vtp_path = data.get("splined_vtp_path")
+                if (splined_vtp_path is not None
+                        and Path(splined_vtp_path).exists()
+                        and ds == 1):
+                    _t1 = _t.perf_counter()
+                    rdr_spl = vtk.vtkXMLPolyDataReader()
+                    rdr_spl.SetFileName(str(splined_vtp_path))
+                    rdr_spl.Update()
+                    pd_smooth = rdr_spl.GetOutput()
+                    logger.info(
+                        "Pre-splined crown tracks loaded in %.3fs  "
+                        "(%d polylines, %d pts)",
+                        _t.perf_counter() - _t1,
+                        pd_smooth.GetNumberOfCells(),
+                        pd_smooth.GetNumberOfPoints(),
+                    )
+                else:
+                    spline = vtk.vtkSplineFilter()
+                    spline.SetInputData(pd)
+                    spline.SetSubdivideToSpecified()
+                    spline.SetNumberOfSubdivisions(64)
+                    spline.Update()
+                    pd_smooth = spline.GetOutput()
+                    logger.info(
+                        "Crown tracks splined: %d pts → %d pts",
+                        pd.GetNumberOfPoints(), pd_smooth.GetNumberOfPoints(),
+                    )
+
+                # ── Tortuosity colormap LUT ───────────────────────────────
+                # Built from the "tortuosity" CellData array stored in the
+                # VTP by _write_tracks_vtp (requires cx/cy at build time).
+                _tort_lut = None
+                _tort_arr = pd_smooth.GetCellData().GetArray("tortuosity")
+                if _tort_arr is not None:
+                    _tort_stops = np.asarray(
+                        TORTUOSITY_CMAP_STOPS, dtype=np.float64
+                    )
+                    _tort_lut = vtk.vtkLookupTable()
+                    _tort_lut.SetNumberOfTableValues(256)
+                    _tort_lut.SetRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
+                    for _k in range(256):
+                        _tk  = _k / 255.0
+                        _sg  = _tk * (len(_tort_stops) - 1)
+                        _i0  = min(int(_sg), len(_tort_stops) - 2)
+                        _fk  = _sg - _i0
+                        _rgb = (_tort_stops[_i0] * (1.0 - _fk)
+                                + _tort_stops[_i0 + 1] * _fk)
+                        _tort_lut.SetTableValue(
+                            _k, float(_rgb[0]), float(_rgb[1]),
+                            float(_rgb[2]), 1.0,
+                        )
+                    _tort_lut.Build()
+                    logger.info("Tortuosity colormap LUT built.")
+                else:
+                    logger.info(
+                        "No 'tortuosity' CellData; "
+                        "track lines will use solid water colour."
+                    )
 
                 # ── Lines actor (translucent water-blue) ─────────────────
                 # Pale cyan-blue to read as "water" rather than highlight.
@@ -2640,9 +2696,9 @@ def _attach_controls(
                 # ~1/3 of bins visible total (matches the previous 12/2
                 # ratio); the inner half is rendered at full opacity, the
                 # outer half fades linearly to 0.
-                N_BINS          = 100
-                BIN_RADIUS_FULL = 8    # full opacity within ±FULL
-                BIN_RADIUS_FADE = 16   # linear fade from FULL to FADE
+                N_BINS          = TRACK_BIN_N
+                BIN_RADIUS_FULL = TRACK_BIN_RADIUS_FULL
+                BIN_RADIUS_FADE = TRACK_BIN_RADIUS_FADE
 
                 bounds  = pd_smooth.GetBounds()
                 extents = np.array([
@@ -2698,18 +2754,29 @@ def _attach_controls(
                     geo.Update()
                     sub = geo.GetOutput()
                     a = _vedo.Mesh(sub)
-                    try:
-                        a.mapper().ScalarVisibilityOff()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    a.c(WATER_RGB).lw(4).alpha(0.18)
+                    if _tort_lut is not None:
+                        _sub_cd = sub.GetCellData()
+                        if _sub_cd.GetArray("tortuosity") is not None:
+                            _sub_cd.SetActiveScalars("tortuosity")
+                        mm = a.mapper()
+                        mm.SetLookupTable(_tort_lut)
+                        mm.SetScalarRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
+                        mm.ScalarVisibilityOn()
+                        mm.SetColorModeToMapScalars()
+                    else:
+                        try:
+                            a.mapper().ScalarVisibilityOff()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        a.c(WATER_RGB)
+                    a.lw(TRACK_LINE_WIDTH_INTERACTOR).alpha(0.40)
                     try:
                         a.lighting("off")
                     except Exception:  # noqa: BLE001
                         pass
                     a.name = f"track_lines_bin_{bi}"
                     a._bin_idx = bi
-                    a._base_alpha = 0.18
+                    a._base_alpha = 0.40
                     line_bin_actors.append(a)
                 # Drop the full-resolution actor — bin actors replace it.
                 lines_act = None
@@ -3029,6 +3096,10 @@ def _attach_controls(
                     _cbar_water.set_visible(False)
                 if _cbar_air is not None:
                     _cbar_air.set_visible(False)
+            # Hide tortuosity colorbar when leaving arrows_tracks.
+            if cur == "arrows_tracks":
+                if _cbar_tortuosity is not None:
+                    _cbar_tortuosity.set_visible(False)
             # Hide mesh colorbars when leaving a mesh mode.
             if cur in ("mesh_bridges", "mesh_all"):
                 if _cbar_density is not None:
@@ -3065,6 +3136,10 @@ def _attach_controls(
                     _cbar_water.set_visible(True)
                 if _cbar_air is not None:
                     _cbar_air.set_visible(True)
+            # Show tortuosity colorbar when entering arrows_tracks.
+            if new_mode == "arrows_tracks":
+                if _cbar_tortuosity is not None:
+                    _cbar_tortuosity.set_visible(True)
             # Re-show mesh colorbar when entering a mesh mode.
             if new_mode in ("mesh_bridges", "mesh_all"):
                 _mode = _cmap_mesh_state.get("mode", 0)
@@ -3243,6 +3318,7 @@ def _attach_controls(
     _cbar_radial  = None
     _cbar_water   = None
     _cbar_air     = None
+    _cbar_tortuosity = None
     try:
         from marvel_view.visualization.colormap_bar import ColormapBar2D  # noqa: PLC0415
         if _density_has_data:
@@ -3280,8 +3356,18 @@ def _attach_controls(
             pos=(0.87, 0.12),
         )
         _cbar_air.set_visible(False)
+        # Tracks view tortuosity colorbar.
+        _cbar_tortuosity = ColormapBar2D(
+            plt,
+            cmap=TORTUOSITY_CMAP_STOPS,
+            vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
+            title="Tortuosity",
+            pos=(0.87, 0.30),
+        )
+        _cbar_tortuosity.set_visible(False)
     except Exception as _cbar_exc:  # noqa: BLE001
         logger.warning("Could not create colormap bars: %s", _cbar_exc)
+        _cbar_tortuosity = None
 
     # ─── Mesh colormap toggle (3 states: off / density / radial gradient) ──
     # Applies a per-face scalar overlay to the cortical-bridges and
@@ -3727,6 +3813,14 @@ def _attach_controls(
             _plane["v_roll"] = 0.0
             _plane["last_t"] = None
             _stop_plane_timer()
+            _look_offset_active[0] = False
+            _look_cam_saved.clear()
+            if _look_hud_text2d is not None:
+                try:
+                    _look_hud_text2d.text("")
+                    _look_hud_text2d.alpha(0.0)
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001
             pass
         # Reset saved-positions session (new file + counter on next save).
@@ -3817,6 +3911,14 @@ def _attach_controls(
                 _plane["v_roll"] = 0.0
                 _plane["last_t"] = None
                 _stop_plane_timer()
+                _look_offset_active[0] = False
+                _look_cam_saved.clear()
+                if _look_hud_text2d is not None:
+                    try:
+                        _look_hud_text2d.text("")
+                        _look_hud_text2d.alpha(0.0)
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception:  # noqa: BLE001
                 pass
         elif old_mode == 1:  # leaving Spaceship
@@ -3959,6 +4061,9 @@ def _attach_controls(
         "yaw_l": False, "yaw_r": False,
         "pitch_u": False, "pitch_d": False,
         "roll_l": False, "roll_r": False,
+        # Look-around keys: visual-only offset, no velocity ramping.
+        "look_rear": False, "look_left": False, "look_right": False,
+        "look_up": False, "look_down": False,
     }
     # Per-intent scheduled release timestamp (None = no pending release).
     # ``_plane_tick`` flips ``_plane_held[k]`` to False once now ≥ this
@@ -3970,6 +4075,12 @@ def _attach_controls(
     _plane_kbd_held: dict[str, bool] = {k: False for k in _plane_held}
     # Per-intent button-tap auto-release deadline (0.0 = inactive).
     _plane_intent_until: dict[str, float] = {k: 0.0 for k in _plane_held}
+
+    # Look-around visual state: when any look key is held the VTK camera
+    # is rotated by a fixed offset for rendering, then restored at the
+    # start of the next tick so navigation always uses the true heading.
+    _look_offset_active: list[bool] = [False]
+    _look_cam_saved: dict = {}          # {"fp": tuple, "up": tuple}
 
     _iren_plane = getattr(plt, "interactor", None)
 
@@ -4076,6 +4187,18 @@ def _attach_controls(
             return
 
         now = _time_ship.perf_counter()
+
+        # ── 0. Undo any look-around visual offset so navigation always
+        #       reads and writes the true forward/up orientation. ───────
+        if _look_offset_active[0] and _look_cam_saved:
+            try:
+                cam = plt.camera
+                cam.SetFocalPoint(*_look_cam_saved["fp"])
+                cam.SetViewUp(*_look_cam_saved["up"])
+            except Exception:  # noqa: BLE001
+                pass
+            _look_offset_active[0] = False
+            _look_cam_saved.clear()
 
         # Primary input: poll the X server for physically-held keys.
         polled = _poll_plane_keys()
@@ -4201,10 +4324,14 @@ def _attach_controls(
         )
         any_intent = (any_fwd_intent or any_yaw_intent
                       or any_pitch_intent or any_roll_intent)
+        any_look_intent = (
+            _held("look_rear") or _held("look_left") or _held("look_right")
+            or _held("look_up") or _held("look_down")
+        )
         any_pending_release = any(
             t is not None for t in _plane_release_at.values()
         )
-        if not any_motion and not any_intent and not any_pending_release:
+        if not any_motion and not any_intent and not any_look_intent and not any_pending_release:
             _plane["last_t"] = None
             _stop_plane_timer()
             if _info_panel is not None:
@@ -4223,6 +4350,13 @@ def _attach_controls(
             "roll":  _plane["v_roll"]  * dt,
         }
         has_rot = any(abs(v) > 1e-9 for v in rot_deg.values())
+
+        # Rodrigues' rotation formula — used both by the navigation block
+        # (inside `if has_rot`) and by the look-around offset block below.
+        # Defined here so it is always in scope regardless of has_rot.
+        def _rod(v, ax, rad):
+            c, s = _math_plane.cos(rad), _math_plane.sin(rad)
+            return v * c + np.cross(ax, v) * s + ax * float(np.dot(ax, v)) * (1.0 - c)
 
         cam = plt.camera
         moved = False
@@ -4243,10 +4377,6 @@ def _attach_controls(
                 up = np.cross(right, fwd)
                 un = float(np.linalg.norm(up))
                 up = up / un if un > 1e-12 else vu / max(float(np.linalg.norm(vu)), 1e-12)
-
-                def _rod(v, ax, rad):
-                    c, s = _math_plane.cos(rad), _math_plane.sin(rad)
-                    return v * c + np.cross(ax, v) * s + ax * float(np.dot(ax, v)) * (1.0 - c)
 
                 for _ax_name, _ax_vec in [("yaw", up), ("pitch", right), ("roll", fwd)]:
                     _deg = rot_deg[_ax_name]
@@ -4292,6 +4422,81 @@ def _attach_controls(
                         pass
         except Exception:  # noqa: BLE001
             return
+
+        # ── Apply look-around visual offset (after nav, before render) ───
+        # Compute net yaw / pitch offset from held look keys, apply a
+        # one-shot Rodrigues rotation to the *display* camera, and save
+        # the original nav orientation so we can restore it next tick.
+        _look_yaw_deg   = (180.0 if _held("look_rear")
+                           else  90.0 if _held("look_left")
+                           else -90.0 if _held("look_right")
+                           else   0.0)
+        _look_pitch_deg = ( 90.0 if _held("look_up")
+                           else -90.0 if _held("look_down")
+                           else   0.0)
+        _look_label = ("Rear view"   if _held("look_rear")
+                       else "Left view"   if _held("look_left")
+                       else "Right view"  if _held("look_right")
+                       else "Top view"    if _held("look_up")
+                       else "Bottom view" if _held("look_down")
+                       else "")
+        if _look_yaw_deg != 0.0 or _look_pitch_deg != 0.0:
+            try:
+                _lcam  = plt.camera
+                _lpos  = np.asarray(_lcam.GetPosition(),   dtype=float)
+                _lfp   = np.asarray(_lcam.GetFocalPoint(), dtype=float)
+                _lvu   = np.asarray(_lcam.GetViewUp(),     dtype=float)
+                _lfwd  = _lfp - _lpos
+                _ldist = float(np.linalg.norm(_lfwd))
+                if _ldist > 1e-12:
+                    _lfwd /= _ldist
+                    _lright = np.cross(_lfwd, _lvu)
+                    _lrn = float(np.linalg.norm(_lright))
+                    if _lrn > 1e-12:
+                        _lright /= _lrn
+                    _lup = np.cross(_lright, _lfwd)
+                    _lun = float(np.linalg.norm(_lup))
+                    if _lun > 1e-12:
+                        _lup /= _lun
+                    # Save nav state before mutating.
+                    _look_cam_saved["fp"] = tuple(_lfp)
+                    _look_cam_saved["up"] = tuple(_lvu)
+                    # Apply yaw around up axis then pitch around right axis.
+                    if abs(_look_yaw_deg) > 1e-9:
+                        _lr = _math_plane.radians(_look_yaw_deg)
+                        _lfwd = _rod(_lfwd, _lup, _lr)
+                        _lright = np.cross(_lfwd, _lup)
+                        _lrn = float(np.linalg.norm(_lright))
+                        if _lrn > 1e-12:
+                            _lright /= _lrn
+                        _lup = np.cross(_lright, _lfwd)
+                        _lun = float(np.linalg.norm(_lup))
+                        if _lun > 1e-12:
+                            _lup /= _lun
+                    if abs(_look_pitch_deg) > 1e-9:
+                        _lr = _math_plane.radians(_look_pitch_deg)
+                        _lfwd = _rod(_lfwd, _lright, _lr)
+                        _lup  = _rod(_lup,  _lright, _lr)
+                        _lun = float(np.linalg.norm(_lup))
+                        if _lun > 1e-12:
+                            _lup /= _lun
+                    _lcam.SetFocalPoint(*(_lpos + _lfwd * _ldist))
+                    _lcam.SetViewUp(*_lup)
+                    _look_offset_active[0] = True
+                    moved = True
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            _look_offset_active[0] = False
+            _look_cam_saved.clear()
+
+        # Update look-around HUD text.
+        if _look_hud_text2d is not None:
+            try:
+                _look_hud_text2d.text(_look_label)
+                _look_hud_text2d.alpha(0.82 if _look_label else 0.0)
+            except Exception:  # noqa: BLE001
+                pass
 
         if moved:
             _request_render()
@@ -4344,6 +4549,14 @@ def _attach_controls(
         _plane["v_roll"] = 0.0
         _plane["last_t"] = None
         _stop_plane_timer()
+        _look_offset_active[0] = False
+        _look_cam_saved.clear()
+        if _look_hud_text2d is not None:
+            try:
+                _look_hud_text2d.text("")
+                _look_hud_text2d.alpha(0.0)
+            except Exception:  # noqa: BLE001
+                pass
         _show_status("Avion: STOP")
 
     # Maps a button-click ``(axis, sign)`` to the intent name the new
@@ -4646,6 +4859,8 @@ def _attach_controls(
             size=14,
             bold=True,
         )
+        # Pillars start enabled — advance button to state 1 ("Pillars ▸ on").
+        _pillars_btn.switch()
 
     # KeySym sets. We accept both NumLock-on and NumLock-off variants of
     # the numpad keys so the roll bindings work either way.
@@ -4666,16 +4881,39 @@ def _attach_controls(
         _AVION_KEYS_ROLL_LEFT  = {"d", "D"}  # swapped (A felt backwards)
         _AVION_KEYS_ROLL_RIGHT = {"a", "A"}
 
+    # ── Look-around keys (hold to peek, release to snap back) ───────────
+    # F  = rear view  (yaw 180°)  — same physical key on all layouts
+    # A/Q = look left  (yaw +90°) — AZERTY "A" = QWERTY "Q" position
+    # E   = look right (yaw −90°) — same physical key on all layouts
+    # W/Z = look up    (pitch +90°) — AZERTY "W" = QWERTY "Z" position
+    # C   = look down  (pitch −90°) — same physical key on all layouts
+    _AVION_KEYS_LOOK_REAR  = {"f", "F"}
+    if _kb_layout == "azerty":
+        _AVION_KEYS_LOOK_LEFT  = {"a", "A"}
+        _AVION_KEYS_LOOK_RIGHT = {"e", "E"}
+        _AVION_KEYS_LOOK_UP    = {"w", "W"}
+        _AVION_KEYS_LOOK_DOWN  = {"c", "C"}
+    else:  # qwerty
+        _AVION_KEYS_LOOK_LEFT  = {"q", "Q"}
+        _AVION_KEYS_LOOK_RIGHT = {"e", "E"}
+        _AVION_KEYS_LOOK_UP    = {"z", "Z"}
+        _AVION_KEYS_LOOK_DOWN  = {"c", "C"}
+
     # Resolve keysym names to X11 keycodes for fast polling.
     for _intent, _keysyms in (
-        ("yaw_l",   _AVION_KEYS_YAW_LEFT),
-        ("yaw_r",   _AVION_KEYS_YAW_RIGHT),
-        ("pitch_u", _AVION_KEYS_PITCH_UP),
-        ("pitch_d", _AVION_KEYS_PITCH_DOWN),
-        ("roll_l",  _AVION_KEYS_ROLL_LEFT),
-        ("roll_r",  _AVION_KEYS_ROLL_RIGHT),
-        ("fwd",     _AVION_KEYS_ACCEL),
-        ("bck",     _AVION_KEYS_DECEL),
+        ("yaw_l",      _AVION_KEYS_YAW_LEFT),
+        ("yaw_r",      _AVION_KEYS_YAW_RIGHT),
+        ("pitch_u",    _AVION_KEYS_PITCH_UP),
+        ("pitch_d",    _AVION_KEYS_PITCH_DOWN),
+        ("roll_l",     _AVION_KEYS_ROLL_LEFT),
+        ("roll_r",     _AVION_KEYS_ROLL_RIGHT),
+        ("fwd",        _AVION_KEYS_ACCEL),
+        ("bck",        _AVION_KEYS_DECEL),
+        ("look_rear",  _AVION_KEYS_LOOK_REAR),
+        ("look_left",  _AVION_KEYS_LOOK_LEFT),
+        ("look_right", _AVION_KEYS_LOOK_RIGHT),
+        ("look_up",    _AVION_KEYS_LOOK_UP),
+        ("look_down",  _AVION_KEYS_LOOK_DOWN),
     ):
         _AVION_KEYCODES[_intent] = _x11_resolve_keycodes(_keysyms)
     if _x_disp_plane is not None:
@@ -4715,6 +4953,16 @@ def _attach_controls(
             _plane_key_press("fwd")
         elif key in _AVION_KEYS_DECEL:
             _plane_key_press("bck")
+        elif key in _AVION_KEYS_LOOK_REAR:
+            _plane_key_press("look_rear")
+        elif key in _AVION_KEYS_LOOK_LEFT:
+            _plane_key_press("look_left")
+        elif key in _AVION_KEYS_LOOK_RIGHT:
+            _plane_key_press("look_right")
+        elif key in _AVION_KEYS_LOOK_UP:
+            _plane_key_press("look_up")
+        elif key in _AVION_KEYS_LOOK_DOWN:
+            _plane_key_press("look_down")
         else:
             return
         # Intent refreshed; the integrator-driven timer is already armed
@@ -4755,6 +5003,16 @@ def _attach_controls(
             _plane_key_release("fwd")
         elif key in _AVION_KEYS_DECEL:
             _plane_key_release("bck")
+        elif key in _AVION_KEYS_LOOK_REAR:
+            _plane_key_release("look_rear")
+        elif key in _AVION_KEYS_LOOK_LEFT:
+            _plane_key_release("look_left")
+        elif key in _AVION_KEYS_LOOK_RIGHT:
+            _plane_key_release("look_right")
+        elif key in _AVION_KEYS_LOOK_UP:
+            _plane_key_release("look_up")
+        elif key in _AVION_KEYS_LOOK_DOWN:
+            _plane_key_release("look_down")
         else:
             return
         logger.debug("KBD-RELEASE: key=%-10s  release_at=%s",
@@ -5460,6 +5718,14 @@ def main(argv: list[str] | None = None) -> int:
             arrows_vtp_path=(
                 Path(args.tracks_arrows_vtp_cache).expanduser().resolve()
                 if args.tracks_arrows_vtp_cache else None
+            ),
+            splined_vtp_path=(
+                Path(args.tracks_splined_vtp_cache).expanduser().resolve()
+                if getattr(args, "tracks_splined_vtp_cache", None) else None
+            ),
+            central_axis_path=(
+                Path(args.central_axis).expanduser().resolve()
+                if getattr(args, "central_axis", None) else None
             ),
             rebuild=False,  # viewer never rebuilds; use build-meshes for that
             display_stride=args.tracks_stride,

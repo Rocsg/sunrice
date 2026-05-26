@@ -40,6 +40,7 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_CENTRAL_AXIS_PATH,
     DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_CACHE,
+    DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_VTP_CACHE,
     DEFAULT_DENSITY_ALL_CACHE,
     DEFAULT_DENSITY_BRIDGES_CACHE,
@@ -98,6 +99,8 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     _build_density_facet_scalars,
     _build_radial_gradient_facet_scalars,
     _build_mesh,
+    _parse_central_axis,
+    _write_splined_tracks_vtp,
     _write_tracks_arrows_vtp,
     _write_tracks_vtp,
 )
@@ -433,6 +436,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Where to write the pre-computed arrow glyph centres / "
                         "tangents / arc-length fractions (.vtp).  When present "
                         "the viewer skips the per-path Python sampling loop.")
+    p.add_argument("--tracks-splined-vtp-output",
+                   default=str(DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE),
+                   help="Where to write the pre-splined polylines .vtp (64 "
+                        "subdivisions).  When present the viewer and movie "
+                        "skip the vtkSplineFilter step at load time.")
+    p.add_argument("--tracks-only", action="store_true",
+                   help="Skip every step except the crown-tracks build "
+                        "(equivalent to all --skip-* flags except --skip-tracks). "
+                        "Combine with --tracks-vtp-from-cache to regenerate only "
+                        "the .vtp / splined .vtp files from an existing .npz.")
     p.add_argument("--tracks-vtp-from-cache", action="store_true",
                    help="Read the existing crown_tracks.npz and write both .vtp "
                         "files (polylines + arrows) WITHOUT re-running Dijkstra. "
@@ -533,6 +546,20 @@ def main(argv: list[str] | None = None) -> int:
         args.skip_density    = True
         args.skip_membranes  = True
         args.skip_lames      = True
+
+    if args.tracks_only:
+        args.skip_mesh            = True
+        args.skip_all_mesh        = True
+        args.skip_arrows          = True
+        args.skip_overlay         = True
+        args.skip_pillars         = True
+        args.skip_dilatation      = True
+        args.skip_density         = True
+        args.skip_radial_gradient = True
+        args.skip_mask_overlays   = True
+        args.skip_membranes       = True
+        args.skip_lames           = True
+        args.skip_lame2           = True
 
     input_path = Path(args.input).expanduser().resolve()
     out_path = Path(args.output).expanduser().resolve()
@@ -1165,7 +1192,18 @@ def main(argv: list[str] | None = None) -> int:
                         "to overwrite).", vtp_path,
                     )
                 else:
-                    _write_tracks_vtp(tracks, vtp_path)
+                    # Parse cx/cy for tortuosity CellData.
+                    _cx_t = _cy_t = None
+                    _axis_p_t = Path(args.central_axis).expanduser().resolve()
+                    if _axis_p_t.exists():
+                        try:
+                            _cx_t, _cy_t = _parse_central_axis(_axis_p_t)
+                        except Exception as _exc_t:  # noqa: BLE001
+                            logger.warning(
+                                "Could not parse central axis for tortuosity: %s",
+                                _exc_t,
+                            )
+                    _write_tracks_vtp(tracks, vtp_path, cx=_cx_t, cy=_cy_t)
                     # Write the pre-computed arrow glyphs VTP.
                     arrows_vtp_path = Path(
                         args.tracks_arrows_vtp_output
@@ -1177,6 +1215,17 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     else:
                         _write_tracks_arrows_vtp(vtp_path, arrows_vtp_path)
+                    # Write the pre-splined polylines VTP.
+                    splined_vtp_path = Path(
+                        args.tracks_splined_vtp_output
+                    ).expanduser().resolve()
+                    if splined_vtp_path.exists() and not args.force:
+                        logger.error(
+                            "Crown tracks splined VTP already exists: %s  "
+                            "(use --force to overwrite).", splined_vtp_path,
+                        )
+                    else:
+                        _write_splined_tracks_vtp(vtp_path, splined_vtp_path)
     elif args.tracks_vtp_from_cache:
         # ── VTP-only rebuild from existing .npz (no Dijkstra re-run) ──
         import numpy as np
@@ -1199,7 +1248,17 @@ def main(argv: list[str] | None = None) -> int:
                 "overwrite).", vtp_path,
             )
             return 2
-        _write_tracks_vtp(tracks_cache, vtp_path)
+        # Parse cx/cy for tortuosity CellData.
+        _cx_fc = _cy_fc = None
+        _axis_p_fc = Path(args.central_axis).expanduser().resolve()
+        if _axis_p_fc.exists():
+            try:
+                _cx_fc, _cy_fc = _parse_central_axis(_axis_p_fc)
+            except Exception as _exc_fc:  # noqa: BLE001
+                logger.warning(
+                    "Could not parse central axis for tortuosity: %s", _exc_fc,
+                )
+        _write_tracks_vtp(tracks_cache, vtp_path, cx=_cx_fc, cy=_cy_fc)
         arrows_vtp_path = Path(
             args.tracks_arrows_vtp_output
         ).expanduser().resolve()
@@ -1210,6 +1269,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         _write_tracks_arrows_vtp(vtp_path, arrows_vtp_path)
+        splined_vtp_path_fc = Path(
+            args.tracks_splined_vtp_output
+        ).expanduser().resolve()
+        if splined_vtp_path_fc.exists() and not args.force:
+            logger.error(
+                "Crown tracks splined VTP already exists: %s  "
+                "(use --force to overwrite).", splined_vtp_path_fc,
+            )
+            return 2
+        _write_splined_tracks_vtp(vtp_path, splined_vtp_path_fc)
         logger.info("VTP-from-cache rebuild complete.")
     else:
         logger.info("Skipping crown tracks build (--skip-tracks).")

@@ -87,6 +87,7 @@ class AerenQuestLauncher:
         # Active game reference and info
         self._game_ref: list = [None]
         self._current_game_info: Optional[dict] = None
+        self._precomputed_game = None   # game pre-created during countdown
 
     # ─────────────────────────────────────────────── public entry point ───────
 
@@ -406,11 +407,36 @@ class AerenQuestLauncher:
         self._enter_game_mode(game_info)
 
     def _enter_game_mode(self, game_info: dict) -> None:
-        """Position camera, start lames, countdown, then launch game."""
+        """Position camera, start lames, precompute data, countdown, then launch game."""
         # 2D actors already hidden by open() → just position and launch.
         self._start_lames_if_needed()
         self._position_camera()
+        # Pre-instantiate the game and run heavy precomputation NOW so it
+        # finishes during the 3-second countdown instead of at game start.
+        self._precomputed_game = self._try_precompute_game(game_info)
         self._run_countdown(lambda: self._actually_launch(game_info))
+
+    def _try_precompute_game(self, game_info: dict):
+        """Instantiate the game object and precompute column data (no HUD yet)."""
+        try:
+            import importlib
+            mod = importlib.import_module(game_info["module"])
+            cls = getattr(mod, game_info["cls"])
+            ctx  = self._ctx
+            game = cls(
+                plt         = self._plt,
+                lames_state = ctx.get("lames_state", {}),
+                packed_pd   = ctx.get("lames_pd"),
+                start_lames = ctx.get("lames_start_timer", lambda: None),
+                stop_lames  = ctx.get("lames_stop_timer",  lambda: None),
+                data_id     = ctx.get("data_id", "unknown"),
+            )
+            game.precompute()
+            return game
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AerenQuest: precompute failed for %s: %s",
+                           game_info.get("id"), exc)
+            return None
 
     def _start_lames_if_needed(self) -> None:
         """Ensure lames animation is running before the game starts."""
@@ -614,29 +640,38 @@ class AerenQuestLauncher:
         except Exception:
             pass
 
-        # ── Dynamically import and instantiate the game ───────────────────
-        try:
-            import importlib
-            mod = importlib.import_module(game_info["module"])
-            cls = getattr(mod, game_info["cls"])
-        except Exception as exc:
-            logger.warning("AerenQuest: could not import game %s: %s",
-                           game_info["id"], exc)
-            self._restore_scene()
-            return
+        # ── Use precomputed game or create fresh ─────────────────────────
+        game = self._precomputed_game
+        self._precomputed_game = None
 
-        ctx  = self._ctx
-        game = cls(
-            plt         = self._plt,
-            lames_state = ctx.get("lames_state", {}),
-            packed_pd   = ctx.get("lames_pd"),
-            start_lames = ctx.get("lames_start_timer", lambda: None),
-            stop_lames  = ctx.get("lames_stop_timer",  lambda: None),
-            hud_timer   = hud_timer,
-            hud_score   = hud_score,
-            on_end      = self._on_game_end,
-            data_id     = ctx.get("data_id", "unknown"),
-        )
+        if game is not None:
+            # Reuse precomputed instance — just inject HUD and callback.
+            game._hud_timer = hud_timer
+            game._hud_score = hud_score
+            game._on_end    = self._on_game_end
+        else:
+            # Fallback: precompute failed or was skipped — create from scratch.
+            try:
+                import importlib
+                mod = importlib.import_module(game_info["module"])
+                cls = getattr(mod, game_info["cls"])
+            except Exception as exc:
+                logger.warning("AerenQuest: could not import game %s: %s",
+                               game_info["id"], exc)
+                self._restore_scene()
+                return
+            ctx  = self._ctx
+            game = cls(
+                plt         = self._plt,
+                lames_state = ctx.get("lames_state", {}),
+                packed_pd   = ctx.get("lames_pd"),
+                start_lames = ctx.get("lames_start_timer", lambda: None),
+                stop_lames  = ctx.get("lames_stop_timer",  lambda: None),
+                hud_timer   = hud_timer,
+                hud_score   = hud_score,
+                on_end      = self._on_game_end,
+                data_id     = ctx.get("data_id", "unknown"),
+            )
         self._game_ref[0] = game
         game.start()
 

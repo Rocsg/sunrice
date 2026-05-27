@@ -98,13 +98,12 @@ class CatchFluxGame:
         self._elapsed     = 0.0
         self._catch_margin = 5.0
 
-        self._n_columns:  int  = 0
-        self._n_steps:    int  = 0
-        self._col_bounds: dict = {}
-        self._col_in_step: dict = {}
-        self._step_col:   list = []
-        self._caught:     set  = set()
-        self._dirty_steps: set = set()
+        self._n_columns:    int  = 0
+        self._n_steps:      int  = 0
+        self._col_bounds:   dict = {}
+        self._step_col:     list = []
+        self._caught:       set  = set()
+        self._rebuilt_steps: set = set()   # steps whose polydata is clean for current _caught
         self._original_pds: list = []
 
         self._inside_cols:    set = set()
@@ -138,14 +137,19 @@ class CatchFluxGame:
         self._n_steps  = int(self._ls["n_steps"])
         self._inside_cols    = set()
         self._last_seen_step = -1
+        self._rebuilt_steps  = set()
         self._catch_margin   = self._compute_catch_margin()
         self._original_pds   = list(self._ls["step_pds"])
 
-        try:
-            self._build_column_data()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("CatchFluxGame: column pre-processing failed: %s", exc)
-            self._n_columns = 0
+        if self._n_columns <= 0:
+            print("[G01] start(): precompute not done yet — running _build_column_data now (may block!)")
+            try:
+                self._build_column_data()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CatchFluxGame: column pre-processing failed: %s", exc)
+                self._n_columns = 0
+        else:
+            print(f"[G01] start(): precomputed data ready  n_columns={self._n_columns}")
 
         if self._n_columns <= 0:
             logger.warning("CatchFluxGame: no columns found — cannot start.")
@@ -204,6 +208,26 @@ class CatchFluxGame:
             return
         self._end(victory=False, _skip_callback=True)
 
+    def precompute(self) -> None:
+        """Pre-build column index and bounding boxes.
+
+        Call this during the countdown (before ``start()``) so the heavy numpy
+        work happens while the player is reading "3 / 2 / 1", not at game start.
+        ``start()`` will skip ``_build_column_data`` if this was called first.
+        """
+        if self._n_columns > 0:
+            print("[G01] precompute() skipped — already done")
+            return
+        import time as _time
+        print("[G01] precompute() START")
+        t0 = _time.perf_counter()
+        try:
+            self._build_column_data()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CatchFluxGame.precompute failed: %s", exc)
+            print(f"[G01] precompute() FAILED: {exc}")
+        print(f"[G01] precompute() DONE  elapsed={_time.perf_counter()-t0:.3f}s  n_columns={self._n_columns}")
+
     # ── private helpers ───────────────────────────────────────────────────────
 
     def _compute_catch_margin(self) -> float:
@@ -217,126 +241,139 @@ class CatchFluxGame:
             return 8.0
 
     def _build_column_data(self) -> None:
-        """Pre-compute per-column bounds from packed_pd (vectorised)."""
+        """Pre-compute per-column bounding boxes using the flux mid-step (fast)."""
         import time
-        from vtkmodules.util.numpy_support import vtk_to_numpy
+        from vtkmodules.util.numpy_support import vtk_to_numpy as _v2n
 
         t0 = time.perf_counter()
         pd = self._packed_pd
-        col_arr  = vtk_to_numpy(pd.GetCellData().GetArray("column_id")).astype(np.int32)
-        step_arr = vtk_to_numpy(pd.GetCellData().GetArray("step_id")).astype(np.int32)
+        print(f"[G01] _build_column_data: reading cell arrays  t={time.perf_counter()-t0:.3f}s")
+        col_arr  = _v2n(pd.GetCellData().GetArray("column_id")).astype(np.int32)
+        step_arr = _v2n(pd.GetCellData().GetArray("step_id")).astype(np.int32)
         n_cells  = len(col_arr)
         n_cols   = int(col_arr.max()) + 1 if n_cells > 0 else 0
         n_steps  = int(step_arr.max()) + 1 if n_cells > 0 else 0
         pts_vtk  = pd.GetPoints()
+        print(f"[G01] _build_column_data: n_cells={n_cells}  n_cols={n_cols}  n_steps={n_steps}  t={time.perf_counter()-t0:.3f}s")
 
-        # Per-step slice boundaries (cells are pre-sorted by step_id)
-        order    = np.argsort(step_arr, kind="stable")
-        col_arr_s = col_arr[order]
+        # Per-step slice boundaries (cells pre-sorted by step_id)
+        print(f"[G01] _build_column_data: argsort by step  t={time.perf_counter()-t0:.3f}s")
+        order      = np.argsort(step_arr, kind="stable")
+        col_arr_s  = col_arr[order]
         step_arr_s = step_arr[order]
         boundaries = np.searchsorted(step_arr_s, np.arange(n_steps + 1))
         lo_b = boundaries[:-1]
         hi_b = boundaries[1:]
 
-        # Per-step column list
-        step_col: list = [None] * n_steps
-        col_in_step: dict[int, set] = {c: set() for c in range(n_cols)}
-        for s in range(n_steps):
-            a, b = int(lo_b[s]), int(hi_b[s])
-            sc = col_arr_s[a:b]
-            step_col[s] = sc
-            for c in sc:
-                col_in_step[int(c)].add(s)
-        self._lo_b  = lo_b
-        self._hi_b  = hi_b
-        self._col_arr   = col_arr
-        self._step_arr  = step_arr
+        # Per-step column list — simple slice references, no Python set insertions
+        print(f"[G01] _build_column_data: building step_col list  t={time.perf_counter()-t0:.3f}s")
+        step_col: list = [col_arr_s[int(lo_b[s]):int(hi_b[s])] for s in range(n_steps)]
 
-        # Per-column bounding boxes (vectorised)
+        self._lo_b     = lo_b
+        self._hi_b     = hi_b
+        self._col_arr  = col_arr
+        self._step_arr = step_arr
+
+        # Point coordinates
+        print(f"[G01] _build_column_data: reading points  t={time.perf_counter()-t0:.3f}s")
         try:
-            pts_np = vtk_to_numpy(pts_vtk.GetData()).reshape(-1, 3)
+            pts_np = _v2n(pts_vtk.GetData()).reshape(-1, 3)
         except Exception:
             pts_np = np.zeros((pts_vtk.GetNumberOfPoints(), 3), dtype=np.float32)
             for i in range(pts_vtk.GetNumberOfPoints()):
                 pts_np[i] = pts_vtk.GetPoint(i)
+        print(f"[G01] _build_column_data: pts_np shape={pts_np.shape}  t={time.perf_counter()-t0:.3f}s")
 
-        sort_idx = np.argsort(col_arr, kind="stable")
-        col_sorted = col_arr[sort_idx]
-        bounds_col = np.searchsorted(col_sorted, np.arange(n_cols + 1))
-
-        # Connectivity array (triangles: each cell has 3 vertex indices)
-        from vtkmodules.util.numpy_support import vtk_to_numpy as _v2n
+        # Connectivity (triangles → 3 vertex indices per cell)
+        print(f"[G01] _build_column_data: reading connectivity  t={time.perf_counter()-t0:.3f}s")
         conn_flat = _v2n(pd.GetPolys().GetData()).reshape(-1, 4)[:, 1:]
-        # Per-cell vertex positions
-        verts_sorted = pts_np[conn_flat[sort_idx].ravel()].reshape(-1, 3, 3)
-        all_pts_sorted = verts_sorted.reshape(-1, 3)  # (n_cells*3, 3)
+        print(f"[G01] _build_column_data: conn_flat shape={conn_flat.shape}  t={time.perf_counter()-t0:.3f}s")
 
-        col_mins = np.empty((n_cols, 3), dtype=np.float32)
-        col_maxs = np.empty((n_cols, 3), dtype=np.float32)
-        counts   = np.diff(bounds_col)
+        # For each column: find the mid-step of its lifecycle (flux fully grown).
+        print(f"[G01] _build_column_data: computing mid-steps  t={time.perf_counter()-t0:.3f}s")
+        col_min_step = np.full(n_cols, n_steps, dtype=np.int32)
+        col_max_step = np.zeros(n_cols, dtype=np.int32)
+        np.minimum.at(col_min_step, col_arr, step_arr)
+        np.maximum.at(col_max_step, col_arr, step_arr)
+        col_mid_step = ((col_min_step.astype(np.int64) + col_max_step.astype(np.int64)) // 2
+                        ).astype(np.int32)
 
-        for c in range(n_cols):
-            a, b_c = int(bounds_col[c]), int(bounds_col[c + 1])
-            if a >= b_c:
-                col_mins[c] = 0; col_maxs[c] = 0
-                continue
-            pts_c = all_pts_sorted[a * 3: b_c * 3]
-            col_mins[c] = pts_c.min(axis=0)
-            col_maxs[c] = pts_c.max(axis=0)
+        # Select only cells at each column's mid-step
+        print(f"[G01] _build_column_data: selecting mid-step cells  t={time.perf_counter()-t0:.3f}s")
+        is_mid         = (step_arr == col_mid_step[col_arr])
+        mid_indices    = np.where(is_mid)[0]
+        mid_col        = col_arr[mid_indices]
+        sort_mid       = np.argsort(mid_col, kind="stable")
+        mid_idx_sorted = mid_indices[sort_mid]
+        mid_col_sorted = mid_col[sort_mid]
+        bounds_mid     = np.searchsorted(mid_col_sorted, np.arange(n_cols + 1))
+        print(f"[G01] _build_column_data: n_mid_cells={len(mid_indices)}  t={time.perf_counter()-t0:.3f}s")
 
+        # Gather vertex positions for the mid cells (shape: n_mid_cells*3 × 3)
+        print(f"[G01] _build_column_data: gathering mid vertex positions  t={time.perf_counter()-t0:.3f}s")
+        mid_pts = pts_np[conn_flat[mid_idx_sorted].ravel()].reshape(-1, 3)
+
+        print(f"[G01] _build_column_data: computing per-column bboxes  t={time.perf_counter()-t0:.3f}s")
         col_bounds: dict = {}
         for c in range(n_cols):
-            if counts[c] == 0:
+            a, b_c = int(bounds_mid[c]), int(bounds_mid[c + 1])
+            if a >= b_c:
                 col_bounds[c] = None
-            else:
-                col_bounds[c] = (
-                    float(col_mins[c, 0]), float(col_maxs[c, 0]),
-                    float(col_mins[c, 1]), float(col_maxs[c, 1]),
-                    float(col_mins[c, 2]), float(col_maxs[c, 2]),
-                )
+                continue
+            pts_c = mid_pts[a * 3: b_c * 3]
+            col_bounds[c] = (
+                float(pts_c[:, 0].min()), float(pts_c[:, 0].max()),
+                float(pts_c[:, 1].min()), float(pts_c[:, 1].max()),
+                float(pts_c[:, 2].min()), float(pts_c[:, 2].max()),
+            )
 
-        self._n_columns   = n_cols
-        self._col_bounds  = col_bounds
-        self._col_in_step = col_in_step
-        self._step_col    = step_col
+        self._n_columns  = n_cols
+        self._col_bounds = col_bounds
+        self._step_col   = step_col
+        elapsed = time.perf_counter() - t0
+        print(f"[G01] _build_column_data: DONE  n_cols={n_cols}  n_steps={n_steps}  elapsed={elapsed:.3f}s")
         logger.info(
             "CatchFluxGame: %d columns indexed across %d steps  total=%.2fs",
-            n_cols, n_steps, time.perf_counter() - t0,
+            n_cols, n_steps, elapsed,
         )
 
-    def _vanish_column(self, col_id: int) -> None:
-        dirty = self._col_in_step.get(col_id, set())
-        self._dirty_steps.update(dirty)
-        current_step = int(self._ls.get("step", 0))
-        if current_step in dirty:
-            self._vanish_step(current_step)
-            self._dirty_steps.discard(current_step)
+    # ── VTK timer callback ────────────────────────────────────────────────────
 
     def _vanish_step(self, s: int) -> None:
+        import time
         import vtk
         from vtk.util import numpy_support as nps
+        t0 = time.perf_counter()
+        print(f"[G01] _vanish_step({s}) START  caught={sorted(self._caught)}")
         try:
             pds   = self._ls["step_pds"]
             a, b  = int(self._lo_b[s]), int(self._hi_b[s])
             if a >= b:
+                print(f"[G01] _vanish_step({s}) empty slice, skip  t={time.perf_counter()-t0:.4f}s")
                 return
             step_cols  = self._col_arr[a:b]
             caught_arr = np.array(list(self._caught), dtype=np.int32)
+            print(f"[G01] _vanish_step({s}): slice [{a}:{b}] n_cells={len(step_cols)}  t={time.perf_counter()-t0:.4f}s")
             keep = np.where(~np.isin(step_cols, caught_arr))[0]
             if len(keep) == len(step_cols):
+                print(f"[G01] _vanish_step({s}): nothing to remove  t={time.perf_counter()-t0:.4f}s")
                 return
+            print(f"[G01] _vanish_step({s}): keeping {len(keep)}/{len(step_cols)} cells  t={time.perf_counter()-t0:.4f}s")
             pts_vtk = self._packed_pd.GetPoints()
             rgb_np  = nps.vtk_to_numpy(
                 self._packed_pd.GetCellData().GetArray("rgb")
             )
+            print(f"[G01] _vanish_step({s}): got rgb array len={len(rgb_np)}  t={time.perf_counter()-t0:.4f}s")
             if len(keep) == 0:
                 pds[s] = vtk.vtkPolyData()
                 if int(self._ls.get("step", -1)) == s:
                     actor = self._ls.get("actor")
                     if actor is not None:
                         actor.GetMapper().SetInputData(pds[s])
+                print(f"[G01] _vanish_step({s}): cleared (all removed)  t={time.perf_counter()-t0:.4f}s")
                 return
             global_keep = a + keep
+            print(f"[G01] _vanish_step({s}): rebuilding polydata  t={time.perf_counter()-t0:.4f}s")
             conn_np = nps.vtk_to_numpy(
                 self._packed_pd.GetPolys().GetData()
             ).reshape(-1, 4)
@@ -354,18 +391,20 @@ class CatchFluxGame:
             a_rgb.SetNumberOfComponents(3)
             new_pd.GetCellData().AddArray(a_rgb)
             pds[s] = new_pd
+            print(f"[G01] _vanish_step({s}): new polydata built  t={time.perf_counter()-t0:.4f}s")
             if int(self._ls.get("step", -1)) == s:
                 actor = self._ls.get("actor")
                 if actor is not None:
                     actor.GetMapper().SetInputData(new_pd)
+                    print(f"[G01] _vanish_step({s}): mapper updated  t={time.perf_counter()-t0:.4f}s")
         except Exception as exc:  # noqa: BLE001
             logger.debug("CatchFluxGame._vanish_step(%d): %s", s, exc)
+            print(f"[G01] _vanish_step({s}) EXCEPTION: {exc}  t={time.perf_counter()-t0:.4f}s")
+        print(f"[G01] _vanish_step({s}) END  t={time.perf_counter()-t0:.4f}s")
 
     def _process_dirty(self, n: int = 30) -> None:
-        for _ in range(n):
-            if not self._dirty_steps:
-                return
-            self._vanish_step(self._dirty_steps.pop())
+        # Kept for backward compatibility — no longer used; vanishing is now lazy.
+        pass
 
     # ── VTK timer callback ────────────────────────────────────────────────────
 
@@ -394,6 +433,15 @@ class CatchFluxGame:
         if current_step != self._last_seen_step:
             if 0 <= current_step < len(self._step_col):
                 visible_now = set(int(c) for c in self._step_col[current_step])
+                # Lazy vanish: on step change, remove caught columns from this
+                # step's polydata only if needed (one rebuild per step visit).
+                if self._caught and current_step not in self._rebuilt_steps:
+                    if visible_now & self._caught:
+                        import time as _t; _tlv = _t.perf_counter()
+                        print(f"[G01] lazy vanish step={current_step}  caught_in_step={visible_now & self._caught}")
+                        self._vanish_step(current_step)
+                        self._rebuilt_steps.add(current_step)
+                        print(f"[G01] lazy vanish done  t={_t.perf_counter()-_tlv:.4f}s")
             else:
                 visible_now = set()
             self._inside_cols &= visible_now
@@ -418,19 +466,27 @@ class CatchFluxGame:
                             and bnd[4] - mg <= cz <= bnd[5] + mg
                         )
                         if inside and col_id not in self._inside_cols:
+                            import time as _t
+                            _tc = _t.perf_counter()
+                            print(f"[G01] CATCH col_id={col_id}  step={current_step}  score={self._score+1}")
                             self._score += 1
                             self._caught.add(col_id)
                             self._inside_cols.discard(col_id)
-                            self._vanish_column(col_id)
+                            # Rebuild current step immediately; invalidate all
+                            # cached rebuilds so future step visits are clean.
+                            print(f"[G01] CATCH calling _vanish_step({current_step})  t={_t.perf_counter()-_tc:.4f}s")
+                            self._vanish_step(current_step)
+                            print(f"[G01] CATCH _vanish_step done  t={_t.perf_counter()-_tc:.4f}s")
+                            self._rebuilt_steps.clear()
+                            self._rebuilt_steps.add(current_step)
                             step_caught = True
+                            print(f"[G01] CATCH complete  total_catch_time={_t.perf_counter()-_tc:.4f}s")
                         elif inside:
                             self._inside_cols.add(col_id)
                         else:
                             self._inside_cols.discard(col_id)
                 except Exception:  # noqa: BLE001
                     pass
-
-        self._process_dirty(30)
 
         if step_caught:
             left   = self._n_columns - len(self._caught)

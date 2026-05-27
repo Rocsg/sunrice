@@ -534,6 +534,10 @@ class OrthoPanelOverlay:
         rgb = self.compose(cam_world, cam_dir)
         self._push_pixels(rgb)
 
+    def set_visible(self, visible: bool) -> None:
+        """Show or hide the ortho-panel overlay."""
+        self.image_actor.SetVisibility(1 if visible else 0)
+
 
 # ─── helper ─────────────────────────────────────────────────────────────────
 
@@ -715,10 +719,11 @@ class OrthoPanel3DBillboard:
         # When the camera passes through a tissue mesh the billboard can end
         # up geometrically behind the mesh.  All 6 cubemap faces then fail
         # the depth test and the panel disappears for the duration of the
-        # transit.  Override gl_FragDepth to the near-clip value so the
-        # billboard always wins the depth test (HUD / navigation-aid
-        # behaviour).  Stereo depth cues for the panel itself are sacrificed,
-        # which is acceptable for a label overlay.
+        # transit.  Two approaches applied together for robustness across VTK
+        # builds:
+        #   1. Fragment shader: override the written depth value directly.
+        #   2. Vertex shader:   force clip-space z to near-clip so the depth
+        #      test itself is won even when tag (1) is absent in this build.
         try:
             _sp = self._actor.GetShaderProperty()
             _sp.AddFragmentShaderReplacement(
@@ -726,8 +731,17 @@ class OrthoPanel3DBillboard:
                 "gl_FragDepth = 0.0001;\n",
                 False,
             )
-        except Exception:  # noqa: BLE001
-            pass
+            _sp.AddVertexShaderReplacement(
+                "//VTK::PositionVC::Impl", True,
+                "//VTK::PositionVC::Impl\n  gl_Position.z = -0.999 * gl_Position.w;\n",
+                False,
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(
+                "OrthoPanel3DBillboard depth override failed (%s); "
+                "billboard may be occluded by scene geometry.",
+                _e,
+            )
 
         # Add to layer-0 renderer (passes through the panoramic pass).
         main_ren = (
@@ -1300,6 +1314,10 @@ class InfoPanelOverlay:
         self._push_pixels(_render_info_tile(self._title, subtitle, speed_text,
                                             w=self.panel_w, h=self.panel_h))
 
+    def set_visible(self, visible: bool) -> None:
+        """Show or hide the info-panel overlay."""
+        self.image_actor.SetVisibility(1 if visible else 0)
+
 
 class InfoBillboard3D:
     """VR-mode 3-D billboard: title + mode-subtitle, above the travel direction.
@@ -1416,8 +1434,17 @@ class InfoBillboard3D:
                 "gl_FragDepth = 0.0001;\n",
                 False,
             )
-        except Exception:  # noqa: BLE001
-            pass
+            _sp.AddVertexShaderReplacement(
+                "//VTK::PositionVC::Impl", True,
+                "//VTK::PositionVC::Impl\n  gl_Position.z = -0.999 * gl_Position.w;\n",
+                False,
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(
+                "InfoBillboard3D depth override failed (%s); "
+                "billboard may be occluded by scene geometry.",
+                _e,
+            )
 
         # Add to the layer-0 renderer (panoramic pass operates on layer 0).
         target_ren = None

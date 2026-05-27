@@ -1,0 +1,187 @@
+AERENQUEST GAMES
+================
+Game ideas for the Sunrice root visualization project.
+Engine: VTK/vedo, Python, precomputed aerenchyme meshes + wind-field particles.
+Leaderboard: GitHub API → rfernandez/sunrice-leaderboard (leaderboard.json)
+
+Score types
+-----------
+  time_asc    : lower time is better  (Le Messager, Circuit, Cross, Root Dive, Savior, Infection)
+  points_desc : higher count is better (Catch the Pillars, Membrane Surfer, Aero-Census)
+
+Legend  [ ] to do  [~] in progress  [x] done
+
+
+══════════════════════════════════════════════════════════════
+ INFRASTRUCTURE
+══════════════════════════════════════════════════════════════
+
+[ ] Leaderboard — GitHub API client
+      marvel_view/leaderboard/models.py   — ScoreEntry dataclass
+      marvel_view/leaderboard/client.py   — read/write leaderboard.json via GitHub API
+                                            local SQLite fallback when offline
+                                            flush pending on next successful submit
+      marvel_view/leaderboard/ui.py       — vedo Text2D overlay (top-10 display)
+                                            NameEntry widget (VTK keyboard capture)
+      SUNRICE_LB_TOKEN env var            — PAT with contents:write on sunrice-leaderboard repo
+      SUNRICE_LB_REPO  env var            — default: rfernandez/sunrice-leaderboard
+
+[ ] GitHub repo setup
+      Create rfernandez/sunrice-leaderboard (private or public)
+      Commit an initial empty leaderboard.json: {"games": {}}
+      Generate a fine-grained PAT: Contents → Read and Write on that repo only
+      Set SUNRICE_LB_TOKEN on each machine (laptop + phenodrone + any future machine)
+      Document in repo README how to set the token
+
+[ ] Game base class
+      marvel_view/scripts/games/base_game.py
+      Abstract interface: start() tick(dt) end() → ScoreEntry
+      Timer HUD (top-center), score HUD (top-right)
+      Integrates with the master 16ms scheduler in app.py
+
+
+══════════════════════════════════════════════════════════════
+ GAMES — USER IDEAS
+══════════════════════════════════════════════════════════════
+
+[ ] LE MESSAGER  (game_id: le_messager)
+      Score type  : time_asc
+      Data needed : any dataset with aerenchyme + cortex
+      Mechanic
+        - Timer starts immediately (displayed top-center)
+        - Player = metallic olive-green particle (specular, mirror-like)
+        - Opening : close-up of a random "source" cell (cortex mesh bounce)
+                    speech bubble: "J'ai un message à délivrer, qui peut m'aider ?"
+                    player insight: "J'arrive !"
+        - Navigation arrow (HUD) points toward source cell from camera center
+        - Player navigates to source cell in full tissue mesh
+        - Source cell close-up: "Voici le message." / "De quoi s'agit-il ?"
+                                 cell blushes (pink flush), tiny arc, silly face
+                                 "C'est un secret !"
+        - Navigation arrow now points toward target cell
+        - Player navigates to target cell
+        - Target cell close-up: "Merci beaucoup ! Au revoir !"  → timer stops
+        - Name entry → leaderboard submit
+      Implementation notes
+        - Source cell: random CC accessible from exterior (connected_components.interior_mask)
+        - Target cell: different random accessible CC
+        - Arrow HUD: project cell centroid to screen, draw 2D direction arrow
+        - Speech bubbles: vedo Text2D overlay with auto-hide timer
+
+[ ] CROSS THE BEAST  (game_id: cross_the_beast)
+      Score type  : time_asc
+      Data needed : dataset with pillars + trackways visible
+      Mechanic
+        - Mode: trackways + pillars, stele (central cylinder) is blocked/opaque
+        - Go from one root end to the other through cortex only
+        - Must NOT touch a pillar or a trackway (collision sphere around player)
+        - On touch: restart from entry point (no penalty time, just restart pos)
+        - Timer stops when player reaches the far end of the root
+        - Name entry → leaderboard
+      Implementation notes
+        - Collision: distance from camera pos to each pillar/trackway actor centroid < threshold
+        - Entry/exit: bounding box extremes along root axis (Z or longest axis)
+
+[ ] CATCH THE PILLARS  (game_id: catch_pillars)
+      Score type  : points_desc
+      Data needed : any dataset with pillar actors
+      Mechanic
+        - Mode: Lames view
+        - 2-minute countdown (HUD top-left)
+        - Catch a pillar by flying within proximity radius
+        - On catch: actor.SetVisibility(0), score += 1 (displayed top-right)
+        - After 2 min: name entry → leaderboard
+      Implementation notes
+        - Simplest game to implement — proximity check on pillar actors each tick
+        - Proximity radius ~ 5% of scene diagonal
+        - Caught count persists even if player revisits the area
+
+[ ] CIRCUIT  (game_id: circuit)
+      Score type  : time_asc  (ranked by average speed = total_dist / elapsed_time)
+      Data needed : any dataset with cortex mesh
+      Mechanic
+        - N random control points drawn inside cortex mesh (default N=8)
+        - Each materialised as a translucent ring (opacity 0.3) orthogonal to
+          the line from previous → next waypoint
+        - Current target ring highlighted (slightly more opaque / glowing)
+        - Player must fly through each ring in sequence
+        - Passing a ring: distance from camera to ring center < ring radius
+          AND camera crossed the ring plane (dot product sign change)
+        - Timer starts at ring 1, stops when ring N is passed
+        - Leaderboard key: average speed (voxels/s) OR elapsed time
+        - Name entry → leaderboard
+      Implementation notes
+        - Rings: vtkDiskSource with inner_radius = outer_radius * 0.9, thin disk
+        - Random points: sample cortex mesh surface, push inward by normal * offset
+        - Ring orientation: normal = direction to next waypoint
+
+[ ] THE SAVIOR  (game_id: the_savior)  ← CHEF D'ŒUVRE — deferred until long-root data available
+      Score type  : time_asc  (leaderboard tracks completions, i.e. people who made it)
+      Data needed : LONG root dataset (full root length, many aerenchyme cavities)
+      Music       : Vivaldi — L'Estate (Summer) from Le Quattro Stagioni  ← check license
+      Mechanic
+        - Opening cinematic:
+            Far end of root: cell speech bubble "Je suis une cellule de la pointe,
+            la racine est inondée, j'ai besoin d'oxygène, au secours !"
+            Player particle (blue-white, mirror brilliant): "Je suis une molécule
+            d'oxygène, je vais te sauver !"
+        - Control: YAW + PITCH + ROLL only — no speed control (constant forward velocity)
+        - Vivaldi starts, player dives into root from crown end
+        - HUD bar 1: SANTÉ de la cellule (decreases over time, orange/red)
+        - HUD bar 2: DISTANCE à la cellule (decreases as player advances)
+        - Mid-sequence drama:
+            Cell: "J'étouffe... arg !"
+            Tissue turns orange/red
+            Speed increases
+        - Win condition: reach the target cell before health bar empties
+        - End: "Merci !! Tu m'as sauvée !" → timer stops → leaderboard (win only)
+        - Lose condition: health bar empty → "..." → fade to red → restart offer
+      Implementation notes
+        - Speed ramp: linear until drama trigger, then step-up × 1.5
+        - Health bar: simple vedo Rectangle actor, shrinks left-to-right
+        - Distance bar: similar, shrinks as camera Z approaches target Z
+        - Cinematic speech: same Text2D overlay system as Le Messager
+
+
+══════════════════════════════════════════════════════════════
+ GAMES — SUGGESTED EXTRAS
+══════════════════════════════════════════════════════════════
+
+[ ] ROOT DIVE  (game_id: root_dive)
+      Score type  : time_asc
+      Mechanic    : Enter through the crown, reach the root tip staying inside
+                    aerenchyme channels. Pure speedrun, no obstacles.
+                    Timer stops at the tip bounding box edge.
+      Simplest game to implement after Catch the Pillars.
+
+[ ] MEMBRANE SURFER  (game_id: membrane_surfer)
+      Score type  : points_desc  (distance surfed)
+      Mechanic    : Ride the descending water membrane animation (already in engine).
+                    Stay within ±3 animation frames of the current membrane front.
+                    Falling too far behind or ahead ends the run.
+                    Score = how many membrane steps you stayed in sync with.
+
+[ ] AERO-CENSUS  (game_id: aero_census)
+      Score type  : points_desc  (% cells identified)
+      Mechanic    : Educational. 2-minute timer. Fly through the section and
+                    "scan" cell types by proximity (cortex / endodermis /
+                    aerenchyme / stele). Each cell type scanned once = +1 point.
+                    HUD shows mini map of identified zones.
+
+[ ] INFECTION  (game_id: infection)
+      Score type  : time_asc
+      Mechanic    : A contamination wave spreads from the crown end (red voxel
+                    front advancing at constant speed). Player is a white-cell
+                    molecule. Must reach the stele center at the tip before the
+                    infection does. Infection wave uses the same membrane
+                    animation system but reversed / recolored.
+
+
+══════════════════════════════════════════════════════════════
+ FUTURE / BLUE SKY
+══════════════════════════════════════════════════════════════
+
+[ ] Multiplayer race (two players on different machines, same dataset, sync via leaderboard API)
+[ ] VR-native versions of Circuit + The Savior (stereoscopic, head-tracked navigation)
+[ ] Procedural soundtrack: generative audio that responds to player speed + health bars
+[ ] Anatomist quiz: identify labeled structures, educational scoring, exportable results

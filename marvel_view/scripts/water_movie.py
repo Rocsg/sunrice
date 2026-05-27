@@ -3126,25 +3126,25 @@ def main(argv: list[str] | None = None) -> int:
             from marvel_view.visualization.colormap_bar import ColormapBar3DBillboard as _CB3D  # noqa: PLC0415
             _cbar_mv_density = _CB3D(
                 plt, cmap="viridis",  vmin=0.0, vmax=1.0, title="Density",
-                focal_dist=_focal_dist, left_frac=0.55, vert_frac=0.15,
+                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.15,
             )
             _cbar_mv_radial = _CB3D(
                 plt, cmap="coolwarm", vmin=-1.0, vmax=1.0, title="Slope of radial density",
-                focal_dist=_focal_dist, left_frac=0.55, vert_frac=-0.05,
+                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=-0.05,
             )
             _cbar_mv_water = _CB3D(
                 plt, cmap=_WATER_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Water",
-                focal_dist=_focal_dist, left_frac=0.55, vert_frac=0.15,
+                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.15,
             )
             _cbar_mv_air = _CB3D(
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Air",
-                focal_dist=_focal_dist, left_frac=0.55, vert_frac=-0.05,
+                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=-0.05,
             )
             _cbar_mv_tortuosity = _CB3D(
                 plt, cmap=TORTUOSITY_CMAP_STOPS,
                 vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
                 title="Tortuosity",
-                focal_dist=_focal_dist, left_frac=0.55, vert_frac=0.15,
+                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.05,
             )
             print("      colormap billboards attached")
         else:

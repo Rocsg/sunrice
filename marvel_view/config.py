@@ -18,6 +18,30 @@ DEFAULT_IMAGE_PATH: Path = Path(
 # Directory where preprocessed VTK meshes are saved / loaded from.
 DEFAULT_OUTPUT_DIR: Path = Path("./marvel_output")
 
+# ──────────────────────────────── leaderboard ─────────────────────────────────
+#
+# The shared leaderboard lives in a GitHub repository as leaderboard.json.
+# Scores are submitted via the GitHub Contents API (no extra server needed).
+#
+# Required on every machine that will submit scores
+# ──────────────────────────────────────────────────
+#   export SUNRICE_LB_TOKEN=<your-PAT>
+#
+#   The PAT must have "Contents: Read and Write" permission scoped to
+#   SUNRICE_LB_REPO only.  Generate a fine-grained PAT at:
+#   https://github.com/settings/personal-access-tokens
+#
+# Optional overrides
+# ───────────────────
+#   export SUNRICE_LB_REPO=owner/repo       (default below)
+#   export SUNRICE_LB_LOCAL_DB=/path/to.db  (default: ~/.cache/sunrice/…)
+#
+# The client (marvel_view/leaderboard/client.py) reads these env vars at
+# import time.  Values here are kept as documentation only; the actual
+# defaults live in client.py.
+
+LEADERBOARD_GITHUB_REPO: str = "rfernandez/sunrice-leaderboard"
+
 # ──────────────────────────────── imaging ─────────────────────────────────────
 
 # Physical voxel size (z, y, x) in µm – adjust to the real acquisition.

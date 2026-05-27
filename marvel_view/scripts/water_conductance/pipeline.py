@@ -892,10 +892,31 @@ def _build_crown_dijkstra_tracks(
         return None
 
     # ── Build cost field and propagate from all target voxels ────────────
-    # Cost = 1 inside domain, near-infinite outside.  MCP_Geometric
+    # Base cost = 1 inside domain, near-infinite outside.  MCP_Geometric
     # scales each edge by the Euclidean distance between voxel centres,
     # so the cumulative cost is approximately the geodesic arc-length.
-    costs = np.where(paths_m, 1.0, 1e12).astype(np.float64)
+    #
+    # With a perfectly uniform cost field, many paths share the exact same
+    # total length → the traceback breaks ties arbitrarily, producing
+    # lateral oscillations (zigzags) along otherwise straight segments.
+    # To eliminate this, we add a small distance-to-wall gradient: voxels
+    # near the centre of the domain cost 5 % less than those at the
+    # boundary.  This preference is too weak to force any geometric detour
+    # (a 1-voxel detour costs ~1 extra unit while the savings are < 0.05),
+    # but it cleanly breaks ties in favour of the anatomically meaningful
+    # centre-of-tissue path.
+    from scipy.ndimage import distance_transform_edt as _dist_edt
+    dist_to_wall = _dist_edt(paths_m).astype(np.float64)
+    max_d = float(dist_to_wall.max()) or 1.0
+    _cost_inside = 1.0 - 0.05 * (dist_to_wall / max_d)   # 0.95 … 1.0
+    costs = np.where(paths_m, _cost_inside, 1e12).astype(np.float64)
+    logger.info(
+        "MCP cost field: inside range [%.4f, %.4f]  (centre-preference "
+        "tie-breaker, 5%% gradient).",
+        float(_cost_inside[paths_m].min()),
+        float(_cost_inside[paths_m].max()),
+    )
+    del dist_to_wall, _cost_inside  # free memory before the heavy propagation
     target_coords = np.argwhere(target_m)
     logger.info("Building MCP cost field (shape=%s) …", costs.shape)
     mcp = MCP_Geometric(costs)
@@ -1083,17 +1104,23 @@ def _compute_per_path_tortuosity(
     cx: float,
     cy: float,
 ) -> "np.ndarray":
-    """Compute per-path tortuosity = arc_length / (R_start − R_end).
+    """Compute per-path *radial* tortuosity = arc_length / |R_start − R_end|.
+
+    The denominator is the absolute change in radial distance from the root
+    central axis: this is the minimum possible displacement a water molecule
+    must cover to travel from its start radius to its end radius.  A
+    perfectly straight radial path gives tortuosity = 1; any detour
+    (circumferential, tangential, back-tracking) inflates the ratio.
 
     Parameters
     ----------
     segs_start, segs_end : (n_segs, 3) float32 arrays — world coords (z, y, x).
     path_lengths         : (n_paths,) int64 — number of segments per path.
-    cx, cy               : float — central-axis x/y world coordinates.
+    cx, cy               : float — central-axis x/y image coordinates.
 
     Returns
     -------
-    (n_paths,) float32 — tortuosity values, clamped so denom ≥ 0.5.
+    (n_paths,) float32 — tortuosity values ≥ 1.0.
     """
     import numpy as np
 
@@ -1105,30 +1132,39 @@ def _compute_per_path_tortuosity(
     path_starts = np.concatenate(([0], np.cumsum(path_lengths)[:-1])).astype(np.intp)
 
     # Arc length: sum of segment Euclidean distances per path.
-    seg_lengths   = np.linalg.norm(segs_end - segs_start, axis=1)  # (n_segs,)
-    path_arc_len  = np.add.reduceat(seg_lengths, path_starts)       # (n_paths,)
+    seg_lengths  = np.linalg.norm(segs_end - segs_start, axis=1)  # (n_segs,)
+    path_arc_len = np.add.reduceat(seg_lengths, path_starts)       # (n_paths,)
 
-    # Radial distance from central axis at start / end of each path.
-    first_pts = segs_start[path_starts]                             # (n_paths, 3) z,y,x
+    # Radial distance from the central axis at each path endpoint.
+    # Coordinates are (z, y, x) → columns 1 and 2 are y and x.
+    first_pts = segs_start[path_starts]                            # (n_paths, 3)
     last_idx  = (path_starts + path_lengths - 1).astype(np.intp)
-    last_pts  = segs_end[last_idx]                                  # (n_paths, 3)
+    last_pts  = segs_end[last_idx]                                 # (n_paths, 3)
 
-    start_r = np.sqrt((first_pts[:, 1] - cy) ** 2 + (first_pts[:, 2] - cx) ** 2)
-    end_r   = np.sqrt((last_pts[:, 1]  - cy) ** 2 + (last_pts[:, 2]  - cx) ** 2)
+    r_start = np.sqrt((first_pts[:, 1] - cy) ** 2
+                      + (first_pts[:, 2] - cx) ** 2)              # (n_paths,)
+    r_end   = np.sqrt((last_pts[:, 1]  - cy) ** 2
+                      + (last_pts[:, 2] - cx) ** 2)               # (n_paths,)
 
-    denom = start_r - end_r
-    neg_mask = denom <= 0
-    if neg_mask.any():
-        logger.warning(
-            "Tortuosity: %d path(s) have denom ≤ 0 (start_r ≤ end_r); "
-            "clamping denominator to 0.5 for those paths.",
-            int(neg_mask.sum()),
+    # |ΔR|: minimum radial displacement a perfectly radial path would cover.
+    radial_delta = np.abs(r_start - r_end)
+
+    # Paths with very small radial displacement (circumferential / near-flat)
+    # are genuinely tortuous from a water-transport perspective; clamp to
+    # 1.0 voxel minimum so we do not produce inf/nan.
+    small = radial_delta < 1.0
+    if small.any():
+        logger.info(
+            "Tortuosity: %d path(s) have |ΔR| < 1 voxel (near-circumferential); "
+            "clamping denominator to 1.0 for those.",
+            int(small.sum()),
         )
-    denom = np.where(denom > 0, denom, 0.5)
+    radial_delta = np.where(small, 1.0, radial_delta)
 
-    tortuosity = (path_arc_len / denom).astype(np.float32)
+    tortuosity = (path_arc_len / radial_delta).astype(np.float32)
+    tortuosity = np.maximum(tortuosity, 1.0)  # floating-point noise clamp
 
-    # Log distribution statistics.
+    # Log distribution statistics + histogram.
     med = float(np.median(tortuosity))
     mad = float(np.median(np.abs(tortuosity - med)))
     logger.info(
@@ -1138,6 +1174,14 @@ def _compute_per_path_tortuosity(
         float(tortuosity.min()), float(tortuosity.max()),
         float(tortuosity.mean()), float(tortuosity.std()),
         med, mad,
+    )
+    _hist_edges  = [1.0, 1.05, 1.1, 1.2, 1.3, 1.5, 1.75, 2.0, np.inf]
+    _hist_labels = ["1.0-1.05", "1.05-1.1", "1.1-1.2", "1.2-1.3",
+                    "1.3-1.5", "1.5-1.75", "1.75-2.0", "2.0+"]
+    _counts = np.histogram(tortuosity, bins=_hist_edges)[0]
+    logger.info(
+        "Tortuosity histogram: %s",
+        "  ".join(f"{lbl}:{cnt}" for lbl, cnt in zip(_hist_labels, _counts)),
     )
     return tortuosity
 
@@ -1271,22 +1315,72 @@ def _write_tracks_vtp(data, vtp_path: Path, *,
     )
 
 
+def _dp_mask(pts: "np.ndarray", epsilon: float) -> "np.ndarray":
+    """Return a boolean keep-mask for one polyline using Douglas-Peucker.
+
+    ``pts`` is an (N, 3) float64 array of control points; the first and last
+    points are always kept.  The algorithm is iterative (stack-based) to
+    avoid Python recursion limits on long paths.
+    """
+    import numpy as np
+
+    n = len(pts)
+    kept = np.zeros(n, dtype=bool)
+    kept[0] = kept[-1] = True
+    if n <= 2:
+        return kept
+    stack = [(0, n - 1)]
+    while stack:
+        i0, i1 = stack.pop()
+        if i1 <= i0 + 1:
+            continue
+        seg  = pts[i1] - pts[i0]
+        seg_sq = float(np.dot(seg, seg))
+        inner  = pts[i0 + 1:i1]  # (k, 3)
+        if seg_sq < 1e-12:
+            dists = np.linalg.norm(inner - pts[i0], axis=1)
+        else:
+            t = np.clip(
+                np.einsum("ij,j->i", inner - pts[i0], seg) / seg_sq,
+                0.0, 1.0,
+            )
+            proj  = pts[i0] + t[:, np.newaxis] * seg
+            dists = np.linalg.norm(inner - proj, axis=1)
+        mi_local = int(np.argmax(dists))
+        if dists[mi_local] > epsilon:
+            mi = i0 + 1 + mi_local
+            kept[mi] = True
+            stack.append((i0, mi))
+            stack.append((mi, i1))
+    return kept
+
+
 def _write_splined_tracks_vtp(
     vtp_path: Path,
     splined_vtp_path: Path,
     *,
     n_subdivisions: int = 64,
+    dp_epsilon: float = 1.0,
 ) -> None:
-    """Read the raw polylines VTP, run ``vtkSplineFilter`` and write the
-    result as a binary ``.vtp`` cache.
+    """Read the raw polylines VTP, simplify with Douglas-Peucker, run
+    ``vtkSplineFilter`` and write the result as a binary ``.vtp`` cache.
 
-    This pre-bakes the expensive spline step so the viewer and movie loader
-    can skip it at runtime (the first-click 5-second delay).
+    **Why Douglas-Peucker before splining?**
+    Dijkstra paths on a voxel grid step between adjacent voxel centres at
+    right angles, producing staircase control-point sequences.  Splining
+    *through* those points yields a smooth curve that still faithfully
+    follows the staircase shape.  D-P (epsilon = 1 voxel by default)
+    removes collinear / near-collinear intermediate voxels first; the
+    remaining skeleton points capture only real turns.  The spline then
+    interpolates between those skeleton points, giving genuinely curved
+    paths rather than rounded staircases.
 
     ``vtkSplineFilter`` preserves CellData (one value per polyline cell),
     so the ``"tortuosity"``, ``"boost"`` and ``"scores"`` arrays survive.
     """
+    import numpy as np
     import vtk
+    from vtkmodules.util.numpy_support import vtk_to_numpy, numpy_to_vtk
 
     reader = vtk.vtkXMLPolyDataReader()
     reader.SetFileName(str(vtp_path))
@@ -1298,7 +1392,60 @@ def _write_splined_tracks_vtp(
         )
         return
 
+    # ── Douglas-Peucker simplification ───────────────────────────────────
+    # Remove near-collinear control points (voxel-grid staircase) so the
+    # spline interpolates between genuine turning-points only.
+    if dp_epsilon > 0.0:
+        pts     = vtk_to_numpy(pd_raw.GetPoints().GetData()).astype(np.float64)
+        ca      = pd_raw.GetLines()
+        offsets = vtk_to_numpy(ca.GetOffsetsArray()).astype(np.intp)
+        conn    = vtk_to_numpy(ca.GetConnectivityArray()).astype(np.intp)
+        n_cells = pd_raw.GetNumberOfCells()
+
+        new_conn_parts: list = []
+        new_off = [0]
+        n_kept_total = 0
+        for ci in range(n_cells):
+            s, e   = offsets[ci], offsets[ci + 1]
+            ids    = conn[s:e]
+            if len(ids) <= 2:
+                new_conn_parts.append(ids)
+            else:
+                mask = _dp_mask(pts[ids], dp_epsilon)
+                new_conn_parts.append(ids[mask])
+            n_kept_total += len(new_conn_parts[-1])
+            new_off.append(n_kept_total)
+
+        new_conn_arr = np.concatenate(new_conn_parts).astype(np.int64)
+        new_off_arr  = np.array(new_off, dtype=np.int64)
+
+        vtk_pts = vtk.vtkPoints()
+        vtk_pts.SetData(numpy_to_vtk(pts, deep=True))
+        ca_dp = vtk.vtkCellArray()
+        ca_dp.SetData(
+            numpy_to_vtk(new_off_arr,  deep=True, array_type=vtk.VTK_ID_TYPE),
+            numpy_to_vtk(new_conn_arr, deep=True, array_type=vtk.VTK_ID_TYPE),
+        )
+        pd_dp = vtk.vtkPolyData()
+        pd_dp.SetPoints(vtk_pts)
+        pd_dp.SetLines(ca_dp)
+        pd_dp.GetCellData().ShallowCopy(pd_raw.GetCellData())
+
+        n_orig = int(offsets[-1])
+        logger.info(
+            "Douglas-Peucker (eps=%.2f): %d → %d control points (%.1f%% kept).",
+            dp_epsilon, n_orig, n_kept_total,
+            100.0 * n_kept_total / max(1, n_orig),
+        )
+        pd_raw = pd_dp
+
+    # Use Kochanek spline with moderate tension (0.5) to limit overshoot at
+    # sharp turns while keeping smooth curves between D-P skeleton points.
+    # Tension=0 is Catmull-Rom (can overshoot); tension=1 is fully linear.
+    _ksp = vtk.vtkKochanekSpline()
+    _ksp.SetDefaultTension(0.5)
     spl = vtk.vtkSplineFilter()
+    spl.SetSpline(_ksp)
     spl.SetInputData(pd_raw)
     spl.SetSubdivideToSpecified()
     spl.SetNumberOfSubdivisions(n_subdivisions)

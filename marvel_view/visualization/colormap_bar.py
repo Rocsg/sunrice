@@ -382,8 +382,17 @@ class ColormapBar3DBillboard:
                 "gl_FragDepth = 0.0001;\n",
                 False,
             )
-        except Exception:  # noqa: BLE001
-            pass
+            _sp.AddVertexShaderReplacement(
+                "//VTK::PositionVC::Impl", True,
+                "//VTK::PositionVC::Impl\n  gl_Position.z = -0.999 * gl_Position.w;\n",
+                False,
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(
+                "ColormapBar3DBillboard depth override failed (%s); "
+                "billboard may be occluded by scene geometry.",
+                _e,
+            )
 
         # Add to layer-0 renderer (captured by the panoramic pass).
         main_ren = (
@@ -393,7 +402,11 @@ class ColormapBar3DBillboard:
         )
         main_ren.AddActor(self._actor)
         self._renderer = main_ren
-        self._visible = True
+        # Start hidden; caller must explicitly call set_visible(True).
+        # Avoids the actor appearing at the default vtkPlaneSource origin
+        # (0,0,0)→(1,0,0) before the first update_pose call.
+        self._actor.SetVisibility(0)
+        self._visible = False
 
     # ------------------------------------------------------------------
 

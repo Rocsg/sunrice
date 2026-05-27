@@ -376,7 +376,7 @@ VIEW_MODE_SUBTITLES: dict = {
 # Colormap: white → yellow → orange → scarlet red → light purple.
 import numpy as _np_tort
 TORTUOSITY_VMIN: float = 1.0
-TORTUOSITY_VMAX: float = 2.5
+TORTUOSITY_VMAX: float = 1.5
 TORTUOSITY_CMAP_STOPS: "_np_tort.ndarray" = _np_tort.array([
     [1.00, 1.00, 1.00],   # white       (ratio = 1 → perfectly straight)
     [1.00, 0.95, 0.10],   # bright yellow

@@ -128,6 +128,20 @@ def _attach_controls(
     # Tracks Mesh ↔ Arrows view; consulted by `_pillars_should_show`.
     view_mode = {"name": "mesh"}
 
+    # ── Window focus tracking ────────────────────────────────────────────
+    # Keyboard events are only processed when the VTK window has input
+    # focus.  On Linux/X11 with focus-follows-mouse some desktop
+    # environments deliver keyboard events as soon as the mouse enters the
+    # window; the flag below prevents accidental navigation input from
+    # being acted upon while another application window is in use.
+    _window_focused = [True]  # assume focused at start (window just opened)
+
+    def _on_focus_in(*_a):
+        _window_focused[0] = True
+
+    def _on_focus_out(*_a):
+        _window_focused[0] = False
+
     state = {
         "opacity":  OPACITY,
         "ambient":  AMBIENT,
@@ -332,7 +346,8 @@ def _attach_controls(
                     speed = abs(_plane["fwd_v"])
                 else:
                     speed = 0.0
-                ts.text(f"↦ {speed:.1f} vox/s")
+                _arrow = "↤" if (_nav_mode[0] == 0 and _plane["fwd_v"] < 0.0) else "↦"
+                ts.text(f"{_arrow} {speed:.1f} vox/s")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -610,7 +625,7 @@ def _attach_controls(
         states=[f"Shading ▸ {name}" for name, _ in _SHADING_MODES],
         c=["white"] * len(_SHADING_MODES),
         bc=["#3b5b8c", "#6b8e23", "#8c6b3b"],
-        pos=(0.88, 0.39),
+        pos=(0.88, 0.52),
         size=14,
         bold=True,
     )
@@ -664,13 +679,19 @@ def _attach_controls(
         _cycle_style_cb,
         # State 0 = Trackball active  → click to go back to keyboard/buttons nav
         # State 1 = Navigation(buttons) active  → click to activate mouse trackball
-        states=["Deactivate mouse trackball", "Activate mouse trackball"],
+        states=["Deactivate mouse trackball", "Activate mouse trackball  "],
         c=["white", "white"],
         bc=["#2e7d32", "#455a64"],
         pos=(0.10, 0.50),
         size=14,
         bold=True,
     )
+    # The app starts in Navigation (buttons) mode (style_state["idx"] = 1),
+    # so advance the button to state 1 ("Activate mouse trackball").
+    try:
+        _style_btn.switch()
+    except Exception:  # noqa: BLE001
+        pass
 
     # ─── on-screen navigation panel (Custom mode only) ──────────────────
     # 6 translation directions × 3 speeds (factor ×5 between speeds) +
@@ -956,7 +977,7 @@ def _attach_controls(
     _save_pos_btn_ref: list = [None]
     _save_pos_btn_ref[0] = plt.add_button(
         _save_position_cb,
-        states=["Save position"],
+        states=["Save position             "],
         c=["white"],
         bc=["#00838f"],
         pos=(0.10, 0.58),
@@ -979,6 +1000,8 @@ def _attach_controls(
 
     # ─── "x" key shortcut → Save position ───────────────────────────────
     def _save_pos_key_cb(obj, _event):
+        if not _window_focused[0]:
+            return
         try:
             key = obj.GetKeySym()
         except Exception:  # noqa: BLE001
@@ -1587,7 +1610,7 @@ def _attach_controls(
             states=["Water OFF", "Water ON"],
             c=["white", "white"],
             bc=["#22336e", "#3aa0ff"],
-            pos=(0.88, 0.76),
+            pos=(0.88, 0.73),
             size=14,
             bold=True,
         )
@@ -1764,7 +1787,7 @@ def _attach_controls(
             states=["Lames OFF", "Lames ON"],
             c=["white", "white"],
             bc=["#1a4f7a", "#4cc2ff"],
-            pos=(0.88, 0.80),
+            pos=(0.88, 0.77),
             size=14,
             bold=True,
         )
@@ -2125,9 +2148,9 @@ def _attach_controls(
     # Initialise per-species state and register one TimerEvent observer
     # per loaded species (no-ops while the species is hidden).
     _wind_button_layout = {
-        "o2":  {"pos": (0.88, 0.72), "labels": ["O Off",  "O₂ ON"],
+        "o2":  {"pos": (0.88, 0.69), "labels": ["O Off",  "O₂ ON"],
                 "bc":  ["#1a4f7a", "#e8f4ff"]},
-        "ch4": {"pos": (0.88, 0.68), "labels": ["CH Off", "CH₄ ON"],
+        "ch4": {"pos": (0.88, 0.65), "labels": ["CH Off", "CH₄ ON"],
                 "bc":  ["#4f3a1a", "#ffd470"]},
     }
     for _sp in ("o2", "ch4"):
@@ -2213,7 +2236,7 @@ def _attach_controls(
             states=[f"Wind \u25b8 {lbl}" for lbl in WIND_SPEED_LABELS],
             c=["white"] * 3,
             bc=["#0d47a1", "#1976d2", "#42a5f5"],
-            pos=(0.88, 0.64),
+            pos=(0.88, 0.44),
             size=14,
             bold=True,
         )
@@ -2416,36 +2439,86 @@ def _attach_controls(
 
                 # Subsample paths if stride > 1.
                 ds = max(1, int(data.get("_display_stride", 1)))
-                if ds > 1:
-                    id_list = vtk.vtkIdList()
-                    for cid in range(0, n_cells, ds):
-                        id_list.InsertNextId(cid)
-                    extract = vtk.vtkExtractCells()
-                    extract.SetInputData(pd)
-                    extract.SetCellList(id_list)
-                    extract.Update()
-                    geo = vtk.vtkGeometryFilter()
-                    geo.SetInputConnection(extract.GetOutputPort())
-                    geo.Update()
-                    pd = geo.GetOutput()
-                    logger.info(
-                        "Crown tracks strided to %d / %d polylines (stride=%d)",
-                        id_list.GetNumberOfIds(), n_cells, ds,
-                    )
 
                 # ── Spline interpolation (or load pre-splined cache) ─────
-                # When the pre-baked splined .vtp exists (ds == 1), load
-                # it directly to skip the vtkSplineFilter work that was
-                # causing the ~5s first-click delay.
+                # Prefer the pre-baked splined cache over running
+                # vtkSplineFilter at render time.  The cache covers all
+                # 20 000 paths; stride is applied *after* loading so
+                # polyline connectivity is always preserved.
                 splined_vtp_path = data.get("splined_vtp_path")
                 if (splined_vtp_path is not None
-                        and Path(splined_vtp_path).exists()
-                        and ds == 1):
+                        and Path(splined_vtp_path).exists()):
                     _t1 = _t.perf_counter()
                     rdr_spl = vtk.vtkXMLPolyDataReader()
                     rdr_spl.SetFileName(str(splined_vtp_path))
                     rdr_spl.Update()
                     pd_smooth = rdr_spl.GetOutput()
+                    _n_sm_full = pd_smooth.GetNumberOfCells()
+                    # Apply stride to the splined polydata via numpy so
+                    # polyline connectivity is kept intact.
+                    if ds > 1:
+                        _keep = np.arange(0, _n_sm_full, ds, dtype=np.intp)
+                        _pts_sm = vtk_to_numpy(
+                            pd_smooth.GetPoints().GetData()
+                        )
+                        _lines_sm = pd_smooth.GetLines()
+                        _off_sm   = vtk_to_numpy(
+                            _lines_sm.GetOffsetsArray()
+                        )
+                        _conn_sm  = vtk_to_numpy(
+                            _lines_sm.GetConnectivityArray()
+                        )
+                        # Build new connectivity for kept cells.
+                        _starts_k = _off_sm[_keep]
+                        _ends_k   = _off_sm[_keep + 1]
+                        _all_old  = np.concatenate(
+                            [_conn_sm[s:e]
+                             for s, e in zip(_starts_k, _ends_k)]
+                        )
+                        _uniq, _inv = np.unique(_all_old, return_inverse=True)
+                        _new_pts = _pts_sm[_uniq]
+                        _new_conn = _inv
+                        _new_off  = np.concatenate(
+                            ([0], np.cumsum(_ends_k - _starts_k))
+                        )
+                        _vtk_pts2 = vtk.vtkPoints()
+                        _vtk_pts2.SetData(
+                            numpy_to_vtk(_new_pts, deep=True)
+                        )
+                        _ca2 = vtk.vtkCellArray()
+                        _ca2.SetData(
+                            numpy_to_vtk(
+                                _new_off.astype(np.int64), deep=True,
+                                array_type=vtk.VTK_ID_TYPE,
+                            ),
+                            numpy_to_vtk(
+                                _new_conn.astype(np.int64), deep=True,
+                                array_type=vtk.VTK_ID_TYPE,
+                            ),
+                        )
+                        _pd_str = vtk.vtkPolyData()
+                        _pd_str.SetPoints(_vtk_pts2)
+                        _pd_str.SetLines(_ca2)
+                        # Carry over CellData arrays (e.g. tortuosity).
+                        for _ai in range(
+                            pd_smooth.GetCellData().GetNumberOfArrays()
+                        ):
+                            _src_arr = pd_smooth.GetCellData().GetArray(_ai)
+                            _sub_arr = numpy_to_vtk(
+                                vtk_to_numpy(_src_arr)[_keep], deep=True,
+                            )
+                            _sub_arr.SetName(_src_arr.GetName())
+                            _pd_str.GetCellData().AddArray(_sub_arr)
+                        _act_sc_arr = pd_smooth.GetCellData().GetScalars()
+                        _act_sc = (_act_sc_arr.GetName()
+                                   if _act_sc_arr is not None else None)
+                        if _act_sc:
+                            _pd_str.GetCellData().SetActiveScalars(_act_sc)
+                        pd_smooth = _pd_str
+                        logger.info(
+                            "Splined tracks strided to %d / %d paths (ds=%d)",
+                            len(_keep), _n_sm_full, ds,
+                        )
                     logger.info(
                         "Pre-splined crown tracks loaded in %.3fs  "
                         "(%d polylines, %d pts)",
@@ -2454,6 +2527,49 @@ def _attach_controls(
                         pd_smooth.GetNumberOfPoints(),
                     )
                 else:
+                    # No cache: apply stride first (numpy-based to preserve
+                    # polyline connectivity), then run vtkSplineFilter.
+                    if ds > 1:
+                        _keep_r = np.arange(0, n_cells, ds, dtype=np.intp)
+                        _pts_r  = vtk_to_numpy(pd.GetPoints().GetData())
+                        _off_r  = vtk_to_numpy(
+                            pd.GetLines().GetOffsetsArray()
+                        )
+                        _conn_r = vtk_to_numpy(
+                            pd.GetLines().GetConnectivityArray()
+                        )
+                        _s_r = _off_r[_keep_r]
+                        _e_r = _off_r[_keep_r + 1]
+                        _all_r = np.concatenate(
+                            [_conn_r[s:e] for s, e in zip(_s_r, _e_r)]
+                        )
+                        _u_r, _inv_r = np.unique(_all_r, return_inverse=True)
+                        _vp_r = vtk.vtkPoints()
+                        _vp_r.SetData(
+                            numpy_to_vtk(_pts_r[_u_r], deep=True)
+                        )
+                        _ca_r = vtk.vtkCellArray()
+                        _ca_r.SetData(
+                            numpy_to_vtk(
+                                np.concatenate(([0], np.cumsum(
+                                    _e_r - _s_r
+                                ))).astype(np.int64),
+                                deep=True, array_type=vtk.VTK_ID_TYPE,
+                            ),
+                            numpy_to_vtk(
+                                _inv_r.astype(np.int64), deep=True,
+                                array_type=vtk.VTK_ID_TYPE,
+                            ),
+                        )
+                        _pd_r = vtk.vtkPolyData()
+                        _pd_r.SetPoints(_vp_r)
+                        _pd_r.SetLines(_ca_r)
+                        pd = _pd_r
+                        logger.info(
+                            "Crown tracks strided to %d / %d polylines "
+                            "(stride=%d, numpy path)",
+                            len(_keep_r), n_cells, ds,
+                        )
                     spline = vtk.vtkSplineFilter()
                     spline.SetInputData(pd)
                     spline.SetSubdivideToSpecified()
@@ -2736,44 +2852,76 @@ def _attach_controls(
                     0, N_BINS - 1,
                 )
 
+                # Pre-extract tortuosity values as a plain numpy array so
+                # the bin loop can slice them cheaply.
+                _cell_pt_starts = offs_sm[:-1]    # (n_cells,)
+                _cell_pt_counts = np.diff(offs_sm) # (n_cells,)
+                _tort_arr_np = None
+                if _tort_lut is not None:
+                    _t_arr_vtk = pd_smooth.GetCellData().GetArray("tortuosity")
+                    if _t_arr_vtk is not None:
+                        _tort_arr_np = vtk_to_numpy(_t_arr_vtk).astype(np.float32)
+
                 line_bin_actors: list = []
                 for bi in range(N_BINS):
                     ids = np.where(cell_bin == bi)[0]
                     if len(ids) == 0:
                         continue
-                    id_list = vtk.vtkIdList()
-                    id_list.SetNumberOfIds(len(ids))
-                    for k, cid in enumerate(ids):
-                        id_list.SetId(k, int(cid))
-                    extr = vtk.vtkExtractCells()
-                    extr.SetInputData(pd_smooth)
-                    extr.SetCellList(id_list)
-                    extr.Update()
-                    geo = vtk.vtkGeometryFilter()
-                    geo.SetInputConnection(extr.GetOutputPort())
-                    geo.Update()
-                    sub = geo.GetOutput()
-                    a = _vedo.Mesh(sub)
+                    # Build sub-polydata directly from numpy arrays.
+                    # This avoids vtkExtractCells (which can reject vtkPolyData
+                    # input in some VTK builds) + vtkGeometryFilter entirely.
+                    sel_starts = _cell_pt_starts[ids]
+                    sel_counts = _cell_pt_counts[ids]
+                    flat_idx = np.concatenate([
+                        conn_sm[int(s):int(s) + int(c)]
+                        for s, c in zip(sel_starts, sel_counts)
+                    ])
+                    vtk_sub_pts = vtk.vtkPoints()
+                    vtk_sub_pts.SetData(
+                        numpy_to_vtk(pts_sm[flat_idx].astype(np.float64),
+                                     deep=True, array_type=vtk.VTK_DOUBLE)
+                    )
+                    # VTK legacy cell-array format: [n0,p0,p1,..., n1,p0,p1,...]
+                    _parts: list = []
+                    _off = 0
+                    for _nc in sel_counts.tolist():
+                        _parts.append(_nc)
+                        _parts.extend(range(_off, _off + _nc))
+                        _off += _nc
+                    _vtk_ids = numpy_to_vtk(
+                        np.array(_parts, dtype=np.int64),
+                        deep=True, array_type=vtk.VTK_ID_TYPE,
+                    )
+                    ca_sub = vtk.vtkCellArray()
+                    ca_sub.SetCells(len(ids), _vtk_ids)
+                    sub_pd = vtk.vtkPolyData()
+                    sub_pd.SetPoints(vtk_sub_pts)
+                    sub_pd.SetLines(ca_sub)
+                    if _tort_arr_np is not None:
+                        _tort_sub = numpy_to_vtk(
+                            _tort_arr_np[ids], deep=True,
+                            array_type=vtk.VTK_FLOAT,
+                        )
+                        _tort_sub.SetName("tortuosity")
+                        sub_pd.GetCellData().AddArray(_tort_sub)
+                        sub_pd.GetCellData().SetActiveScalars("tortuosity")
+                    _mp = vtk.vtkPolyDataMapper()
+                    _mp.SetInputData(sub_pd)
                     if _tort_lut is not None:
-                        _sub_cd = sub.GetCellData()
-                        if _sub_cd.GetArray("tortuosity") is not None:
-                            _sub_cd.SetActiveScalars("tortuosity")
-                        mm = a.mapper()
-                        mm.SetLookupTable(_tort_lut)
-                        mm.SetScalarRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
-                        mm.ScalarVisibilityOn()
-                        mm.SetColorModeToMapScalars()
+                        _mp.SetLookupTable(_tort_lut)
+                        _mp.SetScalarRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
+                        _mp.ScalarVisibilityOn()
+                        _mp.SetColorModeToMapScalars()
                     else:
-                        try:
-                            a.mapper().ScalarVisibilityOff()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        a.c(WATER_RGB)
-                    a.lw(TRACK_LINE_WIDTH_INTERACTOR).alpha(0.40)
-                    try:
-                        a.lighting("off")
-                    except Exception:  # noqa: BLE001
-                        pass
+                        _mp.ScalarVisibilityOff()
+                    a = vtk.vtkActor()
+                    a.SetMapper(_mp)
+                    _prop = a.GetProperty()
+                    if _tort_lut is None:
+                        _prop.SetColor(*WATER_RGB)
+                    _prop.SetLineWidth(TRACK_LINE_WIDTH_INTERACTOR)
+                    _prop.SetOpacity(0.40)
+                    _prop.LightingOff()
                     a.name = f"track_lines_bin_{bi}"
                     a._bin_idx = bi
                     a._base_alpha = 0.40
@@ -2898,7 +3046,12 @@ def _attach_controls(
                             try:
                                 a.alpha(a._base_alpha * mult)
                             except Exception:  # noqa: BLE001
-                                pass
+                                try:
+                                    a.GetProperty().SetOpacity(
+                                        a._base_alpha * mult
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
 
                 tag = plt.renderer.GetActiveCamera().AddObserver(
                     "ModifiedEvent", _update_bins
@@ -2929,7 +3082,11 @@ def _attach_controls(
                 pass
             return act
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not build tracks curves actor: %s", exc)
+            import traceback as _tb
+            logger.warning(
+                "Could not build tracks curves actor: %s\n%s",
+                exc, _tb.format_exc(),
+            )
             return None
 
     def _rebuild_grid_arrows():
@@ -3215,10 +3372,10 @@ def _attach_controls(
         }
         _btn_inactive_bg = "#263238"      # darker neutral
         _btn_label = {
-            "mesh_bridges":  "Mesh ▸ Cortical bridges",
+            "mesh_bridges":  "Mesh ▸ Cortical bridges   ",
             "mesh_all":      "Mesh ▸ All watered tissues",
-            "arrows_grid":   "Arrows ▸ grid",
-            "arrows_dual":   "Arrows ▸ water ⊕ air",
+            "arrows_grid":   "Arrows ▸ grid             ",
+            "arrows_dual":   "Arrows ▸ water ⊕ air     ",
             "arrows_tracks": "Conduction ▸ shorter paths",
         }
 
@@ -3283,7 +3440,7 @@ def _attach_controls(
             states=["Arrow color ▸ Angle", "Arrow color ▸ Convergence"],
             c=["white", "white"],
             bc=["#283593", "#bf360c"],
-            pos=(0.88, 0.64),
+            pos=(0.88, 0.40),
             size=14,
             bold=True,
         )
@@ -3501,7 +3658,7 @@ def _attach_controls(
             states=["Colormap ▸ off", "Colormap ▸ density", "Colormap ▸ radial grad."],
             c=["white", "white", "white"],
             bc=["#263238", "#0277bd", "#6a1b9a"],
-            pos=(0.88, 0.31),
+            pos=(0.88, 0.40),
             size=14,
             bold=True,
         )
@@ -3878,7 +4035,7 @@ def _attach_controls(
 
     _restart_nav_btn_ref[0] = plt.add_button(
         _restart_nav_cb,
-        states=["Restart navigation"],
+        states=["Restart navigation        "],
         c=["white"],
         bc=["#4527a0"],   # deep indigo, distinct from the STOP red
         pos=(0.10, 0.54),
@@ -3937,7 +4094,9 @@ def _attach_controls(
 
     _nav_mode_btn_ref[0] = plt.add_button(
         _cycle_nav_mode_cb,
-        states=_NAV_MODE_NAMES,
+        states=["Airplane mode             ",
+                "Space probe mode          ",
+                "Custom moves              "],
         c=["white"] * len(_NAV_MODE_NAMES),
         bc=["#1565c0", "#0d47a1", "#455a64"],
         pos=(0.10, 0.46),
@@ -4008,6 +4167,8 @@ def _attach_controls(
     # increment (great for micro-tissue), a long hold lets speed grow
     # toward MAX_FWD (good for scene traversal).
     _PLANE_MAX_ACCEL    = _PLANE_MAX_FWD / 3.0  # reach MAX_FWD in ≈3 s continuous hold
+    _PLANE_MAX_BWD      = _PLANE_MAX_FWD        # same max speed in reverse
+    _PLANE_BCK_DELAY_S  = 1.0                   # s — hold brake at ~0 speed before reverse kicks in
     _PLANE_TAU_FWD_A_ATK = 1.80   # s — accel ramps up while z held
     _PLANE_TAU_FWD_A_REL = 0.08   # s — accel snaps to 0 on release (vel holds)
     _PLANE_TAU_BRAKE     = 0.22   # s — velocity kill while s held
@@ -4045,12 +4206,13 @@ def _attach_controls(
     _PLANE_A_EPS = _PLANE_MAX_ACCEL / 1000.0
 
     _plane = {
-        "fwd_v":   0.0,   # forward velocity (units/s)  — persists on release
-        "fwd_a":   0.0,   # forward acceleration (units/s²) — pilot's control lever
-        "v_yaw":   0.0,   # angular velocities (deg/s)
-        "v_pitch": 0.0,
-        "v_roll":  0.0,
-        "last_t":  None,
+        "fwd_v":     0.0,   # forward velocity (units/s)  — persists on release
+        "fwd_a":     0.0,   # forward acceleration (units/s²) — pilot's control lever
+        "v_yaw":     0.0,   # angular velocities (deg/s)
+        "v_pitch":   0.0,
+        "v_roll":    0.0,
+        "last_t":    None,
+        "bck_hold_t": None,  # perf_counter timestamp when bck was first held at ~0 speed
     }
 
     # Per-intent "currently held" flag (True while the user is actively
@@ -4278,19 +4440,41 @@ def _attach_controls(
             return cur + (target - cur) * (1.0 - _math_plane.exp(-dt / tau))
 
         if bck_h:
-            # Hard brake: kill acceleration, exponentially decay velocity.
-            _plane["fwd_a"] = 0.0
-            _plane["fwd_v"] = _expd(_plane["fwd_v"], 0.0, _PLANE_TAU_BRAKE)
+            if _plane["fwd_v"] > _PLANE_V_EPS:
+                # Still moving forward: brake as usual, reset rear timer.
+                _plane["fwd_a"] = 0.0
+                _plane["fwd_v"] = _expd(_plane["fwd_v"], 0.0, _PLANE_TAU_BRAKE)
+                _plane["bck_hold_t"] = None
+            else:
+                # At rest (or already reversing): count how long bck is held.
+                if _plane["bck_hold_t"] is None:
+                    _plane["bck_hold_t"] = now
+                if now - _plane["bck_hold_t"] >= _PLANE_BCK_DELAY_S:
+                    # Rear-acceleration: mirror of forward, clamp to -MAX_BWD.
+                    _plane["fwd_a"] = 0.0
+                    _plane["fwd_v"] = max(
+                        -_PLANE_MAX_BWD,
+                        _plane["fwd_v"] - _PLANE_MAX_ACCEL * dt,
+                    )
+                else:
+                    # Still in 1-second delay: hold at zero.
+                    _plane["fwd_v"] = 0.0
+                    _plane["fwd_a"] = 0.0
         else:
-            # Acceleration lever: ramps up while fwd held, snaps to 0 on
-            # release — velocity is *not* touched, it holds at current value.
-            target_a = _PLANE_MAX_ACCEL if fwd_h else 0.0
-            tau_a    = _PLANE_TAU_FWD_A_ATK if fwd_h else _PLANE_TAU_FWD_A_REL
-            _plane["fwd_a"] = _expd(_plane["fwd_a"], target_a, tau_a)
-            _plane["fwd_v"] = max(
-                0.0,
-                min(_plane["fwd_v"] + _plane["fwd_a"] * dt, _PLANE_MAX_FWD),
-            )
+            _plane["bck_hold_t"] = None
+            if fwd_h and _plane["fwd_v"] < -_PLANE_V_EPS:
+                # Moving backward: fwd press = reverse-brake (decay toward 0).
+                _plane["fwd_a"] = 0.0
+                _plane["fwd_v"] = _expd(_plane["fwd_v"], 0.0, _PLANE_TAU_BRAKE)
+            else:
+                # Normal forward acceleration (from rest or forward motion).
+                target_a = _PLANE_MAX_ACCEL if fwd_h else 0.0
+                tau_a    = _PLANE_TAU_FWD_A_ATK if fwd_h else _PLANE_TAU_FWD_A_REL
+                _plane["fwd_a"] = _expd(_plane["fwd_a"], target_a, tau_a)
+                _plane["fwd_v"] = max(
+                    0.0,
+                    min(_plane["fwd_v"] + _plane["fwd_a"] * dt, _PLANE_MAX_FWD),
+                )
 
         # ── 4. Integrate rotation velocities ─────────────────────────
         _plane["v_yaw"]   = _expd(_plane["v_yaw"],   target_yaw,
@@ -4504,8 +4688,8 @@ def _attach_controls(
                 try:
                     _spd_um_s = _plane["fwd_v"] * _VOXEL_SIZE_UM
                     _spd_text = (
-                        f"Travelling speed:  {_spd_um_s:.1f} um/s"
-                        if _spd_um_s > 0.1 else ""
+                        f"Travelling speed:  {abs(_spd_um_s):.1f} um/s  {'(reverse)' if _spd_um_s < -0.1 else ''}".rstrip()
+                        if abs(_spd_um_s) > 0.1 else ""
                     )
                     _info_panel.update(_current_subtitle[0], _spd_text)
                 except Exception:  # noqa: BLE001
@@ -4838,7 +5022,7 @@ def _attach_controls(
         states=["Gauges ▸ off", "Gauges ▸ on"],
         c=["#9e9e9e", "white"],
         bc=["#263238", "#00695c"],
-        pos=(0.88, 0.43),
+        pos=(0.88, 0.48),
         size=14,
         bold=True,
     )
@@ -4855,7 +5039,7 @@ def _attach_controls(
             states=["Pillars ▸ off", "Pillars ▸ on"],
             c=["#9e9e9e", "white"],
             bc=["#263238", "#00695c"],
-            pos=(0.88, 0.38),
+            pos=(0.88, 0.61),
             size=14,
             bold=True,
         )
@@ -4925,6 +5109,8 @@ def _attach_controls(
         # "Avion + keyboard armed + Navigation interaction style".
         # That keeps VTK / vedo default key handling and all other
         # interaction modes completely unaffected.
+        if not _window_focused[0]:
+            return
         if not _keyboard_on[0]:
             return
         if style_state["idx"] != style_state["custom_idx"]:
@@ -4975,6 +5161,8 @@ def _attach_controls(
         # Mirror of _avion_keypress_cb: schedule a deferred release for
         # the matching intent.  The grace period in _plane_key_release
         # filters X11's autorepeat fake-releases.
+        if not _window_focused[0]:
+            return
         if not _keyboard_on[0]:
             return
         if style_state["idx"] != style_state["custom_idx"]:
@@ -5114,6 +5302,8 @@ def _attach_controls(
 
     # ─── Enter key → Restart navigation (respawn) ───────────────────────
     def _enter_keypress_cb(obj, _event):
+        if not _window_focused[0]:
+            return
         try:
             key = obj.GetKeySym()
         except Exception:  # noqa: BLE001
@@ -5244,6 +5434,16 @@ def _attach_controls(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Global mouse sink could not attach: %s", exc)
 
+    # ── Register window focus observers ──────────────────────────────────
+    _iren_focus = getattr(plt, "interactor", None)
+    if _iren_focus is not None:
+        try:
+            _iren_focus.AddObserver("FocusInEvent",  _on_focus_in)
+            _iren_focus.AddObserver("FocusOutEvent", _on_focus_out)
+            logger.info("Window focus tracking registered (FocusIn/FocusOut).")
+        except Exception as _fe:  # noqa: BLE001
+            logger.warning("Could not register focus observers: %s", _fe)
+
     # ─── Fog (depth) + SSAO toggles ─────────────────────────────────────
     # Both are GPU effects driven from the bottom-right button column.
     # They are independent and either / both / none may be active.
@@ -5341,7 +5541,7 @@ def _attach_controls(
         states=["Fog ▸ off", "Fog ▸ on"],
         c=["#9e9e9e", "white"],
         bc=["#263238", "#1976d2"],
-        pos=(0.88, 0.27),
+        pos=(0.88, 0.36),
         size=14,
         bold=True,
     )
@@ -5434,7 +5634,7 @@ def _attach_controls(
         states=["SSAO ▸ off", "SSAO ▸ on"],
         c=["#9e9e9e", "white"],
         bc=["#263238", "#6a1b9a"],
-        pos=(0.88, 0.23),
+        pos=(0.88, 0.32),
         size=14,
         bold=True,
     )
@@ -5463,7 +5663,7 @@ def _attach_controls(
         states=["Axis OFF", "Axis ON"],
         c=["#9e9e9e", "white"],
         bc=["#263238", "#006064"],
-        pos=(0.88, 0.35),
+        pos=(0.88, 0.28),
         size=14,
         bold=True,
     )
@@ -5530,6 +5730,104 @@ def _attach_controls(
             )
     except Exception as _wu_exc:  # noqa: BLE001
         logger.warning("Shader warmup failed (non-fatal): %s", _wu_exc)
+
+    # ─── Mini-game: Catch the Flux  [key: G] ─────────────────────────────
+    # Press 'G' to start a 2-minute lame-surfing run.
+    # The water-front animation plays; fly into each step's bounding volume
+    # to «catch» it.  Score = number of distinct lame steps intercepted.
+    # Re-pressing 'G' while a game is running is a no-op.
+    _game_ref: list = [None]
+    _has_lames = lames_state.get("n_steps", 0) > 0
+
+    def _game_key_cb(obj, _event) -> None:
+        if not _window_focused[0]:
+            return
+        try:
+            key = obj.GetKeySym()
+        except Exception:  # noqa: BLE001
+            return
+        if key not in ("g", "G"):
+            return
+        if lames_state.get("n_steps", 0) <= 0:
+            return
+        try:
+            from marvel_view.scripts.games.catch_flux import CatchFluxGame
+            if _game_ref[0] is None or not _game_ref[0]._running:
+                _data_id = getattr(mesh, "name", None) or "unknown"
+                _game_ref[0] = CatchFluxGame(
+                    plt, lames_state,
+                    packed_pd=_lames_pd,
+                    start_lames=_lames_start_timer,
+                    stop_lames=_lames_stop_timer,
+                    data_id=_data_id,
+                )
+                _game_ref[0].start()
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("CatchFluxGame could not start: %s", _exc)
+        # Consume key — prevent vedo defaults from also firing
+        try:
+            cmd = obj.GetCommand(_game_kp_tag[0])
+            if cmd is not None:
+                cmd.AbortFlagOn()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            obj.SetKeySym("")
+        except Exception:  # noqa: BLE001
+            pass
+
+    _game_kp_tag: list = [None]
+    if _has_lames:
+        _iren_gk = getattr(plt, "interactor", None)
+        if _iren_gk is not None:
+            try:
+                _game_kp_tag[0] = _iren_gk.AddObserver(
+                    "KeyPressEvent", _game_key_cb, 1.0,
+                )
+                logger.info("CatchFluxGame: 'G' key registered.")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CatchFluxGame key hook failed: %s", exc)
+
+    # ── AerenQuest launcher ──────────────────────────────────────────────────
+    _aerenquest_launcher: list = [None]
+    _aerenquest_game_context: dict = {
+        "repo_root":                   _REPO_ROOT,
+        "lames_state":                 lames_state,
+        "lames_start_timer":           _lames_start_timer,
+        "lames_stop_timer":            _lames_stop_timer,
+        "lames_pd":                    _lames_pd,
+        "data_id":                     getattr(mesh, "name", None) or "unknown",
+        "controls_img_actors":         _controls_img_actors,
+        "nav_mode":                    _nav_mode,
+        "style_state":                 style_state,
+        "apply_style":                 _apply_style,
+        "refresh_nav_panel_visibility": _refresh_nav_panel_visibility,
+        # Layer-1 overlay objects hidden during game mode
+        "info_panel":                  _info_panel,
+        "ortho_overlay":               ortho_overlay,
+    }
+
+    def _aerenquest_cb(*_a, **_kw):
+        try:
+            from marvel_view.scripts.AerenQuest.launcher import AerenQuestLauncher
+            if _aerenquest_launcher[0] is None:
+                _aerenquest_launcher[0] = AerenQuestLauncher(
+                    plt, mesh, _aerenquest_game_context,
+                )
+            _aerenquest_launcher[0].open()
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("AerenQuest launcher failed: %s", _exc)
+
+    plt.add_button(
+        _aerenquest_cb,
+        states=["AerenQuest"],
+        c=["black"],
+        bc=["#FFD700"],   # gold
+        pos=(0.88, 0.18),
+        size=14,
+        bold=True,
+    )
+    logger.info("AerenQuest button added.")
 
     # ── FPS/speed HUD: hook to VTK EndEvent so it fires on every render,
     # including trackball mouse-drag renders that bypass the master timer.

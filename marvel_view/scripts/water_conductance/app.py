@@ -57,7 +57,7 @@ logger = logging.getLogger("marvel_view.water_conductance")
 # Constants, CLI, pipeline (build/cache helpers) and styling helpers were
 # split into sibling modules to keep this file focused on the viewer.
 from .constants import *  # noqa: F401,F403  (re-exported for backward compat)
-from .constants import _SHADING_MODES  # not exported by * (leading underscore)
+from .constants import _DATA_BASE, _SHADING_MODES  # not exported by * (leading underscore)
 from .cli import parse_args  # noqa: F401
 from .pipeline import (  # noqa: F401
     _build_mesh,
@@ -682,7 +682,7 @@ def _attach_controls(
         states=["Deactivate mouse trackball", "Activate mouse trackball  "],
         c=["white", "white"],
         bc=["#2e7d32", "#455a64"],
-        pos=(0.10, 0.50),
+        pos=(0.10, 0.255),
         size=14,
         bold=True,
     )
@@ -980,7 +980,7 @@ def _attach_controls(
         states=["Save position             "],
         c=["white"],
         bc=["#00838f"],
-        pos=(0.10, 0.58),
+        pos=(0.10, 0.335),
         size=14,
         bold=True,
     )
@@ -989,7 +989,7 @@ def _attach_controls(
     import vedo as _vedo_sp
     _save_feedback = _vedo_sp.Text2D(
         "",
-        pos=(0.10, 0.625),
+        pos=(0.10, 0.352),
         c="white",
         bg="#00838f",
         alpha=0.0,
@@ -1104,12 +1104,12 @@ def _attach_controls(
         except Exception as exc:  # noqa: BLE001
             logger.debug("_update_orient_text failed: %s", exc)
 
-    # YPR readout Text2D – right of the axes widget, just below the ortho panel.
+    # YPR readout Text2D – right of the axes widget, in the nav-panel area.
     try:
         import vedo as _vedo_orient
         _orient_state["text2d"] = _vedo_orient.Text2D(
             "YAW     ---\nPITCH   ---\nROLL    ---",
-            pos=(0.205, 0.435),
+            pos=(0.205, 0.335),
             s=0.90,
             c="lime",
             bg="black",
@@ -1134,7 +1134,7 @@ def _attach_controls(
                 _cow.SetParentRenderer(_ren_ow)
                 _rep_cow = _cow.GetRepresentation()
                 if _rep_cow is not None:
-                    _rep_cow.SetViewport(0.01, 0.23, 0.20, 0.44)
+                    _rep_cow.SetViewport(0.01, 0.21, 0.18, 0.34)
                 _cow.EnabledOff()
                 _orient_state["widget"] = _cow
                 logger.info("vtkCameraOrientationWidget created.")
@@ -1148,7 +1148,7 @@ def _attach_controls(
                     _omw = _vtk_orient.vtkOrientationMarkerWidget()
                     _omw.SetOrientationMarker(_axes_actor)
                     _omw.SetInteractor(_iren_ow)
-                    _omw.SetViewport(0.01, 0.23, 0.20, 0.44)
+                    _omw.SetViewport(0.01, 0.21, 0.18, 0.34)
                     _omw.SetEnabled(0)
                     _omw.InteractiveOff()
                     _orient_state["widget"] = _omw
@@ -3478,13 +3478,61 @@ def _attach_controls(
     _cbar_tortuosity = None
     try:
         from marvel_view.visualization.colormap_bar import ColormapBar2D  # noqa: PLC0415
+        # ── Horizontal colormaps below the ortho panel ──────────────────
+        # Positioned with normalised-display rectangles (resize-robust).
+        #
+        # Layout — ortho panel ALWAYS at y=[0.50, 1.00] (top-left, fixed).
+        # Everything below fits in the bottom 50% (x=[0%, 40%]):
+        #
+        #   y=0.50 ── ortho panel bottom
+        #   y=0.490 ─ water/single bar top   (1% gap)
+        #   y=0.430 ─ water bar bottom       (height 6%)
+        #   y=0.425 ─ air bar top            (0.5% gap)
+        #   y=0.365 ─ air bar bottom         (height 6%)
+        #              ~1.5% gap
+        #   y=0.335 ─ save_pos btn
+        #   y=0.295 ─ restart_nav btn
+        #   y=0.255 ─ style (trackball) btn
+        #   y=0.215 ─ nav_mode btn
+        #              gap
+        #   y=0.020 ─ controls image bottom  (~18% tall at 16:9)
+        #
+        # x range: 0.01 → 0.39
+        _CBAR_X0   = 0.01
+        _CBAR_X1   = 0.39
+        _CBAR_H    = 0.060          # normalised height of one bar
+        _CBAR_GAP  = 0.010          # gap below ortho panel bottom
+        _CBAR_SEP  = 0.005          # gap between the two stacked bars
+        _ORTHO_Y   = 0.50           # ortho panel bottom = colormap band top
+        _rect_top = (
+            _CBAR_X0,
+            _ORTHO_Y - _CBAR_GAP - _CBAR_H,          # bottom of upper bar
+            _CBAR_X1,
+            _ORTHO_Y - _CBAR_GAP,                     # top   of upper bar
+        )
+        _rect_bot = (
+            _CBAR_X0,
+            _rect_top[1] - _CBAR_SEP - _CBAR_H,      # bottom of lower bar
+            _CBAR_X1,
+            _rect_top[1] - _CBAR_SEP,                 # top   of lower bar
+        )
+        # bar_h controls the number of gradient samples in the PIL image;
+        # 500 is more than enough for a smooth ramp at any window width.
+        _cbar_kwargs = dict(
+            horizontal=True,
+            bar_w=16,
+            bar_h=500,
+            title_h=20,
+            pad=6,
+        )
         if _density_has_data:
             _cbar_density = ColormapBar2D(
                 plt,
                 cmap="viridis",
                 vmin=0.0, vmax=1.0,
                 title="Density",
-                pos=(0.87, 0.30),
+                rect=_rect_top,
+                **_cbar_kwargs,
             )
             _cbar_density.set_visible(False)
         if _radial_has_data:
@@ -3493,16 +3541,18 @@ def _attach_controls(
                 cmap="coolwarm",
                 vmin=-1.0, vmax=1.0,
                 title="Slope of radial density",
-                pos=(0.87, 0.30),
+                rect=_rect_top,
+                **_cbar_kwargs,
             )
             _cbar_radial.set_visible(False)
-        # Arrows-dual colorbars (water + air) — stacked on the right.
+        # Arrows-dual colorbars (water above, air below).
         _cbar_water = ColormapBar2D(
             plt,
             cmap=_WATER_CMAP_STOPS,
             vmin=0.0, vmax=1.0,
             title="Water bridge orientation",
-            pos=(0.87, 0.52),
+            rect=_rect_top,
+            **_cbar_kwargs,
         )
         _cbar_water.set_visible(False)
         _cbar_air = ColormapBar2D(
@@ -3510,7 +3560,8 @@ def _attach_controls(
             cmap=_AIR_CMAP_STOPS,
             vmin=0.0, vmax=1.0,
             title="Gas diffusion",
-            pos=(0.87, 0.12),
+            rect=_rect_bot,
+            **_cbar_kwargs,
         )
         _cbar_air.set_visible(False)
         # Tracks view tortuosity colorbar.
@@ -3519,7 +3570,8 @@ def _attach_controls(
             cmap=TORTUOSITY_CMAP_STOPS,
             vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
             title="Tortuosity",
-            pos=(0.87, 0.30),
+            rect=_rect_top,
+            **_cbar_kwargs,
         )
         _cbar_tortuosity.set_visible(False)
     except Exception as _cbar_exc:  # noqa: BLE001
@@ -4038,7 +4090,7 @@ def _attach_controls(
         states=["Restart navigation        "],
         c=["white"],
         bc=["#4527a0"],   # deep indigo, distinct from the STOP red
-        pos=(0.10, 0.54),
+        pos=(0.10, 0.295),
         size=14,
         bold=True,
     )
@@ -4099,7 +4151,7 @@ def _attach_controls(
                 "Custom moves              "],
         c=["white"] * len(_NAV_MODE_NAMES),
         bc=["#1565c0", "#0d47a1", "#455a64"],
-        pos=(0.10, 0.46),
+        pos=(0.10, 0.215),
         size=14,
         bold=True,
     )
@@ -4851,7 +4903,7 @@ def _attach_controls(
                     return str(_cp)
         return None
 
-    _CTRL_IMG_NRM_W = 0.40 / 1.7  # normalised-viewport width of the controls image
+    _CTRL_IMG_NRM_W = (0.40 / 1.7) * 0.75  # normalised-viewport width of the controls image (×0.75)
     # src_h/src_w stored per mode so Position2 can be recalculated on resize.
     _ctrl_img_aspects: dict = {}  # mode_index → float
 
@@ -5797,6 +5849,13 @@ def _attach_controls(
         "lames_stop_timer":            _lames_stop_timer,
         "lames_pd":                    _lames_pd,
         "data_id":                     getattr(mesh, "name", None) or "unknown",
+        "data_path":                   _DATA_BASE,
+        "cbar_objects": [
+            x for x in [
+                _cbar_density, _cbar_radial,
+                _cbar_water, _cbar_air, _cbar_tortuosity,
+            ] if x is not None
+        ],
         "controls_img_actors":         _controls_img_actors,
         "nav_mode":                    _nav_mode,
         "style_state":                 style_state,
@@ -5951,7 +6010,10 @@ def main(argv: list[str] | None = None) -> int:
             from marvel_view.visualization.ortho_panel import OrthoPanelOverlay
             ortho_overlay = OrthoPanelOverlay(
                 plt, raw_volume,
-                viewport=(0.0, 0.5, 0.4, 1.0),  # top-left, ~40% wide × 50% tall
+                # viewport y-span = 0.5 → cell = target_h//2 = h/4
+                # → panel_h = h/2 → ny = 1.0 - 0.5 = 0.50 always.
+                # The panel is always pinned to y=[0.50, 1.00] (top-left).
+                viewport=(0.0, 0.5, 0.4, 1.0),
                 cell_pixels=224,
             )
             # Refresh on standard mouse interactions too.

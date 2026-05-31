@@ -1360,7 +1360,8 @@ def _write_splined_tracks_vtp(
     splined_vtp_path: Path,
     *,
     n_subdivisions: int = 64,
-    dp_epsilon: float = 1.0,
+    dp_epsilon: float = 1.5,
+    spline_tension: float = 0.3,
 ) -> None:
     """Read the raw polylines VTP, simplify with Douglas-Peucker, run
     ``vtkSplineFilter`` and write the result as a binary ``.vtp`` cache.
@@ -1439,11 +1440,11 @@ def _write_splined_tracks_vtp(
         )
         pd_raw = pd_dp
 
-    # Use Kochanek spline with moderate tension (0.5) to limit overshoot at
-    # sharp turns while keeping smooth curves between D-P skeleton points.
-    # Tension=0 is Catmull-Rom (can overshoot); tension=1 is fully linear.
+    # Use Kochanek spline to limit overshoot at sharp turns while keeping
+    # smooth curves between D-P skeleton points.
+    # Tension=0 is Catmull-Rom (rounder, can overshoot); tension=1 is linear.
     _ksp = vtk.vtkKochanekSpline()
-    _ksp.SetDefaultTension(0.5)
+    _ksp.SetDefaultTension(spline_tension)
     spl = vtk.vtkSplineFilter()
     spl.SetSpline(_ksp)
     spl.SetInputData(pd_raw)

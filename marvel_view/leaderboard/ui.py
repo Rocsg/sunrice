@@ -98,6 +98,20 @@ class NameEntry:
         key_char = obj.GetKeyCode()
 
         if key_sym in ("Return", "KP_Enter"):
+            # Consume BEFORE _finish() removes the observer tag — otherwise
+            # the abort code below would call GetCommand(None) and the Enter
+            # event would leak to the next observer (e.g. a freshly-registered
+            # end-screen handler that would restart the just-finished game).
+            try:
+                cmd = obj.GetCommand(self._observer_tag)
+                if cmd is not None:
+                    cmd.AbortFlagOn()
+            except Exception:
+                pass
+            try:
+                obj.SetKeySym("")
+            except Exception:
+                pass
             self._finish()
             return
         if key_sym == "BackSpace":

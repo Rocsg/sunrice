@@ -441,6 +441,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Where to write the pre-splined polylines .vtp (64 "
                         "subdivisions).  When present the viewer and movie "
                         "skip the vtkSplineFilter step at load time.")
+    p.add_argument("--dp-epsilon", type=float, default=1.5,
+                   help="Douglas-Peucker epsilon (voxels) for staircase "
+                        "simplification before splining.  Larger values "
+                        "remove more near-collinear control points.  "
+                        "(default: 1.5)")
+    p.add_argument("--spline-tension", type=float, default=0.3,
+                   help="Kochanek spline tension: 0=Catmull-Rom (rounder), "
+                        "1=linear (tightest).  Lower values give smoother "
+                        "curves between skeleton points.  (default: 0.3)")
     p.add_argument("--tracks-only", action="store_true",
                    help="Skip every step except the crown-tracks build "
                         "(equivalent to all --skip-* flags except --skip-tracks). "
@@ -1225,7 +1234,11 @@ def main(argv: list[str] | None = None) -> int:
                             "(use --force to overwrite).", splined_vtp_path,
                         )
                     else:
-                        _write_splined_tracks_vtp(vtp_path, splined_vtp_path)
+                        _write_splined_tracks_vtp(
+                            vtp_path, splined_vtp_path,
+                            dp_epsilon=args.dp_epsilon,
+                            spline_tension=args.spline_tension,
+                        )
     elif args.tracks_vtp_from_cache:
         # ── VTP-only rebuild from existing .npz (no Dijkstra re-run) ──
         import numpy as np
@@ -1278,7 +1291,11 @@ def main(argv: list[str] | None = None) -> int:
                 "(use --force to overwrite).", splined_vtp_path_fc,
             )
             return 2
-        _write_splined_tracks_vtp(vtp_path, splined_vtp_path_fc)
+        _write_splined_tracks_vtp(
+            vtp_path, splined_vtp_path_fc,
+            dp_epsilon=args.dp_epsilon,
+            spline_tension=args.spline_tension,
+        )
         logger.info("VTP-from-cache rebuild complete.")
     else:
         logger.info("Skipping crown tracks build (--skip-tracks).")

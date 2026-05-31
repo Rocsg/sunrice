@@ -549,7 +549,9 @@ class CatchFluxGame:
             pass
 
     # ── end of game ───────────────────────────────────────────────────────────
-
+    def abort(self) -> None:
+        """Abort the game immediately (e.g. user pressed Escape)."""
+        self._end(victory=False)
     def _end(self, *, victory: bool = False, _skip_callback: bool = False) -> None:
         if not self._running:
             return

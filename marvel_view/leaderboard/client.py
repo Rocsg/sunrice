@@ -54,6 +54,7 @@ GAME_REGISTRY: dict[str, dict] = {
     "le_messager":     {"label": "Le Messager",      "score_type": "time_asc"},
     "cross_the_beast": {"label": "Cross the Beast",  "score_type": "time_asc"},
     "catch_flux":      {"label": "Catch the Flux",    "score_type": "points_desc"},
+    "safari_photo":    {"label": "Safari Photo",      "score_type": "points_desc"},
     "circuit":         {"label": "Circuit",           "score_type": "time_asc"},
     "the_savior":      {"label": "The Savior",        "score_type": "time_asc"},
     # Suggested extras

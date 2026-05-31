@@ -87,7 +87,9 @@ class AerenQuestLauncher:
         # Active game reference and info
         self._game_ref: list = [None]
         self._current_game_info: Optional[dict] = None
-        self._precomputed_game = None   # game pre-created during countdown
+        self._precomputed_game    = None   # game pre-created during countdown
+        self._freeform_mode      = False  # True while a freeform game is active
+        self._game_escape_obs_tag: Optional[int] = None
 
     # ─────────────────────────────────────────────── public entry point ───────
 
@@ -133,6 +135,37 @@ class AerenQuestLauncher:
 
     # ──────────────────────────────────────────────── selector UI ─────────────
 
+    @staticmethod
+    def _make_fullscreen_black():
+        """Return an opaque black vtkActor2D covering the entire viewport."""
+        try:
+            import vtk
+            pts = vtk.vtkPoints()
+            pts.InsertNextPoint(0.0, 0.0, 0)
+            pts.InsertNextPoint(1.0, 0.0, 0)
+            pts.InsertNextPoint(1.0, 1.0, 0)
+            pts.InsertNextPoint(0.0, 1.0, 0)
+            quad = vtk.vtkCellArray()
+            quad.InsertNextCell(4)
+            for i in range(4):
+                quad.InsertCellPoint(i)
+            pd = vtk.vtkPolyData()
+            pd.SetPoints(pts)
+            pd.SetPolys(quad)
+            coord = vtk.vtkCoordinate()
+            coord.SetCoordinateSystemToNormalizedDisplay()
+            mapper = vtk.vtkPolyDataMapper2D()
+            mapper.SetInputData(pd)
+            mapper.SetTransformCoordinate(coord)
+            actor = vtk.vtkActor2D()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(0.0, 0.0, 0.0)
+            actor.GetProperty().SetOpacity(1.0)
+            return actor
+        except Exception as exc:
+            logger.warning("AerenQuest: could not create black background: %s", exc)
+            return None
+
     def _build_selector_ui(self) -> None:
         """Create the full-screen selector overlay (header, icons, border)."""
         if _vedo is None:
@@ -140,14 +173,44 @@ class AerenQuestLauncher:
 
         from . import GAMES  # noqa: PLC0415
 
-        # ── Header ───────────────────────────────────────────────────────────
-        header = _vedo.Text2D(
-            "AerenQuest",
-            pos=(0.5, 0.90), s=2.5, c="gold", bg=None, alpha=0.95,
-            justify="top-center",
-        )
-        self._plt.add(header)
-        self._selector_actors.append(header)
+        # ── Full-screen black background ──────────────────────────────────────
+        bg = self._make_fullscreen_black()
+        if bg is not None:
+            ren = getattr(self._plt, "renderer", None)
+            if ren is not None:
+                ren.AddActor2D(bg)
+            self._selector_actors.append(bg)
+
+        repo_root = self._ctx.get("repo_root")
+
+        # ── Header logo ───────────────────────────────────────────────────────
+        # Image is 595×238 px; normalised for a 1600×900 window.
+        _logo_w = 595 / 1600   # ≈ 0.372
+        _logo_h = 238 / 900    # ≈ 0.264
+        _logo_x1 = (1.0 - _logo_w) / 2.0  # centred
+        _logo_y2 = 0.96
+        _logo_y1 = _logo_y2 - _logo_h
+        _logo_added = False
+        if repo_root:
+            _logo_path = Path(repo_root) / "images" / "aerenquest_icon.png"
+            if _logo_path.exists():
+                _logo_actor = self._load_icon_actor(
+                    str(_logo_path),
+                    _logo_x1, _logo_y1, _logo_x1 + _logo_w, _logo_y2,
+                    renderer=self._plt.renderer,
+                )
+                if _logo_actor is not None:
+                    self._plt.renderer.AddActor2D(_logo_actor)
+                    self._selector_actors.append(_logo_actor)
+                    _logo_added = True
+        if not _logo_added:
+            header = _vedo.Text2D(
+                "AerenQuest",
+                pos=(0.5, 0.90), s=2.5, c="gold", bg=None, alpha=0.95,
+                justify="top-center",
+            )
+            self._plt.add(header)
+            self._selector_actors.append(header)
 
         # ── Sub-header ───────────────────────────────────────────────────────
         nav_hint = _vedo.Text2D(
@@ -159,8 +222,7 @@ class AerenQuestLauncher:
         self._selector_actors.append(nav_hint)
 
         # ── Icon patches and labels ───────────────────────────────────────────
-        repo_root = self._ctx.get("repo_root")
-        layout    = self._compute_icon_layout(len(GAMES))
+        layout = self._compute_icon_layout(len(GAMES))
 
         for i, (game, (x1, y1, x2, y2)) in enumerate(zip(GAMES, layout)):
             self._add_game_patch(game, x1, y1, x2, y2, repo_root)
@@ -196,7 +258,10 @@ class AerenQuestLauncher:
         if repo_root:
             icon_path = Path(repo_root) / "images" / game["icon"]
             if icon_path.exists():
-                icon_actor = self._load_icon_actor(str(icon_path), x1, y1, x2, y2)
+                icon_actor = self._load_icon_actor(
+                    str(icon_path), x1, y1, x2, y2,
+                    renderer=self._plt.renderer,
+                )
 
         if icon_actor is not None:
             self._plt.renderer.AddActor2D(icon_actor)
@@ -228,8 +293,9 @@ class AerenQuestLauncher:
                 for i in range(n)]
 
     @staticmethod
-    def _load_icon_actor(path: str, x1: float, y1: float, x2: float, y2: float):
-        """Return a vtkActor2D displaying the image, or None on failure."""
+    def _load_icon_actor(path: str, x1: float, y1: float, x2: float, y2: float,
+                         renderer=None):
+        """Return a vtkActor2D displaying the image scaled to fit the rect, or None."""
         try:
             import vtk
             rdr = vtk.vtkImageReader2Factory.CreateImageReader2(path)
@@ -237,17 +303,33 @@ class AerenQuestLauncher:
                 return None
             rdr.SetFileName(path)
             rdr.Update()
+
+            # Compute target pixel dimensions from normalised coordinates.
+            win_w, win_h = 1600, 900
+            if renderer is not None:
+                try:
+                    win_w, win_h = renderer.GetSize()
+                except Exception:
+                    pass
+            px_w = max(1, round((x2 - x1) * win_w))
+            px_h = max(1, round((y2 - y1) * win_h))
+
+            # Pre-scale the image so vtkImageMapper can render it pixel-for-pixel.
+            # This avoids relying on RenderToRectangleOn() which is unreliable.
+            resize = vtk.vtkImageResize()
+            resize.SetInputConnection(rdr.GetOutputPort())
+            resize.SetOutputDimensions(px_w, px_h, 1)
+            resize.Update()
+
             mapper = vtk.vtkImageMapper()
-            mapper.SetInputData(rdr.GetOutput())
+            mapper.SetInputData(resize.GetOutput())
             mapper.SetColorWindow(255)
             mapper.SetColorLevel(127.5)
-            mapper.RenderToRectangleOn()
+
             act = vtk.vtkActor2D()
             act.SetMapper(mapper)
             act.GetPositionCoordinate().SetCoordinateSystemToNormalizedDisplay()
             act.GetPositionCoordinate().SetValue(x1, y1)
-            act.GetPosition2Coordinate().SetCoordinateSystemToNormalizedDisplay()
-            act.GetPosition2Coordinate().SetValue(x2, y2)
             return act
         except Exception as exc:
             logger.warning("AerenQuest: could not load icon %s: %s", path, exc)
@@ -334,6 +416,20 @@ class AerenQuestLauncher:
         except Exception:
             return
 
+        # Consume the key BEFORE any action — the action may clear the tag,
+        # making the post-action abort a no-op and leaking the event to other
+        # observers (which could trigger a stale end-screen handler, etc.).
+        try:
+            cmd = obj.GetCommand(self._selector_obs_tag)
+            if cmd is not None:
+                cmd.AbortFlagOn()
+        except Exception:
+            pass
+        try:
+            obj.SetKeySym("")
+        except Exception:
+            pass
+
         if key in ("Left", "KP_Left"):
             self._selected_idx = (self._selected_idx - 1) % max(len(GAMES), 1)
             self._move_border(self._selected_idx)
@@ -352,18 +448,6 @@ class AerenQuestLauncher:
             self._launch_selected()
         elif key == "Escape":
             self._close_selector()
-
-        # Consume the key
-        try:
-            cmd = obj.GetCommand(self._selector_obs_tag)
-            if cmd is not None:
-                cmd.AbortFlagOn()
-        except Exception:
-            pass
-        try:
-            obj.SetKeySym("")
-        except Exception:
-            pass
 
     def _clear_selector_ui(self) -> None:
         ren = getattr(self._plt, "renderer", None)
@@ -408,6 +492,12 @@ class AerenQuestLauncher:
 
     def _enter_game_mode(self, game_info: dict) -> None:
         """Position camera, start lames, precompute data, countdown, then launch game."""
+        # Freeform games: restore scene directly, no countdown, no camera change.
+        if game_info.get("freeform"):
+            self._freeform_enter(game_info)
+            return
+        # ── Standard flow ─────────────────────────────────────────────────
+        self._freeform_mode = False
         # 2D actors already hidden by open() → just position and launch.
         self._start_lames_if_needed()
         self._position_camera()
@@ -437,6 +527,46 @@ class AerenQuestLauncher:
             logger.warning("AerenQuest: precompute failed for %s: %s",
                            game_info.get("id"), exc)
             return None
+
+    def _freeform_enter(self, game_info: dict) -> None:
+        """Enter a freeform game: restore the scene exactly as it was, no countdown."""
+        self._freeform_mode = True
+        # Restore 2D actors, overlays, navigation — mirror _restore_scene() minus hud.
+        self._restore_2d()
+        self._set_overlays_visible(True)
+        self._restore_navigation()
+        refresh = self._ctx.get("refresh_nav_panel_visibility")
+        if refresh is not None:
+            try:
+                refresh()
+            except Exception:
+                pass
+        try:
+            self._plt.render()
+        except Exception:
+            pass
+        # Instantiate and start the freeform game.
+        try:
+            import importlib
+            mod = importlib.import_module(game_info["module"])
+            cls = getattr(mod, game_info["cls"])
+        except Exception as exc:
+            logger.warning("AerenQuest: could not import freeform game %s: %s",
+                           game_info.get("id"), exc)
+            self._freeform_mode = False
+            return
+        ctx  = self._ctx
+        game = cls(
+            plt          = self._plt,
+            on_end       = self._on_game_end,
+            data_id      = ctx.get("data_id", "unknown"),
+            data_path    = ctx.get("data_path"),
+            cbar_objects = ctx.get("cbar_objects", []),
+            game_context = ctx,
+        )
+        self._game_ref[0] = game
+        game.start()
+        self._register_game_escape()
 
     def _start_lames_if_needed(self) -> None:
         """Ensure lames animation is running before the game starts."""
@@ -674,13 +804,62 @@ class AerenQuestLauncher:
             )
         self._game_ref[0] = game
         game.start()
+        self._register_game_escape()
 
     # ── game-end flow ────────────────────────────────────────────────────────
 
+    def _register_game_escape(self) -> None:
+        """Register a KeyPress observer that aborts the active game on Escape."""
+        iren = getattr(self._plt, "interactor", None)
+        if iren is None:
+            return
+        launcher = self
+
+        def _on_escape(obj, _event):
+            try:
+                key = obj.GetKeySym()
+            except Exception:
+                return
+            if key != "Escape":
+                return
+            launcher._deregister_game_escape()
+            game = launcher._game_ref[0]
+            if game is not None and hasattr(game, "abort"):
+                try:
+                    game.abort()
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("AerenQuest: game.abort() failed: %s", exc)
+            # Fallback if game has no abort() method
+            launcher._on_game_end(0, False)
+
+        self._game_escape_obs_tag = iren.AddObserver(
+            "KeyPressEvent", _on_escape, 85.0,
+        )
+
+    def _deregister_game_escape(self) -> None:
+        """Remove the game-escape observer (idempotent)."""
+        if self._game_escape_obs_tag is None:
+            return
+        iren = getattr(self._plt, "interactor", None)
+        if iren is not None:
+            try:
+                iren.RemoveObserver(self._game_escape_obs_tag)
+            except Exception:
+                pass
+        self._game_escape_obs_tag = None
+
     def _on_game_end(self, score: int, victory: bool) -> None:
         """Called by the game when it finishes (time up or all caught)."""
+        self._deregister_game_escape()
         # Remove in-game HUD
         self._clear_game_hud()
+
+        # For freeform games the 2D actors were restored at game start; re-hide
+        # them now so the end screen renders cleanly on a black background.
+        if self._freeform_mode:
+            self._snapshot_hide_2d()
+            self._set_overlays_visible(False)
 
         # Name entry → submit → end screen
         try:
@@ -751,7 +930,8 @@ class AerenQuestLauncher:
             self._end_screen_actors.append(bg)
 
         # ── Leaderboard text ─────────────────────────────────────────────
-        game_label = (self._current_game_info or {}).get("title", "Leaderboard")
+        game_label  = (self._current_game_info or {}).get("title", "Leaderboard")
+        score_unit  = (self._current_game_info or {}).get("score_unit", "pts")
         lines = [f"  ══  {game_label}  ══\n"]
         if not top10:
             lines.append("   (no scores yet)\n")
@@ -759,8 +939,8 @@ class AerenQuestLauncher:
             for i, (name, val) in enumerate(top10, 1):
                 medal = ("🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3
                          else f"{i:2d}.")
-                lines.append(f"  {medal}  {name:<20s}  {int(val):>5d} pts")
-        lines.append(f"\n  Your score this run: {score} pts")
+                lines.append(f"  {medal}  {name:<20s}  {int(val):>5d} {score_unit}")
+        lines.append(f"\n  Your score this run: {score} {score_unit}")
 
         lb_text = _vedo.Text2D(
             "\n".join(lines),
@@ -836,15 +1016,10 @@ class AerenQuestLauncher:
         except Exception:
             return
 
-        handled = False
-        if key in ("Return", "KP_Enter"):
-            handled = True
-            self._restart_game()
-        elif key == "Escape":
-            handled = True
-            self._quit_game()
-
-        if handled:
+        if key in ("Return", "KP_Enter", "Escape"):
+            # Consume BEFORE calling the action — the action clears
+            # _end_screen_obs_tag, so post-action abort is always a no-op and
+            # the raw key event leaks to other observers otherwise.
             try:
                 cmd = obj.GetCommand(self._end_screen_obs_tag)
                 if cmd is not None:
@@ -855,6 +1030,11 @@ class AerenQuestLauncher:
                 obj.SetKeySym("")
             except Exception:
                 pass
+
+            if key in ("Return", "KP_Enter"):
+                self._restart_game()
+            else:
+                self._quit_game()
 
     def _clear_end_screen(self) -> None:
         ren = getattr(self._plt, "renderer", None)
@@ -882,10 +1062,13 @@ class AerenQuestLauncher:
         """Clear end screen and re-run the same game from scratch."""
         self._clear_end_screen()
         if self._current_game_info is not None:
-            self._position_camera()
-            self._run_countdown(
-                lambda: self._actually_launch(self._current_game_info)
-            )
+            if self._current_game_info.get("freeform"):
+                self._freeform_enter(self._current_game_info)
+            else:
+                self._position_camera()
+                self._run_countdown(
+                    lambda: self._actually_launch(self._current_game_info)
+                )
 
     def _quit_game(self) -> None:
         """Exit game mode: clear everything, restore original scene."""
@@ -894,6 +1077,7 @@ class AerenQuestLauncher:
 
     def _restore_scene(self) -> None:
         """Restore all hidden UI and navigation after game mode ends."""
+        self._freeform_mode = False
         self._clear_game_hud()
         self._restore_2d()
         self._set_overlays_visible(True)   # restore map + info panel

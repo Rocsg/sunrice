@@ -156,30 +156,140 @@ def _render_bar_image(
     return img
 
 
+def _render_bar_image_h(
+    cmap: CmapSpec,
+    vmin: float,
+    vmax: float,
+    title: str,
+    *,
+    bar_w: int = _DEFAULT_BAR_W,
+    bar_h: int = _DEFAULT_BAR_H,
+    label_w: int = _DEFAULT_LABEL_W,
+    title_h: int = _DEFAULT_TITLE_H,
+    pad: int = _DEFAULT_PAD,
+    bg_color: tuple = (15, 15, 20),
+    text_color: tuple = (220, 220, 220),
+    border_color: tuple = (80, 80, 90),
+    font_size: int = 11,
+) -> np.ndarray:
+    """Render a *horizontal* colormap bar as an RGB uint8 ``(H, W, 3)`` array.
+
+    The gradient runs left (vmin) → right (vmax).  ``bar_h`` controls the
+    length (width) of the strip; ``bar_w`` controls the strip height.
+    """
+    total_w = 2 * pad + bar_h
+    label_row_h = font_size + 4          # space below the strip for tick labels
+    total_h = title_h + pad + bar_w + pad + label_row_h
+    img = np.full((total_h, total_w, 3), bg_color, dtype=np.uint8)
+
+    # ── colour gradient (left = vmin, right = vmax) ─────────────────────
+    colors = _sample_cmap(cmap, bar_h)   # (bar_h, 3) uint8
+    bar_x0 = pad
+    bar_x1 = pad + bar_h
+    bar_y0 = title_h + pad
+    bar_y1 = title_h + pad + bar_w
+    for col in range(bar_h):
+        img[bar_y0:bar_y1, bar_x0 + col] = colors[col]
+
+    # ── border around gradient ──────────────────────────────────────────
+    img[bar_y0, bar_x0:bar_x1] = border_color
+    img[bar_y1 - 1, bar_x0:bar_x1] = border_color
+    img[bar_y0:bar_y1, bar_x0] = border_color
+    img[bar_y0:bar_y1, bar_x1 - 1] = border_color
+
+    try:
+        from PIL import Image as _I, ImageDraw as _D, ImageFont as _F  # noqa: PLC0415
+        pil = _I.fromarray(img, "RGB")
+        draw = _D.Draw(pil)
+        try:
+            font = _F.load_default(size=font_size)
+            font_sm = _F.load_default(size=max(8, font_size - 2))
+        except TypeError:   # Pillow < 9.2
+            font = _F.load_default()
+            font_sm = font
+
+        # ── title (centred above the bar) ───────────────────────────────
+        try:
+            tb = draw.textbbox((0, 0), title, font=font_sm)
+            tw = tb[2] - tb[0]
+        except AttributeError:
+            tw = len(title) * (font_size - 2)
+        tx = max(pad, (total_w - tw) // 2)
+        ty = (title_h - font_size) // 2
+        draw.text((tx, ty), title, fill=text_color, font=font_sm)
+
+        # ── tick labels: vmin (left), mid (centre), vmax (right) ────────
+        mid = (vmax + vmin) / 2.0
+
+        def _fmt(v: float) -> str:
+            if abs(v) >= 1000 or (abs(v) < 0.01 and v != 0.0):
+                return f"{v:.2e}"
+            if v == int(v):
+                return f"{int(v)}"
+            return f"{v:.2f}"
+
+        label_y = bar_y1 + 3
+        # vmin – left-aligned
+        draw.text((bar_x0, label_y), _fmt(vmin), fill=text_color, font=font_sm)
+        # mid – centred
+        mid_s = _fmt(mid)
+        try:
+            tb2 = draw.textbbox((0, 0), mid_s, font=font_sm)
+            tw2 = tb2[2] - tb2[0]
+        except AttributeError:
+            tw2 = len(mid_s) * (font_size - 2)
+        draw.text((bar_x0 + bar_h // 2 - tw2 // 2, label_y),
+                  mid_s, fill=text_color, font=font_sm)
+        # vmax – right-aligned
+        vmax_s = _fmt(vmax)
+        try:
+            tb3 = draw.textbbox((0, 0), vmax_s, font=font_sm)
+            tw3 = tb3[2] - tb3[0]
+        except AttributeError:
+            tw3 = len(vmax_s) * (font_size - 2)
+        draw.text((bar_x1 - tw3, label_y), vmax_s, fill=text_color, font=font_sm)
+
+        # ── tick marks (short vertical lines below the strip) ───────────
+        for _tick_x in (bar_x0, bar_x0 + bar_h // 2, bar_x1 - 1):
+            draw.line([(_tick_x, bar_y1), (_tick_x, bar_y1 + 3)],
+                      fill=text_color, width=1)
+
+        img = np.array(pil, dtype=np.uint8)
+    except Exception:  # noqa: BLE001  (PIL not available)
+        pass
+    return img
+
+
 # ── 2-D HUD overlay ────────────────────────────────────────────────────────────
 
 class ColormapBar2D:
     """Colormap legend rendered as a 2-D HUD overlay via ``vtkActor2D``.
 
-    The bar is anchored by its **bottom-left** corner at a normalised
-    window position ``(pos_x, pos_y)`` where (0,0) is the bottom-left
-    of the render window and (1,1) the top-right.
+    Two positioning modes are available:
+
+    * **Rectangle mode** (recommended, resize-robust): pass ``rect=(x0, y0,
+      x1, y1)`` in normalised window coordinates.  The image is
+      stretched/fitted to the rectangle via ``RenderToRectangleOn``, so
+      position and size are always correct regardless of when the bar is
+      created relative to window initialisation.
+    * **Anchor mode** (legacy): pass ``pos=(x, y)`` only.  The
+      bottom-left corner is pinned in *display* (pixel) coordinates
+      computed at construction time; the image renders at its natural
+      pixel size.  This can mis-position the bar if the window is not
+      yet at its final size when the bar is created.
 
     Parameters
     ----------
     plotter:
         A vedo ``Plotter`` (or any object exposing ``.window`` as the
         ``vtkRenderWindow``).
-    cmap:
-        Matplotlib colormap name (``str``) or ``(N, 3)`` float32 RGB
-        array in [0, 1].
-    vmin, vmax:
-        Data range shown on the bar.
-    title:
-        Short label drawn above the bar (e.g. ``"Density"``).
+    rect:
+        ``(x0, y0, x1, y1)`` normalised window coordinates of the
+        **bottom-left** and **top-right** corners.  Preferred over
+        ``pos`` for resize-robustness.
     pos:
         ``(x, y)`` normalised window coordinates of the **bottom-left**
-        corner of the bar image.
+        corner (legacy / anchor mode, used when ``rect`` is not given).
     """
 
     def __init__(
@@ -190,12 +300,14 @@ class ColormapBar2D:
         vmin: float,
         vmax: float,
         title: str,
+        rect: tuple[float, float, float, float] | None = None,
         pos: tuple[float, float] = (0.87, 0.55),
         bar_w: int = _DEFAULT_BAR_W,
         bar_h: int = _DEFAULT_BAR_H,
         label_w: int = _DEFAULT_LABEL_W,
         title_h: int = _DEFAULT_TITLE_H,
         pad: int = _DEFAULT_PAD,
+        horizontal: bool = False,
     ) -> None:
         self._plotter = plotter
         self._cmap = cmap
@@ -203,17 +315,26 @@ class ColormapBar2D:
         self._vmax = float(vmax)
         self._title = title
         self._pos = pos
+        self._rect = rect
         self._bar_w = bar_w
         self._bar_h = bar_h
         self._label_w = label_w
         self._title_h = title_h
         self._pad = pad
+        self._horizontal = bool(horizontal)
 
-        self._img = _render_bar_image(
-            cmap, vmin, vmax, title,
-            bar_w=bar_w, bar_h=bar_h,
-            label_w=label_w, title_h=title_h, pad=pad,
-        )
+        if horizontal:
+            self._img = _render_bar_image_h(
+                cmap, vmin, vmax, title,
+                bar_w=bar_w, bar_h=bar_h,
+                label_w=label_w, title_h=title_h, pad=pad,
+            )
+        else:
+            self._img = _render_bar_image(
+                cmap, vmin, vmax, title,
+                bar_w=bar_w, bar_h=bar_h,
+                label_w=label_w, title_h=title_h, pad=pad,
+            )
         total_h, total_w = self._img.shape[:2]
 
         # ── VTK image pipeline ───────────────────────────────────────────
@@ -235,13 +356,22 @@ class ColormapBar2D:
         self.image_actor = vtk.vtkActor2D()
         self.image_actor.SetMapper(self._mapper)
 
-        # Position: convert normalised (x, y) → display pixel coords.
-        renwin = plotter.window
-        win_w, win_h = renwin.GetSize()
-        px = int(round(self._pos[0] * win_w))
-        py = int(round(self._pos[1] * win_h))
-        self.image_actor.SetPosition(px, py)
-        self.image_actor.GetPositionCoordinate().SetCoordinateSystemToDisplay()
+        if rect is not None:
+            # ── Rectangle mode: normalised coords, resize-robust ─────────
+            # Identical to the controls-image positioning strategy.
+            self._mapper.RenderToRectangleOn()
+            self.image_actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedDisplay()
+            self.image_actor.GetPositionCoordinate().SetValue(rect[0], rect[1])
+            self.image_actor.GetPosition2Coordinate().SetCoordinateSystemToNormalizedDisplay()
+            self.image_actor.GetPosition2Coordinate().SetValue(rect[2], rect[3])
+        else:
+            # ── Anchor mode: pixel coords (legacy) ───────────────────────
+            renwin = plotter.window
+            win_w, win_h = renwin.GetSize()
+            px = int(round(self._pos[0] * win_w))
+            py = int(round(self._pos[1] * win_h))
+            self.image_actor.SetPosition(px, py)
+            self.image_actor.GetPositionCoordinate().SetCoordinateSystemToDisplay()
 
         # ── Dedicated layer-1 renderer ───────────────────────────────────
         n_layers = renwin.GetNumberOfLayers()

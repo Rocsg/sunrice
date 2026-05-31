@@ -59,6 +59,16 @@ def _premultiply_tile(tile: np.ndarray) -> None:
     tile[:] = (tile.astype(np.float32) * alpha[:, :, np.newaxis]).astype(np.uint8)
 
 
+def _rescale_tile_3ch(tile: np.ndarray, new_s: int) -> np.ndarray:
+    """Nearest-neighbour rescale a (H, W, 3) uint8 tile to (new_s × new_s)."""
+    if tile.ndim != 3 or tile.shape[2] != 3 or tile.shape[0] < 1 or tile.shape[1] < 1:
+        return np.zeros((new_s, new_s, 3), dtype=np.uint8)
+    h, w = tile.shape[:2]
+    ys = np.linspace(0, h - 1, new_s).astype(np.int32)
+    xs = np.linspace(0, w - 1, new_s).astype(np.int32)
+    return tile[ys[:, None], xs[None, :], :]
+
+
 def load_raw_volume(path: Path) -> np.ndarray:
     """Load ``Raw.tif`` (or any 3-D TIFF) as ``uint8`` ``(Z, Y, X)``."""
     path = Path(path)
@@ -102,6 +112,9 @@ class OrthoPanelOverlay:
         if raw_volume.ndim != 3:
             raise ValueError("raw_volume must be a 3-D array (Z, Y, X).")
         self._center_vertically = bool(center_vertically)
+        self._cell_pixels = int(cell_pixels)   # user-supplied upper limit
+        self._last_cam_world: tuple = (0.0, 0.0, 0.0)
+        self._last_cam_dir: tuple   = (0.0, 0.0, -1.0)
         self.plotter = plotter
         self.volume = raw_volume
         # Adapt the panel raster to the current window size so the 2×2
@@ -256,7 +269,9 @@ class OrthoPanelOverlay:
         # Re-place on window resize / render so the overlay stays anchored
         # to the requested viewport rectangle even if the user resizes.
         try:
-            renwin.AddObserver("ModifiedEvent", lambda *a, **k: self._reposition())
+            # ConfigureEvent fires only on real window resizes, not on every
+            # internal render / vtkWindowToImageFilter tile pass.
+            renwin.AddObserver("ConfigureEvent", lambda *a, **k: self._reposition())
         except Exception:  # noqa: BLE001
             pass
 
@@ -299,19 +314,41 @@ class OrthoPanelOverlay:
             pass
 
     def _reposition(self) -> None:
-        """Anchor the panel's UPPER-LEFT corner at ``(x0, y1)`` of the
-        requested viewport rectangle.
+        """Resize the panel canvas to fill the target viewport at the current
+        window size, then anchor the actor's UPPER-LEFT corner at (x0, y1).
 
-        ``vtkActor2D`` anchors its lower-left corner at the position we
-        set, so we have to convert.  Panel pixel size stays fixed; only
-        the placement tracks the window size.
+        Called once at init and again on every ``ConfigureEvent`` (user
+        window resize).  ``vtkActor2D`` anchors its lower-left corner at
+        the position we set, so we subtract panel height in normalised units.
         """
         try:
             w, h = self.plotter.window.GetSize()
         except Exception:  # noqa: BLE001
             return
-        x0, _y0, _x1, y1 = self._target_viewport
-        panel_h_norm = self.panel_h / max(1, h)
+        if w < 1 or h < 1:
+            return
+        x0, y0, x1, y1 = self._target_viewport
+
+        # ── resize canvas if the window dimensions changed ─────────────────
+        target_w = max(64, int(round((x1 - x0) * w)))
+        target_h = max(64, int(round((y1 - y0) * h)))
+        new_cell = max(32, min(self._cell_pixels, target_h // 2, target_w // 2))
+        if new_cell != self.cell:
+            self.cell    = new_cell
+            self.panel_w = new_cell * 2
+            self.panel_h = new_cell * 2
+            self._canvas = np.zeros((self.panel_h, self.panel_w, 3), dtype=np.uint8)
+            self._br_label_tile = _rescale_tile_3ch(self._br_label_tile, new_cell)
+            self._importer.SetWholeExtent(0, self.panel_w - 1, 0, self.panel_h - 1, 0, 0)
+            self._importer.SetDataExtent( 0, self.panel_w - 1, 0, self.panel_h - 1, 0, 0)
+            try:
+                rgb = self.compose(self._last_cam_world, self._last_cam_dir)
+                self._push_pixels(rgb)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ── reposition actor (lower-left in normalised display coords) ─────
+        panel_h_norm = self.panel_h / float(h)
         nx = float(x0)
         if self._center_vertically:
             ny = 0.5 - panel_h_norm / 2.0
@@ -320,8 +357,8 @@ class OrthoPanelOverlay:
         pos_coord = self.image_actor.GetPositionCoordinate()
         pos_coord.SetValue(nx, ny)
         logger.debug(
-            "OrthoPanelOverlay reposition  win=%dx%d  anchor=(%.3f, %.3f)",
-            w, h, nx, ny,
+            "OrthoPanelOverlay reposition  win=%dx%d  cell=%d  anchor=(%.3f, %.3f)",
+            w, h, self.cell, nx, ny,
         )
 
     # ─── primitives ───────────────────────────────────────────────────────
@@ -531,6 +568,8 @@ class OrthoPanelOverlay:
         cam_dir: Sequence[float] = (0.0, 0.0, -1.0),
     ) -> None:
         """Recompose the panel for the given camera position and direction."""
+        self._last_cam_world = tuple(cam_world)
+        self._last_cam_dir   = tuple(cam_dir)
         rgb = self.compose(cam_world, cam_dir)
         self._push_pixels(rgb)
 

@@ -24,4 +24,17 @@ GAMES: list[dict] = [
         "cls":        "CatchFluxGame",
         "score_type": "points_desc",
     },
+    {
+        "id":         "safari_photo",
+        "label":      "G02: Safari Photo",
+        "title":      "Safari Photo",
+        "icon":       "G02_icon.png",
+        "module":     "marvel_view.scripts.AerenQuest.G02_Safari_photo.game",
+        "cls":        "SafariPhotoGame",
+        "score_type": "points_desc",
+        "score_unit": "photos",
+        # Freeform games skip countdown and restore the normal scene view.
+        # The launcher calls _freeform_enter() instead of _enter_game_mode().
+        "freeform":   True,
+    },
 ]

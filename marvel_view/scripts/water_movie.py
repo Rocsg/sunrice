@@ -13,7 +13,7 @@ overlaid by default to make the trajectory visible in 3-D space.
 
 * No UI / buttons / sliders – only the mesh + (optionally) the path.
 * Output resolution: 1920×1080 (Full HD).
-* Frame rate: 25 fps.
+* Frame rate: 90 fps.
 * 2 seconds (= 50 frames) between each consecutive control point.
 * Progress is printed live: frame index, percentage, ETA.
 
@@ -90,7 +90,7 @@ logger = logging.getLogger("marvel_view.water_movie")
 # ── defaults ─────────────────────────────────────────────────────────────────
 
 WIDTH, HEIGHT = 1920, 1080
-FPS = 25
+FPS = 90
 SECONDS_PER_SEGMENT = 3.0
 HOLD_SECONDS = 10.0
 EASE_SEGMENTS = 2     # number of trailing segments over which to ease-out
@@ -229,10 +229,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "mono.  Slower = better compression at equal CRF.")
 
     p.add_argument("--stresstest", action="store_true",
-                   help="Render only the first ~4 seconds of footage "
-                        "(truncates the track after fps×4 frames).  "
+                   help="Render only a short window of footage "
+                        "(defined by --stresstest-start / --stresstest-end).  "
                         "Useful to validate a VR rendering pipeline before "
                         "committing to a multi-minute encode.")
+    p.add_argument("--stresstest-start", type=float, default=0.0,
+                   help="Start time (seconds) of the stresstest window.  "
+                        "Default: 0.")
+    p.add_argument("--stresstest-end", type=float, default=4.0,
+                   help="End time (seconds) of the stresstest window.  "
+                        "Default: 4.")
+    p.add_argument("--print-debug", action="store_true",
+                   help="Diagnostic mode: skip mesh loading, build the track,"
+                        " apply all transformations (stresstest, VR lock, "
+                        "smoothing), then print per-frame positions, "
+                        "velocities, and an FFT analysis for the first 2 s "
+                        "of the window.  Combine with --stresstest / "
+                        "--stresstest-start / --stresstest-end to inspect any "
+                        "time window without rendering a single frame.")
     p.add_argument("--fast", action="store_true",
                    help="Low-resolution quick-render mode.  Overrides "
                         "resolution to 960×540 (flat) or 2048×512 / "
@@ -278,6 +292,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "CRF 10 and preset veryslow.  Very slow (~4× --high). "
                         "Implies --high; explicit --crf / --preset still "
                         "take precedence.")
+    p.add_argument("--compromise", action="store_true",
+                   help="VR compromise mode for 90 fps playback on Meta Quest. "
+                        "Reduces the SBS canvas from 8192\u00d72048 to 6144\u00d71536 "
+                        "(3072\u00d71536 per eye, 75%% of normal pixels) to ease "
+                        "decoder load while keeping acceptable quality. "
+                        "Cube-face stays at 2048 px (normal internal quality). "
+                        "CRF 16.  Combine with --stresstest to test quickly.")
     p.add_argument("--trick", type=int, default=None, metavar="N",
                    help="Keep only the first N control points before "
                         "building the track.  Handy to quickly render the "
@@ -367,6 +388,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "window.  Required on headless servers where no X "
                         "display is available.  VTK must have been built with "
                         "EGL support (vtkEGLRenderWindow must exist).")
+    # ── Depth / atmosphere ───────────────────────────────────────────
+    p.add_argument("--fog", dest="fog", action="store_true", default=True,
+                   help="Force depth-fog ON for the entire movie (default). "
+                        "Applies a GLSL fragment fog to all mesh actors so "
+                        "distant surfaces fade toward the background colour.")
+    p.add_argument("--no-fog", dest="fog", action="store_false",
+                   help="Disable depth fog.")
+    p.add_argument("--fog-near", type=float, default=0.45, metavar="FRAC",
+                   help="Start of fog ramp, as a fraction of the scene "
+                        "bounding-box diagonal.  Below this distance surfaces "
+                        "are unaffected.  Default: 0.45 (45%% of diagonal). "
+                        "Use higher values to keep nearby cavern walls crisp.")
+    p.add_argument("--fog-far", type=float, default=0.92, metavar="FRAC",
+                   help="End of fog ramp (full background colour), as a "
+                        "fraction of the scene diagonal.  Default: 0.92.")
+    p.add_argument("--torch-tilt", type=float, default=10.0, metavar="DEG",
+                   help="Tilt the VR torch light downward by this many "
+                        "degrees from the travel direction.  Creates a "
+                        "bright-near / dark-far floor gradient that helps "
+                        "depth perception in enclosed cavern spaces.  "
+                        "Only affects VR mode.  Default: 10.")
     return p.parse_args(argv)
 
 
@@ -675,13 +717,31 @@ def _smooth_track_positions(
     win = max(3, int(round(window_s * fps)))
     try:
         from scipy.signal import filtfilt, gaussian as _gauss
-        kernel  = _gauss(win * 4 + 1, std=float(win))
+        kernel_len = win * 4 + 1
+        kernel  = _gauss(kernel_len, std=float(win))
         kernel /= kernel.sum()
         pos = np.array([s["camera"]["position"]    for s in track], dtype=float)
         foc = np.array([s["camera"]["focal_point"] for s in track], dtype=float)
-        for ax in range(3):
-            pos[:, ax] = filtfilt(kernel, [1.0], pos[:, ax])
-            foc[:, ax] = filtfilt(kernel, [1.0], foc[:, ax])
+        # filtfilt requires signal length > padlen = 3*(kernel_len-1).
+        # When the track is short (e.g. a stresstest slice), we pad with edge
+        # values before filtering and strip the padding afterwards — this avoids
+        # the edge-ringing that would otherwise produce 2-4 Hz camera jitter.
+        min_len   = 3 * (kernel_len - 1) + 1
+        n         = len(track)
+        if n < min_len:
+            pad_l = (min_len - n + 1) // 2
+            pad_r = min_len - n - pad_l
+            pos = np.pad(pos, ((pad_l, pad_r), (0, 0)), mode="edge")
+            foc = np.pad(foc, ((pad_l, pad_r), (0, 0)), mode="edge")
+            for ax in range(3):
+                pos[:, ax] = filtfilt(kernel, [1.0], pos[:, ax])
+                foc[:, ax] = filtfilt(kernel, [1.0], foc[:, ax])
+            pos = pos[pad_l:pad_l + n]
+            foc = foc[pad_l:pad_l + n]
+        else:
+            for ax in range(3):
+                pos[:, ax] = filtfilt(kernel, [1.0], pos[:, ax])
+                foc[:, ax] = filtfilt(kernel, [1.0], foc[:, ax])
         for i, state in enumerate(track):
             state["camera"]["position"]    = pos[i].tolist()
             state["camera"]["focal_point"] = foc[i].tolist()
@@ -1146,6 +1206,7 @@ def _update_vr_headlight(
     camera_state: dict,
     travel_dir: "np.ndarray | None" = None,
     world_up: "np.ndarray | None" = None,
+    tilt_deg: float = 0.0,
 ) -> None:
     """Aim world-space VR lights for the current frame.
 
@@ -1153,7 +1214,12 @@ def _update_vr_headlight(
     When *travel_dir* is provided, the torch follows the smoothed travel
     direction; the green/red fills are yawed ±135 ° around *world_up*.
     Falls back to the camera focal direction when *travel_dir* is None.
+
+    *tilt_deg* tilts the torch downward (toward -world_up) by that many
+    degrees.  This creates a near-bright / far-dark floor gradient that
+    enhances depth perception in enclosed cavern spaces.
     """
+    import math as _math
     if not lights:
         return
     torch_lights, green_lights, red_lights = lights
@@ -1168,13 +1234,21 @@ def _update_vr_headlight(
 
     up = np.asarray(world_up, dtype=float) if world_up is not None else np.array([0.0, 1.0, 0.0])
 
+    # Tilt the torch downward toward -world_up.
+    if tilt_deg:
+        alpha = _math.radians(tilt_deg)
+        up_n = _normalize(up)
+        torch_dir = _normalize(forward * _math.cos(alpha) + (-up_n) * _math.sin(alpha))
+    else:
+        torch_dir = forward
+
     green_dir = _normalize(_rotate_yaw(forward, up,  135.0))
     red_dir   = _normalize(_rotate_yaw(forward, up, -135.0))
 
     # Light position = camera; focal point = camera + direction (directional light).
     for lt in torch_lights:
         lt.SetPosition(*pos.tolist())
-        lt.SetFocalPoint(*(pos + forward).tolist())
+        lt.SetFocalPoint(*(pos + torch_dir).tolist())
     for lt in green_lights:
         lt.SetPosition(*pos.tolist())
         lt.SetFocalPoint(*(pos + green_dir).tolist())
@@ -1347,6 +1421,9 @@ class _UiReplayBundle:
         membranes_actor=None,
         membranes_threshold=None,
         membranes_n_steps: int = 0,
+        fog_near_frac: float = 0.45,
+        fog_far_frac: float = 0.92,
+        force_fog: bool = False,
         **kwargs,
     ) -> None:
         self.mesh = mesh
@@ -1381,6 +1458,9 @@ class _UiReplayBundle:
             "fog_on": False, "ssao_on": False,
             "ssao_keepalive": [], "prev_pass": {},
         }
+        self._fog_near_frac: float = float(fog_near_frac)
+        self._fog_far_frac:  float = float(fog_far_frac)
+        self._force_fog:     bool  = bool(force_fog)
         # Pillars colour bases — kept in sync with viewer.
         self._pillars_base_glow  = (0.20, 0.95, 0.75)
         self._pillars_base_solid = (0.05, 0.50, 0.45)
@@ -1444,7 +1524,7 @@ class _UiReplayBundle:
                 ))
             except Exception:  # noqa: BLE001
                 diag = 1000.0
-            near, far = diag * 0.20, diag * 0.90
+            near, far = diag * self._fog_near_frac, diag * self._fog_far_frac
             bg = BACKGROUND
             if isinstance(bg, (tuple, list)) and len(bg) >= 3:
                 fr, fg, fb = float(bg[0]), float(bg[1]), float(bg[2])
@@ -1659,9 +1739,10 @@ class _UiReplayBundle:
             self._last["pillars_visible"]   = ui_state.get("pillars_visible")
             self._last["pillars_style"]     = ui_state.get("pillars_style")
             self._last["pillars_hue_shift"] = ui_state.get("pillars_hue_shift")
-        if ui_state.get("fog_on") != self._last.get("fog_on"):
-            self._set_fog(bool(ui_state.get("fog_on")))
-            self._last["fog_on"] = ui_state.get("fog_on")
+        _fog_want = True if self._force_fog else bool(ui_state.get("fog_on"))
+        if _fog_want != self._last.get("fog_on"):
+            self._set_fog(_fog_want)
+            self._last["fog_on"] = _fog_want
         if ui_state.get("ssao_on") != self._last.get("ssao_on"):
             self._set_ssao(bool(ui_state.get("ssao_on")))
             self._last["ssao_on"] = ui_state.get("ssao_on")
@@ -2075,6 +2156,89 @@ def _screenshot_array(plt) -> np.ndarray:
 # ─────────────────────────────────── main ────────────────────────────────────
 
 
+def _run_track_debug(track: "List[dict]", fps: int, vr_mode: str) -> None:
+    """Print diagnostic info about the camera track (--print-debug mode).
+
+    Outputs a per-frame table (positions + speed + travel direction) for the
+    first 2 seconds of the window, followed by acceleration statistics and an
+    FFT of the longitudinal velocity.
+
+    Interpretation guide
+    --------------------
+    * **Accel rms ≈ 0**  →  positions are smooth; jitter source is elsewhere
+      (e.g. lighting direction, actor transform, VR reprojection).
+    * **Accel rms large** or **FFT peaks at 2-4 Hz**  →  the camera-position
+      data itself oscillates; fix is in the smoothing pipeline.
+    """
+    pos = np.array([s["camera"]["position"] for s in track], dtype=float)
+    N = len(pos)
+
+    # Per-frame speed (distance moved from previous frame).
+    dpos = np.diff(pos, axis=0)                          # (N-1, 3)
+    speed = np.linalg.norm(dpos, axis=1)                 # (N-1,)
+    speed_all = np.concatenate([[speed[0] if N > 1 else 0.0], speed])  # (N,)
+
+    # Acceleration = change in speed per frame.
+    accel = np.diff(speed) if len(speed) > 1 else np.array([0.0])  # (N-2,)
+
+    # Travel directions (same computation as main render loop).
+    world_up_raw = np.asarray(
+        track[0]["camera"].get("view_up", [0.0, 1.0, 0.0]), dtype=float)
+    w_n = float(np.linalg.norm(world_up_raw))
+    world_up = world_up_raw / w_n if w_n > 1e-9 else np.array([0.0, 1.0, 0.0])
+    vel_win = max(1, fps // 4)
+    travel_dirs = _compute_travel_dirs(
+        track, world_up, velocity_window=vel_win, alpha=0.12)
+
+    # ── Table ────────────────────────────────────────────────────────────────
+    N_PRINT = min(N, fps * 2)
+    hdr = (f"  {'fr':>5}  {'t(s)':>6}  {'pos.x':>9}  {'pos.y':>9}  "
+           f"{'pos.z':>9}  {'speed':>8}  {'dir.x':>6}  {'dir.y':>6}  {'dir.z':>6}")
+    sep = "  " + "  ".join(["-" * w for w in (5, 6, 9, 9, 9, 8, 6, 6, 6)])
+    print(hdr)
+    print(sep)
+    for i in range(N_PRINT):
+        t = i / fps
+        p = pos[i]
+        d = travel_dirs[i]
+        print(f"  {i:>5}  {t:>6.3f}  {p[0]:>9.2f}  {p[1]:>9.2f}  {p[2]:>9.2f}"
+              f"  {speed_all[i]:>8.4f}  {d[0]:>6.3f}  {d[1]:>6.3f}  {d[2]:>6.3f}")
+    if N > N_PRINT:
+        print(f"  … ({N - N_PRINT} more frames not shown)")
+
+    # ── Statistics ───────────────────────────────────────────────────────────
+    print(f"\n  ── Statistics over {N} frames ({'--vr' if vr_mode != 'off' else 'flat'}) ──")
+    print(f"  Speed  : mean={np.mean(speed):.4f}  std={np.std(speed):.5f}  "
+          f"max={np.max(speed):.4f}  vox/frame")
+    accel_rms = float(np.sqrt(np.mean(accel ** 2)))
+    accel_max = float(np.max(np.abs(accel)))
+    print(f"  Accel  : rms={accel_rms:.5f}  max={accel_max:.5f}  vox/frame\u00b2")
+    print(f"  \u2192 Accel rms near 0 = smooth positions; high = jitter in track data")
+
+    # ── FFT of longitudinal velocity ─────────────────────────────────────────
+    try:
+        from numpy.fft import rfft, rfftfreq  # type: ignore[import]
+        mean_dir = np.mean(travel_dirs, axis=0)
+        mn = float(np.linalg.norm(mean_dir))
+        if mn > 1e-9:
+            mean_dir /= mn
+        pos_proj = pos @ mean_dir          # forward-direction component (N,)
+        vel_1d = np.diff(pos_proj)         # longitudinal speed (N-1,)
+        if len(vel_1d) >= 8:
+            freqs = rfftfreq(len(vel_1d), d=1.0 / fps)
+            amps = np.abs(rfft(vel_1d)) / len(vel_1d)
+            # Top 6 non-DC peaks.
+            nondc = np.argsort(amps[1:])[::-1][:6] + 1
+            print(f"\n  ── FFT of longitudinal velocity (top peaks) ──")
+            print(f"  (peaks at 2-4 Hz = position jitter; flat spectrum = smooth)")
+            for idx in nondc:
+                if idx < len(freqs) and freqs[idx] > 0.01:
+                    print(f"    {freqs[idx]:5.2f} Hz   amplitude {amps[idx]:.5f} vox/frame")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  FFT skipped: {exc}")
+    print()
+
+
 def _print_progress(i: int, total: int, t_start: float) -> None:
     pct = 100.0 * (i + 1) / total
     elapsed = time.time() - t_start
@@ -2189,6 +2353,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.preset is None:
             args.preset = "veryslow"
 
+    # ── Compromise mode (--compromise) ──────────────────────────────────
+    # Reduced SBS canvas for 90 fps on Meta Quest: 75 % of normal pixels,
+    # same internal cube-face quality as default.  Mutually exclusive
+    # with --high / --ultra-high (those keep the full 8192×2048 canvas).
+    if args.compromise:
+        if not vr_user_set_size:
+            if vr_mode != "off":
+                args.width, args.height = 6144, 1536   # 3072×1536 per eye
+                # cube-face stays at default 2048 px
+        if args.crf is None:
+            args.crf = 16
+
     if vr_mode != "off":
         if args.width % 2 != 0:
             logger.error("SBS canvas width must be even; got %d.", args.width)
@@ -2216,6 +2392,8 @@ def main(argv: list[str] | None = None) -> int:
             quality_prefix = "ULTRA_"
         elif args.high:
             quality_prefix = "HIGH_"
+        elif args.compromise:
+            quality_prefix = "COMP_"
         elif args.fast:
             quality_prefix = "FAST_"
         else:
@@ -2277,20 +2455,35 @@ def main(argv: list[str] | None = None) -> int:
     _summarise_control_points(control_points)
     print("═" * 72)
 
-    # ── 1. Build the mesh once ─────────────────────────────────────────────
-    print("[1/4] Building mesh from TIFF …")
-    t0 = time.time()
-    mesh = _load_or_build_mesh(
-        Path(args.input).expanduser().resolve(),
-        level=args.level,
-        smooth_iter=args.smooth_iter,
-        cache_path=Path(args.mesh_cache).expanduser().resolve()
-                   if args.mesh_cache else None,
-        rebuild=args.rebuild_mesh,
-    )
-    _style_mesh(mesh)
-    print(f"      done in {time.time() - t0:.1f}s  "
-          f"({mesh.npoints} vertices, {mesh.ncells} faces)")
+    # ── --print-debug: skip heavy loading, go straight to track build ──────
+    # All companion-actor and mesh variables are set to empty sentinels so
+    # that [2/4] and [2bis] run normally; we exit right after smoothing.
+    if args.print_debug:
+        print("  [--print-debug] Skipping mesh + companion actor loading.")
+        print("  Track will be built, transformed, smoothed, then analysed.")
+        mesh = alt_mesh = pillars_mesh = None
+        membranes_actor = membranes_threshold = None
+        membranes_n_steps = lames_n_steps = 0
+        lames_actor = None
+        lames_step_pds: list = []
+        arrows_actor = None
+        tracks_bin_actors: list = []
+        tracks_axis_info = None
+    else:
+        # ── 1. Build the mesh once ─────────────────────────────────────────
+        print("[1/4] Building mesh from TIFF …")
+        t0 = time.time()
+        mesh = _load_or_build_mesh(
+            Path(args.input).expanduser().resolve(),
+            level=args.level,
+            smooth_iter=args.smooth_iter,
+            cache_path=Path(args.mesh_cache).expanduser().resolve()
+                       if args.mesh_cache else None,
+            rebuild=args.rebuild_mesh,
+        )
+        _style_mesh(mesh)
+        print(f"      done in {time.time() - t0:.1f}s  "
+              f"({mesh.npoints} vertices, {mesh.ncells} faces)")
 
     # ── 1bis. Optional companion actors (alt mesh + pillars overlay) ──
     # Loaded lazily from disk caches; used by the per-frame UI-state
@@ -2805,12 +2998,16 @@ def main(argv: list[str] | None = None) -> int:
           f"({total_frames / args.fps:.2f}s of footage)")
 
     if args.stresstest:
-        keep = min(total_frames, args.fps * 4)
-        track    = track[:keep]
-        t_out_ui = t_out_ui[:keep]  # keep in sync with track
+        t_start_s = max(0.0, args.stresstest_start)
+        t_end_s   = args.stresstest_end
+        f_start   = min(total_frames - 1, int(round(t_start_s * args.fps)))
+        f_end     = min(total_frames,     int(round(t_end_s   * args.fps)))
+        track     = track   [f_start:f_end]
+        t_out_ui  = t_out_ui[f_start:f_end]
         total_frames = len(track)
-        print(f"      [stresstest] truncated to first {total_frames} frames "
-              f"({total_frames / args.fps:.2f}s)")
+        print(f"      [stresstest] frames {f_start}–{f_end}  "
+              f"({t_start_s:.1f}s – {t_end_s:.1f}s)  "
+              f"→ {total_frames} frames")
 
     # In VR mode, lock the orientation to the first keyframe so the
     # spline only carries the translation component.  Any orientation
@@ -2826,10 +3023,19 @@ def main(argv: list[str] | None = None) -> int:
     # ── Stage C: zero-phase position smoothing ──────────────────────────
     # Eliminates spline-residual jitter from the ortho-panel red dot and
     # info-billboard.  Wider window for VR (comfort-critical) than flat.
+    # _smooth_track_positions handles short tracks (stresstest) by auto-
+    # padding the signal before filtfilt — no edge-ringing artefacts.
     _smooth_window = 1.0 if vr_mode != "off" else 0.6
     _smooth_track_positions(track, args.fps, window_s=_smooth_window)
     logger.info("Stage-C smoothing applied (window=%.1f s, %d frames)",
                 _smooth_window, len(track))
+
+    # ── --print-debug: analyse track, skip rendering ──────────────────
+    if args.print_debug:
+        print(f"\n[--print-debug] {len(track)} frames after slice/lock/smooth "
+              f"({len(track)/args.fps:.2f}s)  vr_mode={vr_mode}")
+        _run_track_debug(track, args.fps, vr_mode)
+        return 0
 
     # ── 2bis. UI-state replay track ──────────────────────────────────
     if args.ignore_ui_state:
@@ -2960,9 +3166,13 @@ def main(argv: list[str] | None = None) -> int:
     # frames so we don't reapply unchanged values).
     fog_actors_bundle = [a for a in (
         mesh, alt_mesh, pillars_mesh, arrows_actor,
+        membranes_actor, lames_actor,
     ) if a is not None]
     ui_bundle = _UiReplayBundle(
         mesh=mesh,
+        fog_near_frac=args.fog_near,
+        fog_far_frac=args.fog_far,
+        force_fog=args.fog,
         alt_mesh=alt_mesh,
         pillars_mesh=pillars_mesh,
         fog_actors=fog_actors_bundle,
@@ -3340,7 +3550,8 @@ def main(argv: list[str] | None = None) -> int:
             # Sync the world-space lights to the mono camera once per frame
             # (same lights for both eyes — avoids any stereo shading discrepancy).
             _td = vr_travel_dirs[i] if vr_travel_dirs is not None else None
-            _update_vr_headlight(vr_lights, state["camera"], _td, vr_world_up)
+            _update_vr_headlight(vr_lights, state["camera"], _td, vr_world_up,
+                                 tilt_deg=args.torch_tilt)
 
             # Left eye — render & write to disk (same code path as mono).
             for renderer in plt.renderers:

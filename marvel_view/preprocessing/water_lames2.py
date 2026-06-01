@@ -284,6 +284,7 @@ def build_water_lame2(
     iso_only:        bool  = False,
     n_seeds:         int   = DEFAULT_N_SEEDS,
     phase_factor:    int   = DEFAULT_PHASE_FACTOR,
+    fps:             int   = 25,
     step_growth:     float = DEFAULT_STEP_GROWTH,
     hold_ratio:      float = DEFAULT_HOLD_RATIO,
     target_tris_per_shell: int = DEFAULT_TARGET_TRIS_PER_SHELL,
@@ -639,6 +640,7 @@ def build_water_lame2(
 
     meta = {
         "version":              3,
+        "fps":                  int(max(1, fps)),
         "n_steps":              int(Nstep),
         "max_lifetime":         int(max_lifetime),
         "n_columns":            int(n_columns),

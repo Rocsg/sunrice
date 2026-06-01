@@ -48,12 +48,18 @@ from marvel_view.scripts.water_conductance import (
     DEFAULT_ALL_MESH_CACHE_PATH,
     DEFAULT_ARROW_LENGTH,
     DEFAULT_ARROW_THICKNESS,
+    DEFAULT_AIR_DUAL_ARROWS_CACHE,
     DEFAULT_ARROWS_CACHE_PATH,
     DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_VTP_CACHE,
+    DEFAULT_WATER_DUAL_ARROWS_CACHE,
+    _load_or_build_dual_arrows,
     DEFAULT_INPUT_PATH,
     DEFAULT_LAME2_META_CACHE,
+    DEFAULT_LAME2_MOVIE_META_CACHE,
+    DEFAULT_LAME2_MOVIE_VTP_CACHE,
+    DEFAULT_LAME2_SOURCE_FPS,
     DEFAULT_LAME2_VTP_CACHE,
     DEFAULT_LAME2_NORMALS_CACHE_DIR,
     DEFAULT_LAMES_META_CACHE,
@@ -296,9 +302,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="VR compromise mode for 90 fps playback on Meta Quest. "
                         "Reduces the SBS canvas from 8192\u00d72048 to 6144\u00d71536 "
                         "(3072\u00d71536 per eye, 75%% of normal pixels) to ease "
-                        "decoder load while keeping acceptable quality. "
-                        "Cube-face stays at 2048 px (normal internal quality). "
-                        "CRF 16.  Combine with --stresstest to test quickly.")
+                        "decoder load, and bumps the cube-face from 2048 to "
+                        "3072 px for sharper distant detail.  CRF 16.  "
+                        "Override cube-face with --vr-cube-resolution or "
+                        "canvas with --width/--height.  "
+                        "Combine with --stresstest to test quickly.")
     p.add_argument("--trick", type=int, default=None, metavar="N",
                    help="Keep only the first N control points before "
                         "building the track.  Handy to quickly render the "
@@ -314,6 +322,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "tell the assistant where in the trajectory to "
                         "trigger a specific behaviour.  Ignored when "
                         "--vr is not 'off'.")
+    p.add_argument("--debug-tracks", action="store_true",
+                   help="Print detailed diagnostics about ui_state/view_mode "
+                        "replay and crown-track actor visibility while "
+                        "rendering.  Useful to debug missing pathways.")
 
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Enable DEBUG-level logging.")
@@ -338,22 +350,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="JSON sidecar with the membranes n_steps / phases. "
                         "Required alongside --membranes-vtp-cache.")
     p.add_argument("--lames-vtp-cache",
-                   default=str(DEFAULT_LAME2_VTP_CACHE),
+                   default=None,
                    help="Path to the cached water-lames .vtp.  When "
                         "provided AND keyframes set lames_visible=true, "
                         "the descending-lames animation is replayed. "
-                        f"(default: {DEFAULT_LAME2_VTP_CACHE})")
+                        "Defaults to auto-select based on --fps: "
+                        "25 fps → lame2.vtp, other → lame2_<fps>fps.vtp.")
     p.add_argument("--lames-meta-cache",
-                   default=str(DEFAULT_LAME2_META_CACHE),
+                   default=None,
                    help="JSON sidecar with the lames n_steps. "
                         "Required alongside --lames-vtp-cache. "
-                        f"(default: {DEFAULT_LAME2_META_CACHE})")
+                        "Defaults to auto-select based on --fps.")
+    p.add_argument(
+        "--lames-fps",
+        type=int,
+        default=None,
+        help="Override source FPS for the lames animation. "
+             "By default uses lames_meta.json['fps'] or 25.",
+    )
     p.add_argument("--arrows-cache",
                    default=str(DEFAULT_ARROWS_CACHE_PATH),
                    help="Path to the cached geodesic-distance arrows .npz.  "
                         "When present, the 'Arrows grid' view-mode renders "
                         "the gradient field in the movie.  "
                         f"(default: {DEFAULT_ARROWS_CACHE_PATH})")
+    p.add_argument("--dual-water-cache",
+                   default=str(DEFAULT_WATER_DUAL_ARROWS_CACHE),
+                   help="Path to the cached dual water arrows .npz.  "
+                        "Used for the 'arrows_dual' view-mode.  "
+                        f"(default: {DEFAULT_WATER_DUAL_ARROWS_CACHE})")
+    p.add_argument("--dual-air-cache",
+                   default=str(DEFAULT_AIR_DUAL_ARROWS_CACHE),
+                   help="Path to the cached dual air arrows .npz.  "
+                        "Used for the 'arrows_dual' view-mode.  "
+                        f"(default: {DEFAULT_AIR_DUAL_ARROWS_CACHE})")
     p.add_argument("--crown-tracks-cache",
                    default=str(DEFAULT_CROWN_TRACKS_VTP_CACHE),
                    help="Path to the cached crown Dijkstra tracks .vtp.  "
@@ -1401,6 +1431,17 @@ def _build_ui_track(
                 val = a.get(k)
             if val is not None:
                 frame_state[k] = val
+        # Carry forward previous values when a key is absent on both ends.
+        # This mirrors the interactive viewer where toggles remain latched
+        # until explicitly changed by the user.
+        if out and out[-1] is not None:
+            prev = out[-1]
+            for k in _UI_DISCRETE_FIELDS:
+                if k not in frame_state and k in prev:
+                    frame_state[k] = prev[k]
+            for k in _UI_CONT_FIELDS:
+                if k not in frame_state and k in prev:
+                    frame_state[k] = prev[k]
         out.append(frame_state)
     return out
 
@@ -1444,13 +1485,19 @@ class _UiReplayBundle:
         self.lames_actor = kwargs.get("lames_actor")
         self.lames_step_pds = kwargs.get("lames_step_pds") or []
         self.lames_n_steps = int(kwargs.get("lames_n_steps") or 0)
-        self._lames_step = 0
+        self.lames_fps = float(kwargs.get("lames_fps") or DEFAULT_LAME2_SOURCE_FPS)
+        self.movie_fps = float(kwargs.get("movie_fps") or FPS)
+        self._lames_phase = 0.0
         # Gradient arrows (arrows_grid view-mode).
         self.arrows_actor = kwargs.get("arrows_actor")
+        # Dual arrows for arrows_dual view-mode (water + air harmonic arrows).
+        self.water_dual_actor = kwargs.get("water_dual_actor")
+        self.air_dual_actor   = kwargs.get("air_dual_actor")
         # Crown Dijkstra tracks — list of bin-actors (lines + arrows).
         self.tracks_bin_actors = list(kwargs.get("tracks_bin_actors") or [])
         # Axis info for per-frame bin visibility update.
         self.tracks_axis_info = kwargs.get("tracks_axis_info")
+        self.debug_tracks = bool(kwargs.get("debug_tracks", False))
         # Latched values so we don't re-apply identical state every frame.
         self._last: dict = {}
         # Fog / SSAO state mirrors viewer's ``_depth_state`` dict shape.
@@ -1627,10 +1674,11 @@ class _UiReplayBundle:
         if self.alt_mesh is None and mode == "mesh_all":
             mode = "mesh_bridges"
         try:
-            show_main   = mode == "mesh_bridges"
-            show_alt    = mode == "mesh_all"
-            show_arrows = mode in ("arrows_grid", "arrows_dual")
-            show_tracks = mode == "arrows_tracks"
+            show_main        = mode == "mesh_bridges"
+            show_alt         = mode == "mesh_all"
+            show_arrows_grid = mode == "arrows_grid"
+            show_arrows_dual = mode == "arrows_dual"
+            show_tracks      = mode == "arrows_tracks"
             getattr(self.mesh, "actor", self.mesh).SetVisibility(
                 1 if show_main else 0)
             if self.alt_mesh is not None:
@@ -1639,8 +1687,23 @@ class _UiReplayBundle:
             if self.arrows_actor is not None:
                 getattr(self.arrows_actor, "actor",
                         self.arrows_actor).SetVisibility(
-                    1 if show_arrows else 0)
-            if not show_tracks:
+                    1 if show_arrows_grid else 0)
+            for _dual_act in (self.water_dual_actor, self.air_dual_actor):
+                if _dual_act is not None:
+                    getattr(_dual_act, "actor", _dual_act).SetVisibility(
+                        1 if show_arrows_dual else 0)
+            if show_tracks and self.tracks_axis_info is None:
+                # Fallback mode: no bin metadata available, show all tracks.
+                for _ta in self.tracks_bin_actors:
+                    try:
+                        getattr(_ta, "actor", _ta).SetVisibility(1)
+                        _alpha = 1.0 if self._vr_mode != "off" else float(
+                            getattr(_ta, "_base_alpha", 0.40)
+                        )
+                        _ta.alpha(_alpha)
+                    except Exception:  # noqa: BLE001
+                        pass
+            elif not show_tracks:
                 for _ta in self.tracks_bin_actors:
                     try:
                         getattr(_ta, "actor", _ta).SetVisibility(0)
@@ -1648,6 +1711,13 @@ class _UiReplayBundle:
                         pass
             # When show_tracks=True, update_tracks_bins() manages per-bin
             # visibility every frame.
+            if self.debug_tracks:
+                print(
+                    "      [debug-tracks] view_mode="
+                    f"{mode} show_tracks={show_tracks} "
+                    f"tracks_actors={len(self.tracks_bin_actors)} "
+                    f"binning={'on' if self.tracks_axis_info is not None else 'off'}"
+                )
         except Exception as exc:  # noqa: BLE001
             logger.debug("view_mode swap failed: %s", exc)
 
@@ -1659,9 +1729,27 @@ class _UiReplayBundle:
         bins between BIN_FULL and BIN_FADE fade linearly; beyond BIN_FADE
         are hidden.  No-op when view_mode != arrows_tracks.
         """
-        if (self.tracks_axis_info is None
-                or not self.tracks_bin_actors
+        if (not self.tracks_bin_actors
                 or self._last.get("view_mode") != "arrows_tracks"):
+            return
+        if self.tracks_axis_info is None:
+            # Fallback mode: no bin culling, keep all tracks visible.
+            _vis_count = 0
+            for _a in self.tracks_bin_actors:
+                try:
+                    getattr(_a, "actor", _a).SetVisibility(1)
+                    _alpha = 1.0 if self._vr_mode != "off" else float(
+                        getattr(_a, "_base_alpha", 0.40)
+                    )
+                    _a.alpha(_alpha)
+                    _vis_count += 1
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.debug_tracks:
+                print(
+                    "      [debug-tracks] fallback visible actors="
+                    f"{_vis_count}/{len(self.tracks_bin_actors)}"
+                )
             return
         try:
             info      = self.tracks_axis_info
@@ -1682,15 +1770,19 @@ class _UiReplayBundle:
                 _mult = (1.0 if _d <= bin_full
                          else (1.0 - (_d - bin_full) / fade_span
                                if _d <= bin_fade else 0.0))
-                _vis  = 1 if _mult > 0.0 else 0
+                # In VR, translucency is broken (panoramic pass blend-state).
+                # Hide fading bins entirely rather than showing them opaque:
+                # only bins within ±bin_full of the camera are visible.
+                if self._vr_mode != "off":
+                    _vis = 1 if _d <= bin_full else 0
+                else:
+                    _vis = 1 if _mult > 0.0 else 0
                 try:
                     getattr(_a, "actor", _a).SetVisibility(_vis)
                 except Exception:  # noqa: BLE001
                     pass
                 if _vis:
                     try:
-                        # In VR the panoramic pass can't handle translucency;
-                        # force fully opaque (same logic as pillars solid mode).
                         _alpha = (1.0 if self._vr_mode != "off"
                                   else _a._base_alpha * _mult)
                         _a.alpha(_alpha)
@@ -1706,15 +1798,18 @@ class _UiReplayBundle:
         # Save old view_mode BEFORE updating so the pillars block can detect the
         # transition (needed for the VR view-mode guard below).
         _old_vm = self._last.get("view_mode")
-        if ui_state.get("view_mode") != _old_vm:
-            vm = ui_state.get("view_mode") or "mesh_bridges"
+        vm = ui_state.get(
+            "view_mode",
+            _old_vm if _old_vm is not None else "mesh_bridges",
+        )
+        if vm != _old_vm:
             self._set_view_mode(vm)
-            self._last["view_mode"] = ui_state.get("view_mode")
+        self._last["view_mode"] = vm
         # Pillars: re-apply on pillars state change, or in VR when view_mode
         # changes (because visibility depends on the current view_mode in VR).
         _vr_vm_changed = (
             self._vr_mode != "off"
-            and ui_state.get("view_mode") != _old_vm
+            and vm != _old_vm
         )
         if (_vr_vm_changed
                 or ui_state.get("pillars_visible")  != self._last.get("pillars_visible")
@@ -1727,7 +1822,7 @@ class _UiReplayBundle:
                 # In VR translucency is broken; hide pillars in cortex modes
                 # and force solid (opaque) when they are shown in arrow modes.
                 _VR_ARROWS = {"arrows_grid", "arrows_tracks", "arrows_dual"}
-                _cur_vm = ui_state.get("view_mode") or "mesh_bridges"
+                _cur_vm = vm or "mesh_bridges"
                 _vis = _vis and (_cur_vm in _VR_ARROWS)
                 if _sty == "glow":
                     _sty = "solid"
@@ -1778,11 +1873,13 @@ class _UiReplayBundle:
                     logger.debug("lames visibility swap failed: %s", exc)
                 self._last["lames_visible"] = want_vis
             if want_vis:
-                self._lames_step = (
-                    self._lames_step + 1
+                _advance = self.lames_fps / max(self.movie_fps, 1e-6)
+                self._lames_phase = (
+                    self._lames_phase + _advance
                 ) % self.lames_n_steps
-                step_pd = (self.lames_step_pds[self._lames_step]
-                           if self._lames_step < len(self.lames_step_pds)
+                _lames_step = int(self._lames_phase)
+                step_pd = (self.lames_step_pds[_lames_step]
+                           if _lames_step < len(self.lames_step_pds)
                            else None)
                 if step_pd is not None:
                     try:
@@ -2277,6 +2374,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # ── Auto-select lames cache based on movie output fps ──────────────────
+    # Explicit --lames-vtp-cache always wins; otherwise pick the variant that
+    # matches the render fps (25 fps → lame2.vtp, 90 fps → lame2_90fps.vtp).
+    if args.lames_vtp_cache is None or args.lames_meta_cache is None:
+        _movie_fps = getattr(args, "fps", 25) or 25
+        _vtk_dir = Path(DEFAULT_LAME2_VTP_CACHE).parent
+        if _movie_fps == 25:
+            _auto_lv = Path(DEFAULT_LAME2_VTP_CACHE)
+            _auto_lm = Path(DEFAULT_LAME2_META_CACHE)
+        else:
+            _auto_lv = _vtk_dir / f"lame2_{_movie_fps}fps.vtp"
+            _auto_lm = _vtk_dir / f"lame2_meta_{_movie_fps}fps.json"
+            if not _auto_lv.exists():
+                logger.warning(
+                    "Lames cache for %d fps not found (%s), "
+                    "falling back to 25 fps cache.", _movie_fps, _auto_lv
+                )
+                _auto_lv = Path(DEFAULT_LAME2_VTP_CACHE)
+                _auto_lm = Path(DEFAULT_LAME2_META_CACHE)
+        if args.lames_vtp_cache is None:
+            args.lames_vtp_cache = str(_auto_lv)
+        if args.lames_meta_cache is None:
+            args.lames_meta_cache = str(_auto_lm)
+
     # ── Sanity check: refuse to write into the Trash ──────────────────────
     # Bash keeps the original cwd label even after the directory has been
     # moved to the Trash (e.g. deleted from a file manager), but Path.cwd()
@@ -2354,14 +2475,20 @@ def main(argv: list[str] | None = None) -> int:
             args.preset = "veryslow"
 
     # ── Compromise mode (--compromise) ──────────────────────────────────
-    # Reduced SBS canvas for 90 fps on Meta Quest: 75 % of normal pixels,
-    # same internal cube-face quality as default.  Mutually exclusive
-    # with --high / --ultra-high (those keep the full 8192×2048 canvas).
+    # Reduced SBS canvas for 90 fps on Meta Quest: 75 % of normal pixels.
+    # Cube-face bumped to 3072 px (between normal 2048 and high 4096) to
+    # recover sharpness on distant objects without affecting decode load.
+    # For an even sharper result at the cost of render time, override with
+    # --vr-cube-resolution 4096.  For a slightly larger canvas (87% of
+    # full, still lower decode load), use --width 7168 --height 1792.
     if args.compromise:
         if not vr_user_set_size:
             if vr_mode != "off":
                 args.width, args.height = 6144, 1536   # 3072×1536 per eye
-                # cube-face stays at default 2048 px
+        # Bump cube-face from default 2048 to 3072 unless the user explicitly
+        # chose a different value with --vr-cube-resolution.
+        if args.vr_cube_resolution == VR_CUBE_RESOLUTION:
+            args.vr_cube_resolution = 3072
         if args.crf is None:
             args.crf = 16
 
@@ -2393,7 +2520,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.high:
             quality_prefix = "HIGH_"
         elif args.compromise:
-            quality_prefix = "COMP_"
+            # Include canvas width so different --width overrides don't collide.
+            quality_prefix = f"COMP{args.width}_"
         elif args.fast:
             quality_prefix = "FAST_"
         else:
@@ -2607,39 +2735,51 @@ def main(argv: list[str] | None = None) -> int:
     lames_actor = None
     lames_step_pds: list = []
     lames_n_steps = 0
+    lames_fps = int(DEFAULT_LAME2_SOURCE_FPS)
     if not args.ignore_ui_state and args.lames_vtp_cache and args.lames_meta_cache:
-        _lv = Path(args.lames_vtp_cache).expanduser().resolve()
-        _lm = Path(args.lames_meta_cache).expanduser().resolve()
-        try:
-            _lames_pd, _lames_meta = _load_lames(_lv, _lm)
-            if _lames_pd is not None and _lames_meta is not None:
+        _requested_lv = Path(args.lames_vtp_cache).expanduser().resolve()
+        _requested_lm = Path(args.lames_meta_cache).expanduser().resolve()
+
+        for _lv, _lm in [(_requested_lv, _requested_lm)]:
+            if not (_lv.exists() and _lm.exists()):
+                logger.warning("Lames cache not found: %s / %s", _lv, _lm)
+                break
+            try:
+                _lames_pd, _lames_meta = _load_lames(_lv, _lm)
+                if _lames_pd is None or _lames_meta is None:
+                    continue
                 lames_n_steps = int(_lames_meta.get("n_steps", 0))
-                if lames_n_steps > 0:
-                    _normals_dir = DEFAULT_LAME2_NORMALS_CACHE_DIR
-                    _step_pds, _actor = load_lame2_normals_cache(
-                        _normals_dir, lames_n_steps)
-                    if _step_pds is None:
-                        _step_pds, _actor = _build_lames_step_polydatas(
-                            _lames_pd, lames_n_steps)
-                    lames_step_pds = _step_pds
-                    lames_actor = _actor
-                    # Render lames fully opaque with Phong shading (flat and VR).
-                    # Translucency is also broken in VR, so this is doubly needed there.
-                    # Point normals available when cache loaded.
-                    _lp = _actor.GetProperty()
-                    _lp.SetOpacity(1.0)
-                    _lp.SetAmbient(0.18)
-                    _lp.SetDiffuse(0.78)
-                    _lp.SetSpecular(0.55)
-                    _lp.SetSpecularPower(35)
-                    _lp.SetInterpolation(2)  # Phong
-                    lames_actor.SetVisibility(0)
-                    print(f"      [ui_state] water lames loaded "
-                          f"(n_steps={lames_n_steps}, "
-                          f"{_lames_pd.GetNumberOfCells()} cells)")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not load lames caches %s / %s: %s",
-                           _lv, _lm, exc)
+                if lames_n_steps <= 0:
+                    continue
+                lames_fps = int(_lames_meta.get("fps", DEFAULT_LAME2_SOURCE_FPS))
+                if args.lames_fps is not None and int(args.lames_fps) > 0:
+                    lames_fps = int(args.lames_fps)
+                _normals_dir = DEFAULT_LAME2_NORMALS_CACHE_DIR
+                _step_pds, _actor = load_lame2_normals_cache(
+                    _normals_dir, lames_n_steps)
+                if _step_pds is None:
+                    _step_pds, _actor = _build_lames_step_polydatas(
+                        _lames_pd, lames_n_steps)
+                lames_step_pds = _step_pds
+                lames_actor = _actor
+                # Render lames fully opaque with Phong shading (flat and VR).
+                # Translucency is also broken in VR, so this is doubly needed there.
+                # Point normals available when cache loaded.
+                _lp = _actor.GetProperty()
+                _lp.SetOpacity(1.0)
+                _lp.SetAmbient(0.18)
+                _lp.SetDiffuse(0.78)
+                _lp.SetSpecular(0.55)
+                _lp.SetSpecularPower(35)
+                _lp.SetInterpolation(2)  # Phong
+                lames_actor.SetVisibility(0)
+                print(f"      [ui_state] water lames loaded "
+                      f"(n_steps={lames_n_steps}, fps={lames_fps}, "
+                      f"{_lames_pd.GetNumberOfCells()} cells)")
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not load lames caches %s / %s: %s",
+                               _lv, _lm, exc)
 
     # ── Gradient arrows (arrows_grid view-mode) ────────────────────────────
     arrows_actor = None
@@ -2702,6 +2842,10 @@ def main(argv: list[str] | None = None) -> int:
                         arrows_actor.lighting("off")
                     except Exception:  # noqa: BLE001
                         pass
+                    try:
+                        arrows_actor.linewidth(1).linecolor("black")
+                    except Exception:  # noqa: BLE001
+                        pass
                     getattr(arrows_actor, "actor", arrows_actor).SetVisibility(0)
                     print(f"      [ui_state] gradient arrows loaded "
                           f"({len(_pts)} arrows, cmap={_arr_cmap})")
@@ -2711,6 +2855,89 @@ def main(argv: list[str] | None = None) -> int:
         else:
             logger.debug("--arrows-cache %s does not exist – "
                          "arrows_grid mode will be empty", _arr_path)
+
+    # ── Dual arrows (arrows_dual view-mode: water + air harmonic arrows) ───
+    water_dual_actor = None
+    air_dual_actor   = None
+    if not args.ignore_ui_state:
+        _dw_path = (Path(args.dual_water_cache).expanduser().resolve()
+                    if getattr(args, "dual_water_cache", None) else None)
+        _da_path = (Path(args.dual_air_cache).expanduser().resolve()
+                    if getattr(args, "dual_air_cache", None) else None)
+        _dual_data = None
+        try:
+            _dual_data = _load_or_build_dual_arrows(
+                None, None,          # harmonic/wind caches not needed for load-only
+                dual_water_cache=_dw_path if (_dw_path and _dw_path.exists()) else None,
+                dual_air_cache=_da_path   if (_da_path and _da_path.exists()) else None,
+                rebuild=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load dual arrows: %s", exc)
+        if _dual_data is not None:
+            _dual_length = DEFAULT_ARROW_LENGTH * 1.3
+            for _domain, _actor_var in (("water", "water_dual_actor"),
+                                        ("air",   "air_dual_actor")):
+                _dd = _dual_data.get(_domain)
+                if _dd is None:
+                    continue
+                try:
+                    import vedo as _vedo_d
+                    _dpts   = np.asarray(_dd["pts"],    dtype=np.float32)
+                    _ddirs  = np.asarray(_dd["dirs"],   dtype=np.float32)
+                    _dscores = np.asarray(_dd["scores"], dtype=np.float32)
+                    if len(_dpts) == 0:
+                        continue
+                    _dends = _dpts + _ddirs * _dual_length
+                    if _domain == "water":
+                        _dstops = np.array([
+                            [0.10, 0.12, 0.72],
+                            [0.25, 0.45, 1.00],
+                            [0.70, 0.35, 0.90],
+                            [0.90, 0.05, 0.05],
+                        ], dtype=np.float32)
+                        _dt = np.clip(
+                            np.nan_to_num(_dscores, nan=0.0, posinf=1.0, neginf=0.0),
+                            0.0, 1.0,
+                        ).astype(np.float32)
+                    else:  # air
+                        _dstops = np.array([
+                            [0.05, 0.38, 0.10],
+                            [0.28, 0.68, 0.12],
+                            [0.72, 0.88, 0.12],
+                        ], dtype=np.float32)
+                        _dnrm  = np.linalg.norm(_ddirs, axis=-1)
+                        _dsafe = _dnrm > 1e-9
+                        _du    = np.zeros_like(_ddirs)
+                        _du[_dsafe] = _ddirs[_dsafe] / _dnrm[_dsafe, None]
+                        _dt = np.clip(1.0 - np.abs(_du[:, 0]), 0.0, 1.0).astype(np.float32)
+                    _dseg = _dt * (len(_dstops) - 1)
+                    _di0  = np.clip(_dseg.astype(int), 0, len(_dstops) - 2)
+                    _df   = (_dseg - _di0)[:, None]
+                    _drgb = _dstops[_di0] * (1.0 - _df) + _dstops[_di0 + 1] * _df
+                    _dact = _vedo_d.Arrows(
+                        _dpts, _dends,
+                        c=(_drgb * 255).astype(np.uint8),
+                        thickness=DEFAULT_ARROW_THICKNESS,
+                    )
+                    try:
+                        _dact.lighting("off")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        _dact.linewidth(1).linecolor("black")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    getattr(_dact, "actor", _dact).SetVisibility(0)
+                    if _domain == "water":
+                        water_dual_actor = _dact
+                    else:
+                        air_dual_actor = _dact
+                    print(f"      [ui_state] dual {_domain} arrows loaded "
+                          f"({len(_dpts)} arrows)")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not build dual %s arrows actor: %s",
+                                   _domain, exc)
 
     # ── Crown Dijkstra tracks (arrows_tracks view-mode) ────────────────────
     # Instead of one monolithic actor, we build N_BINS sub-actors grouped by
@@ -2731,12 +2958,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         if _trk_path.exists():
             try:
+                _trk_stage = "imports"
                 import vtk as _vtk_t
                 from vtkmodules.util.numpy_support import (
                     vtk_to_numpy as _v2n,
                     numpy_to_vtk  as _n2v,
                 )
                 import vedo as _vedo_trk
+                _trk_stage = "load-lines-vtp"
                 _rdr_t = _vtk_t.vtkXMLPolyDataReader()
                 _rdr_t.SetFileName(str(_trk_path))
                 _rdr_t.Update()
@@ -2745,6 +2974,7 @@ def main(argv: list[str] | None = None) -> int:
                     # ── Spline (or load pre-splined cache) ───────────────
                     if (_trk_spl_path is not None
                             and _trk_spl_path.exists()):
+                        _trk_stage = "load-splined-vtp"
                         _rdr_spl = _vtk_t.vtkXMLPolyDataReader()
                         _rdr_spl.SetFileName(str(_trk_spl_path))
                         _rdr_spl.Update()
@@ -2794,192 +3024,200 @@ def main(argv: list[str] | None = None) -> int:
                     _amin = float(_b[2 * _ac])
                     _alen = max(float(_b[2 * _ac + 1]) - _amin, 1.0)
                     # ── Per-cell bin assignment (splined polylines) ───────
-                    _pts_sm  = _v2n(_pd_sm.GetPoints().GetData())
-                    _ca_sm   = _pd_sm.GetLines()
-                    _offs_sm = _v2n(_ca_sm.GetOffsetsArray()).astype(np.int64)
-                    _conn_sm = _v2n(
-                        _ca_sm.GetConnectivityArray()).astype(np.int64)
-                    _coord_pt = _pts_sm[_conn_sm, _ac].astype(np.float64)
-                    _seg_sum  = np.add.reduceat(_coord_pt, _offs_sm[:-1])
-                    _seg_cnt  = np.maximum(
-                        np.diff(_offs_sm).astype(np.float64), 1.0)
-                    _cell_bin = np.clip(
-                        ((_seg_sum / _seg_cnt - _amin) / _alen
-                         * _N_BINS).astype(int),
-                        0, _N_BINS - 1,
-                    )
-                    # ── Line bin actors ───────────────────────────────────
+                    _pts_sm = _v2n(_pd_sm.GetPoints().GetData())
+                    _ca_sm = _pd_sm.GetLines()
+                    _offs_arr = _ca_sm.GetOffsetsArray()
+                    _conn_arr = _ca_sm.GetConnectivityArray()
+                    if _offs_arr is not None and _conn_arr is not None:
+                        _offs_sm = _v2n(_offs_arr).astype(np.int64)
+                        _conn_sm = _v2n(_conn_arr).astype(np.int64)
+                    else:
+                        # VTK legacy cell-array layout fallback:
+                        # [npts, id0, id1, ..., npts, ...]
+                        _legacy = _vtk_t.vtkIdTypeArray()
+                        _ca_sm.ExportLegacyFormat(_legacy)
+                        _legacy_np = _v2n(_legacy).astype(np.int64)
+                        _offs_list = [0]
+                        _conn_list: list[int] = []
+                        _idx = 0
+                        _n_legacy = int(_legacy_np.size)
+                        while _idx < _n_legacy:
+                            _npt = int(_legacy_np[_idx])
+                            _idx += 1
+                            if _npt <= 0 or (_idx + _npt) > _n_legacy:
+                                raise ValueError(
+                                    "Malformed vtkCellArray legacy layout "
+                                    f"(idx={_idx}, npts={_npt}, size={_n_legacy})"
+                                )
+                            _conn_list.extend(_legacy_np[_idx:_idx + _npt])
+                            _idx += _npt
+                            _offs_list.append(len(_conn_list))
+                        _offs_sm = np.asarray(_offs_list, dtype=np.int64)
+                        _conn_sm = np.asarray(_conn_list, dtype=np.int64)
                     _lba = []
-                    for _bi in range(_N_BINS):
-                        _ids = np.where(_cell_bin == _bi)[0]
-                        if len(_ids) == 0:
-                            continue
-                        _idl = _vtk_t.vtkIdList()
-                        _idl.SetNumberOfIds(len(_ids))
-                        for _k2, _cid in enumerate(_ids):
-                            _idl.SetId(_k2, int(_cid))
-                        _extr = _vtk_t.vtkExtractCells()
-                        _extr.SetInputData(_pd_sm)
-                        _extr.SetCellList(_idl)
-                        _extr.Update()
-                        _geo = _vtk_t.vtkGeometryFilter()
-                        _geo.SetInputConnection(_extr.GetOutputPort())
-                        _geo.Update()
-                        _a = _vedo_trk.Mesh(_geo.GetOutput())
-                        if _tort_lut_mv is not None:
-                            _sub_cd = _geo.GetOutput().GetCellData()
-                            if _sub_cd.GetArray("tortuosity") is not None:
-                                _sub_cd.SetActiveScalars("tortuosity")
-                            _mm = _a.mapper()
-                            _mm.SetLookupTable(_tort_lut_mv)
-                            _mm.SetScalarRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
-                            _mm.ScalarVisibilityOn()
-                            _mm.SetColorModeToMapScalars()
-                        else:
+                    try:
+                        _coord_pt = _pts_sm[_conn_sm, _ac].astype(np.float64)
+                        _seg_sum  = np.add.reduceat(_coord_pt, _offs_sm[:-1])
+                        _seg_cnt  = np.maximum(
+                            np.diff(_offs_sm).astype(np.float64), 1.0)
+                        _cell_bin = np.clip(
+                            ((_seg_sum / _seg_cnt - _amin) / _alen
+                             * _N_BINS).astype(int),
+                            0, _N_BINS - 1,
+                        )
+                        # ── Line bin actors ───────────────────────────────
+                        for _bi in range(_N_BINS):
+                            _ids = np.where(_cell_bin == _bi)[0]
+                            if len(_ids) == 0:
+                                continue
+                            _idl = _vtk_t.vtkIdList()
+                            _idl.SetNumberOfIds(len(_ids))
+                            for _k2, _cid in enumerate(_ids):
+                                _idl.SetId(_k2, int(_cid))
+                            _extr = _vtk_t.vtkExtractCells()
+                            _extr.SetInputData(_pd_sm)
+                            _extr.SetCellList(_idl)
+                            _extr.Update()
+                            _geo = _vtk_t.vtkGeometryFilter()
+                            _geo.SetInputConnection(_extr.GetOutputPort())
+                            _geo.Update()
+                            _a = _vedo_trk.Mesh(_geo.GetOutput())
+                            if _tort_lut_mv is not None:
+                                _sub_cd = _geo.GetOutput().GetCellData()
+                                if _sub_cd.GetArray("tortuosity") is not None:
+                                    _sub_cd.SetActiveScalars("tortuosity")
+                                _mm = _a.mapper()
+                                _mm.SetLookupTable(_tort_lut_mv)
+                                _mm.SetScalarRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
+                                _mm.ScalarVisibilityOn()
+                                _mm.SetColorModeToMapScalars()
+                            else:
+                                try:
+                                    _a.mapper().ScalarVisibilityOff()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                _a.c(_WATER_RGB)
+                            _a.lw(TRACK_LINE_WIDTH_MOVIE).alpha(0.40)
                             try:
-                                _a.mapper().ScalarVisibilityOff()
+                                _a.lighting("off")
                             except Exception:  # noqa: BLE001
                                 pass
-                            _a.c(_WATER_RGB)
-                        _a.lw(TRACK_LINE_WIDTH_MOVIE).alpha(0.40)
-                        try:
-                            _a.lighting("off")
-                        except Exception:  # noqa: BLE001
-                            pass
-                        _a._bin_idx    = _bi
+                            _a._bin_idx    = _bi
+                            _a._base_alpha = 0.40
+                            getattr(_a, "actor", _a).SetVisibility(0)
+                            _lba.append(_a)
+                        tracks_axis_info  = {
+                            "axis_col": _ac,
+                            "axis_min": _amin,
+                            "axis_len": _alen,
+                            "n_bins":   _N_BINS,
+                            "bin_full": _BIN_FULL,
+                            "bin_fade": _BIN_FADE,
+                        }
+                    except Exception as _bin_exc:  # noqa: BLE001
+                        logger.warning(
+                            "Tracks binning failed in movie (%s); "
+                            "falling back to single tracks actor.",
+                            _bin_exc,
+                        )
+                        # Use raw VTK directly: vedo.Mesh wraps triangle
+                        # meshes, not polylines, so its mapper may not
+                        # honour cell-data LUTs reliably.
+                        _map_fallback = _vtk_t.vtkPolyDataMapper()
+                        _map_fallback.SetInputData(_pd_sm)
+                        _has_tort = (
+                            _tort_lut_mv is not None
+                            and _pd_sm.GetCellData().GetArray("tortuosity")
+                               is not None
+                        )
+                        if _has_tort:
+                            _pd_sm.GetCellData().SetActiveScalars("tortuosity")
+                            _map_fallback.SetScalarModeToUseCellData()
+                            _map_fallback.SetLookupTable(_tort_lut_mv)
+                            _map_fallback.SetScalarRange(
+                                TORTUOSITY_VMIN, TORTUOSITY_VMAX)
+                            _map_fallback.ScalarVisibilityOn()
+                            _map_fallback.SetColorModeToMapScalars()
+                        else:
+                            _map_fallback.ScalarVisibilityOff()
+                        _a = _vtk_t.vtkActor()
+                        _a.SetMapper(_map_fallback)
+                        _a.GetProperty().SetLineWidth(float(TRACK_LINE_WIDTH_MOVIE))
+                        _a.GetProperty().SetOpacity(0.40)
+                        _a.GetProperty().LightingOff()
+                        if not _has_tort:
+                            _a.GetProperty().SetColor(*_WATER_RGB)
+                        _a._bin_idx = 0
                         _a._base_alpha = 0.40
                         getattr(_a, "actor", _a).SetVisibility(0)
-                        _lba.append(_a)
+                        _lba = [_a]
+                        tracks_axis_info = None
                     print(f"      [ui_state] crown tracks lines: "
                           f"{_pd_t.GetNumberOfCells()} paths → "
                           f"{len(_lba)} populated line bins")
                     # Commit line actors immediately so that a failure in the
                     # arrow loading block below does not leave tracks empty.
                     tracks_bin_actors = list(_lba)
-                    tracks_axis_info  = {
-                        "axis_col": _ac,
-                        "axis_min": _amin,
-                        "axis_len": _alen,
-                        "n_bins":   _N_BINS,
-                        "bin_full": _BIN_FULL,
-                        "bin_fade": _BIN_FADE,
-                    }
                     # ── Arrow bin actors ──────────────────────────────────
                     _aba = []
                     if (_trk_arr_path is not None
                             and _trk_arr_path.exists()):
-                        _rdr_a = _vtk_t.vtkXMLPolyDataReader()
-                        _rdr_a.SetFileName(str(_trk_arr_path))
-                        _rdr_a.Update()
-                        _pd_g = _rdr_a.GetOutput()
-                        if _pd_g.GetNumberOfPoints() > 0:
+                        try:
+                            _trk_stage = "load-arrows-vtp"
+                            _rdr_a = _vtk_t.vtkXMLPolyDataReader()
+                            _rdr_a.SetFileName(str(_trk_arr_path))
+                            _rdr_a.Update()
+                            _pd_g = _rdr_a.GetOutput()
+                            if _pd_g.GetNumberOfPoints() <= 0:
+                                raise ValueError("tracks arrows VTP has no points")
                             _asrc = _vtk_t.vtkArrowSource()
                             _asrc.SetTipLength(0.35)
                             _asrc.SetTipRadius(0.12)
                             _asrc.SetShaftRadius(0.06)
                             _asrc.Update()
-                            # 5-stop LUT: blue → green → yellow → orange → red
-                            _slut = np.array([
-                                [0.45, 0.70, 1.00],
-                                [0.20, 0.80, 0.30],
-                                [0.95, 0.90, 0.15],
-                                [1.00, 0.55, 0.10],
-                                [0.90, 0.10, 0.10],
-                            ], dtype=np.float64)
-                            _lut = _vtk_t.vtkLookupTable()
-                            _lut.SetNumberOfTableValues(256)
-                            _lut.SetRange(0.0, 1.0)
-                            for _k in range(256):
-                                _tk  = _k / 255.0
-                                _sgk = _tk * 4.0
-                                _i0  = min(int(_sgk), 3)
-                                _fk  = _sgk - _i0
-                                _rgb = (_slut[_i0] * (1.0 - _fk)
-                                        + _slut[_i0 + 1] * _fk)
-                                _lut.SetTableValue(
-                                    _k, _rgb[0], _rgb[1], _rgb[2], 1.0)
-                            _lut.Build()
-                            # Per-point bin
-                            _tan_a = _pd_g.GetPointData().GetArray("tangents")
-                            _t_a   = _pd_g.GetPointData().GetArray("t")
-                            if _tan_a is not None and _t_a is not None:
-                                _pts_g  = _v2n(_pd_g.GetPoints().GetData())
-                                _tan_np = _v2n(_tan_a)
-                                _t_np   = _v2n(_t_a)
-                                _pt_bin = np.clip(
-                                    ((_pts_g[:, _ac] - _amin) / _alen
-                                     * _N_BINS).astype(int),
-                                    0, _N_BINS - 1,
-                                )
-                                for _bi in range(_N_BINS):
-                                    _idxs = np.where(_pt_bin == _bi)[0]
-                                    if len(_idxs) == 0:
-                                        continue
-                                    _sp = _vtk_t.vtkPolyData()
-                                    _spts = _vtk_t.vtkPoints()
-                                    _spts.SetDataTypeToDouble()
-                                    _spts.SetData(_n2v(
-                                        _pts_g[_idxs].astype(np.float64),
-                                        deep=True,
-                                        array_type=_vtk_t.VTK_DOUBLE,
-                                    ))
-                                    _sp.SetPoints(_spts)
-                                    _ta2 = _n2v(
-                                        _tan_np[_idxs].astype(np.float64),
-                                        deep=True,
-                                        array_type=_vtk_t.VTK_DOUBLE,
-                                    )
-                                    _ta2.SetName("tangents")
-                                    _sp.GetPointData().AddArray(_ta2)
-                                    _sp.GetPointData().SetActiveVectors(
-                                        "tangents")
-                                    _sa2 = _n2v(
-                                        _t_np[_idxs].astype(np.float32),
-                                        deep=True,
-                                        array_type=_vtk_t.VTK_FLOAT,
-                                    )
-                                    _sa2.SetName("t")
-                                    _sp.GetPointData().AddArray(_sa2)
-                                    _sp.GetPointData().SetActiveScalars("t")
-                                    _gl = _vtk_t.vtkGlyph3D()
-                                    _gl.SetSourceConnection(
-                                        _asrc.GetOutputPort())
-                                    _gl.SetInputData(_sp)
-                                    _gl.SetVectorModeToUseVector()
-                                    _gl.OrientOn()
-                                    try:
-                                        _gl.SetScaleModeToNoDataScaling()
-                                    except AttributeError:
-                                        _gl.SetScaleMode(3)  # VTK_DATA_SCALING_OFF
-                                    _gl.SetScaleFactor(
-                                        DEFAULT_ARROW_LENGTH * 1.2)
-                                    _gl.SetColorModeToColorByScalar()
-                                    _gl.Update()
-                                    _a = _vedo_trk.Mesh(_gl.GetOutput())
-                                    _mm = _a.mapper()
-                                    _mm.SetLookupTable(_lut)
-                                    _mm.SetScalarRange(0.0, 1.0)
-                                    _mm.ScalarVisibilityOn()
-                                    _mm.SetColorModeToMapScalars()
-                                    try:
-                                        _a.lighting("off")
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                    _a._bin_idx    = _bi
-                                    _a._base_alpha = 1.0
-                                    getattr(_a, "actor", _a).SetVisibility(0)
-                                    _aba.append(_a)
-                                print(f"      [ui_state] crown tracks arrows: "
-                                      f"{_pd_g.GetNumberOfPoints()} glyph "
-                                      f"centres → {len(_aba)} arrow bins")
+                            _gl = _vtk_t.vtkGlyph3D()
+                            _gl.SetSourceConnection(_asrc.GetOutputPort())
+                            _gl.SetInputData(_pd_g)
+                            _gl.SetVectorModeToUseVector()
+                            _gl.OrientOn()
+                            try:
+                                _gl.SetScaleModeToNoDataScaling()
+                            except AttributeError:
+                                _gl.SetScaleMode(3)  # VTK_DATA_SCALING_OFF
+                            _gl.SetScaleFactor(DEFAULT_ARROW_LENGTH * 1.2)
+                            _gl.SetColorModeToColorByScalar()
+                            _gl.Update()
+                            _a = _vedo_trk.Mesh(_gl.GetOutput())
+                            _a._bin_idx = 0
+                            _a._base_alpha = 1.0
+                            try:
+                                _a.lighting("off")
+                            except Exception:  # noqa: BLE001
+                                pass
+                            getattr(_a, "actor", _a).SetVisibility(0)
+                            _aba.append(_a)
+                            print(f"      [ui_state] crown tracks arrows: "
+                                  f"{_pd_g.GetNumberOfPoints()} glyph centres")
+                        except Exception as _arr_exc:  # noqa: BLE001
+                            logger.warning(
+                                "Tracks arrows bins failed (%s): %s",
+                                _trk_arr_path, _arr_exc,
+                            )
                     if _aba:
-                        tracks_bin_actors.extend(_aba)
+                        # Arrow bin actors are intentionally NOT merged into
+                        # tracks_bin_actors: without proper per-bin culling
+                        # all 200k glyph arrows would render simultaneously,
+                        # creating a visually overwhelming overlay.  They are
+                        # only useful when binning is active (full viewer).
+                        pass
                     print(f"      [ui_state] tracks culling: axis={_ac}, "
                           f"{len(tracks_bin_actors)} bin actors total "
                           f"(±{_BIN_FULL} full + ±{_BIN_FADE} fade)")
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not load crown tracks from %s: %s",
-                               _trk_path, exc)
+                logger.warning(
+                    "Could not load crown tracks from %s at stage '%s': %s",
+                    _trk_path, locals().get("_trk_stage", "unknown"), exc,
+                )
         else:
             logger.debug("--crown-tracks-cache %s does not exist – "
                          "arrows_tracks mode will be empty", _trk_path)
@@ -3056,6 +3294,14 @@ def main(argv: list[str] | None = None) -> int:
         if n_with_ui:
             print(f"      [ui_state] {n_with_ui}/{len(track)} frames have a "
                   f"UI state (transition={args.ui_transition_seconds:.2f}s)")
+            if args.debug_tracks:
+                _vm_counts: dict[str, int] = {}
+                for _u in ui_track:
+                    if not _u:
+                        continue
+                    _vm = str(_u.get("view_mode") or "<none>")
+                    _vm_counts[_vm] = _vm_counts.get(_vm, 0) + 1
+                print("      [debug-tracks] ui view_mode counts:", _vm_counts)
         else:
             print("      [ui_state] no UI state found in positions JSON "
                   "— skipping replay")
@@ -3132,6 +3378,10 @@ def main(argv: list[str] | None = None) -> int:
         plt.add(pillars_mesh)
     if arrows_actor is not None:
         plt.add(arrows_actor)
+    if water_dual_actor is not None:
+        plt.add(water_dual_actor)
+    if air_dual_actor is not None:
+        plt.add(air_dual_actor)
     for _tba in tracks_bin_actors:
         try:
             plt.add(_tba)
@@ -3184,9 +3434,14 @@ def main(argv: list[str] | None = None) -> int:
         lames_actor=lames_actor,
         lames_step_pds=lames_step_pds,
         lames_n_steps=lames_n_steps,
+        lames_fps=lames_fps,
+        movie_fps=args.fps,
         arrows_actor=arrows_actor,
+        water_dual_actor=water_dual_actor,
+        air_dual_actor=air_dual_actor,
         tracks_bin_actors=tracks_bin_actors,
         tracks_axis_info=tracks_axis_info,
+        debug_tracks=args.debug_tracks,
     )
 
     # Install lighting that matches the interactive viewer.
@@ -3464,6 +3719,18 @@ def main(argv: list[str] | None = None) -> int:
         # only nearby tracks are rendered (avoids visual overload).
         ui_bundle.update_tracks_bins(
             np.asarray(state["camera"]["position"], dtype=float))
+        if args.debug_tracks and i < 10:
+            _vis = 0
+            for _a in tracks_bin_actors:
+                try:
+                    _vis += int(getattr(_a, "actor", _a).GetVisibility())
+                except Exception:  # noqa: BLE001
+                    pass
+            _vm_dbg = (state.get("ui_state") or {}).get("view_mode", "<none>")
+            print(
+                f"      [debug-tracks] frame={i:03d} vm={_vm_dbg} "
+                f"tracks_visible={_vis}/{len(tracks_bin_actors)}"
+            )
 
         if ortho_billboard is not None or ortho_overlay is not None:
             # Always use the un-shifted (mono) camera position — the red

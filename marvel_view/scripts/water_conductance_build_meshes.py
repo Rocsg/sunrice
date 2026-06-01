@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import re
 from pathlib import Path
 
 # ── allow running the file directly without pip install ──────────────────────
@@ -145,6 +146,21 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("marvel_view.water_conductance_build_meshes")
+
+
+def _parse_lame2_fps_variants(raw: str) -> list[int]:
+    """Parse comma/space-separated FPS variants (e.g. ``25,90``)."""
+    vals: list[int] = []
+    for tok in re.split(r"[\s,;]+", str(raw).strip()):
+        if not tok:
+            continue
+        try:
+            v = int(tok)
+        except ValueError:
+            continue
+        if v > 0 and v not in vals:
+            vals.append(v)
+    return vals or [25]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -385,6 +401,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="RNG seed for the lame2 build.")
     p.add_argument("--lame2-workers", type=int, default=None,
                    help="Thread count for the per-label lame2 shell extraction.")
+    p.add_argument("--lame2-build-fps", default="25",
+                   help="Comma-separated output FPS variants for lame2 caches "
+                        "(e.g. '25,90').  25 keeps the native viewer cache; "
+                        "90 builds a movie-ready variant with matched duration.")
     # ── Stele / Outside mask isosurfaces (bundled with lame2) ──
     p.add_argument("--stele-tiff", default=str(DEFAULT_STELE_TIFF_PATH),
                    help="Stele_mask.tif: 8-bit binary mask for the stele.")
@@ -545,16 +565,18 @@ def main(argv: list[str] | None = None) -> int:
         args.skip_lame2      = True
 
     if args.lame2_only:
-        args.skip_mesh       = True
-        args.skip_all_mesh   = True
-        args.skip_arrows     = True
-        args.skip_overlay    = True
-        args.skip_pillars    = True
-        args.skip_dilatation = True
-        args.skip_tracks     = True
-        args.skip_density    = True
-        args.skip_membranes  = True
-        args.skip_lames      = True
+        args.skip_mesh            = True
+        args.skip_all_mesh        = True
+        args.skip_arrows          = True
+        args.skip_overlay         = True
+        args.skip_pillars         = True
+        args.skip_dilatation      = True
+        args.skip_tracks          = True
+        args.skip_density         = True
+        args.skip_membranes       = True
+        args.skip_lames           = True
+        args.skip_radial_gradient = True
+        args.skip_mask_overlays   = True
 
     if args.tracks_only:
         args.skip_mesh            = True
@@ -1068,28 +1090,60 @@ def main(argv: list[str] | None = None) -> int:
                 "Lame2 (V3): missing input TIFFs %s -- skipping.", missing,
             )
         else:
-            build_water_lame2(
-                geoddist_path=geoddist_for_l2,
-                bg_dist_path=lame2_bg_dist,
-                object_path=object_path_l2,
-                crown_path=crown_path_l2,
-                output_vtp=lame2_out,
-                output_meta=lame2_meta_out,
-                output_labels=lame2_labels_out,
-                iso_cache_dir=Path(args.lame2_iso_cache_dir),
-                rebuild_iso_cache=args.rebuild_lame2_iso_cache,
-                iso_only=args.lame2_iso_only,
-                n_seeds=args.n_lame2_seeds,
-                phase_factor=args.lame2_phase_factor,
-                step_growth=args.lame2_step_growth,
-                hold_ratio=args.lame2_hold_ratio,
-                target_tris_per_shell=args.lame2_target_tris_per_shell,
-                smooth_iter=args.lame2_smooth_iter,
-                fade_frames=args.lame2_fade_frames,
-                kmeans_iters=args.lame2_kmeans_iters,
-                seed=args.lame2_seed,
-                n_workers=args.lame2_workers,
-            )
+            fps_variants = _parse_lame2_fps_variants(args.lame2_build_fps)
+            logger.info("Lame2 FPS variants to build: %s", fps_variants)
+
+            for _fps in fps_variants:
+                if _fps == 25:
+                    _out = lame2_out
+                    _meta_out = lame2_meta_out
+                    _labels_out = lame2_labels_out
+                else:
+                    _suffix = f"_{_fps}fps"
+                    _out = lame2_out.with_name(f"{lame2_out.stem}{_suffix}{lame2_out.suffix}")
+                    _meta_out = lame2_meta_out.with_name(
+                        f"{lame2_meta_out.stem}{_suffix}{lame2_meta_out.suffix}"
+                    )
+                    _labels_out = lame2_labels_out.with_name(
+                        f"{lame2_labels_out.stem}{_suffix}{lame2_labels_out.suffix}"
+                    )
+
+                # Scale step_growth inversely with fps so that each lame's
+                # individual lifetime stays the same in real time (seconds).
+                # At 25 fps: step_growth = user value (baseline).
+                # At 90 fps: step_growth × (25/90) → 3.6× more frames per
+                # phase → same real-time duration per lame, just smoother.
+                # phase_factor is kept at its original value: Nstep then
+                # scales as fps/25 (same total real-time duration).
+                _step_growth = float(args.lame2_step_growth) * 25.0 / float(_fps)
+                logger.info(
+                    "Lame2 build variant: fps=%d  phase_factor=%d"
+                    "  step_growth=%.4f  output=%s",
+                    _fps, int(args.lame2_phase_factor), _step_growth, _out,
+                )
+                build_water_lame2(
+                    geoddist_path=geoddist_for_l2,
+                    bg_dist_path=lame2_bg_dist,
+                    object_path=object_path_l2,
+                    crown_path=crown_path_l2,
+                    output_vtp=_out,
+                    output_meta=_meta_out,
+                    output_labels=_labels_out,
+                    iso_cache_dir=Path(args.lame2_iso_cache_dir),
+                    rebuild_iso_cache=args.rebuild_lame2_iso_cache,
+                    iso_only=args.lame2_iso_only,
+                    n_seeds=args.n_lame2_seeds,
+                    phase_factor=int(args.lame2_phase_factor),
+                    fps=int(_fps),
+                    step_growth=_step_growth,
+                    hold_ratio=args.lame2_hold_ratio,
+                    target_tris_per_shell=args.lame2_target_tris_per_shell,
+                    smooth_iter=args.lame2_smooth_iter,
+                    fade_frames=args.lame2_fade_frames,
+                    kmeans_iters=args.lame2_kmeans_iters,
+                    seed=args.lame2_seed,
+                    n_workers=args.lame2_workers,
+                )
     else:
         logger.info("Skipping lame2 build (--skip-lame2).")
 

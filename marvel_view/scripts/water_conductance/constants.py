@@ -121,11 +121,19 @@ DEFAULT_LAME2_VTP_CACHE: Path = (
 DEFAULT_LAME2_META_CACHE: Path = (
     DEFAULT_VTK_OUTPUT_DIR / "lame2_meta.json"
 )
+DEFAULT_LAME2_MOVIE_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lame2_90fps.vtp"
+)
+DEFAULT_LAME2_MOVIE_META_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "lame2_meta_90fps.json"
+)
 DEFAULT_LAME2_LABELS_CACHE: Path = (
     DEFAULT_VTK_OUTPUT_DIR / "lame2_labels.tif"
 )
 DEFAULT_LAME2_BG_DIST_PATH: Path = DEFAULT_MEMBRANES_BG_DIST_PATH
 DEFAULT_LAME2_ALPHA: float = 0.30
+# Native cadence of the default lame2 cache (viewer/runtime reference).
+DEFAULT_LAME2_SOURCE_FPS: int = 25
 LAME2_TICK_MS: int = 40
 
 # Pre-baked per-step VTPs with point normals already computed.
@@ -275,8 +283,8 @@ DEFAULT_DILATATION_TIFF_PATH: Path = (
 DEFAULT_ARROW_STRIDE: int = 8          # draw stride on perpendicular axes (voxels)
 DEFAULT_LONG_AXIS_STRIDE: int = 15     # draw stride on the long volume axis
 DEFAULT_FINE_STRIDE: int = 3           # analyse field (∇, div) at this finer resolution
-DEFAULT_ARROW_LENGTH: float = 7.0 / 3  # world units – default 3× smaller than the original 7.0
-DEFAULT_ARROW_THICKNESS: float = 6.3   # vedo.Arrows `thickness=` base multiplier
+DEFAULT_ARROW_LENGTH: float = 8.4 / 3  # world units – 7.0/3 × 1.2
+DEFAULT_ARROW_THICKNESS: float = 7.56  # vedo.Arrows `thickness=` base multiplier – 6.3 × 1.2
 # Optional translucent "shadow" mesh that is overlaid on every view.
 DEFAULT_OVERLAY_TIFF_PATH: Path = (
     acfg.DEFAULT_INPUT_DIR / "Mask_cortex_Gradient.tif"
@@ -396,7 +404,7 @@ DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE: Path = (
 # Line width for track lines: interactor uses a thin line (4 pt),
 # movies use a thicker one for visibility on screen / in VR.
 TRACK_LINE_WIDTH_INTERACTOR: int = 4
-TRACK_LINE_WIDTH_MOVIE: int = 8
+TRACK_LINE_WIDTH_MOVIE: int = 6
 
 # Bin-based track visibility (mirrors the viewer + movie bin-culling system).
 # Increasing RADIUS values shows more of the root depth at any one time.

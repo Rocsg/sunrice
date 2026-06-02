@@ -687,7 +687,7 @@ class OrthoPanel3DBillboard:
         cone_length: int = 40,
         cone_half_width: int = 16,
         meters_per_voxel: float = 0.0,
-        forward_metres: float = 1.0,
+        forward_metres: float = 2.0,
         left_metres: float = 0.5,
         vert_metres: float = 0.0,
     ) -> None:
@@ -762,6 +762,9 @@ class OrthoPanel3DBillboard:
         )
         main_ren.AddActor(self._actor)
         self._renderer = main_ren
+        # Remove any mapper-level clipping planes (e.g. added by vedo/VTK
+        # internals) so the billboard is never clipped by them in VR.
+        self._poly_mapper.RemoveAllClippingPlanes()
 
         # ── Bottom-right label tile ──────────────────────────────────────
         self._br_label_tile: np.ndarray = np.zeros(
@@ -932,9 +935,14 @@ class OrthoPanel3DBillboard:
         right /= r_n
 
         D = self.focal_dist
-        fwd_vox  = D * self.forward_frac
-        left_vox = D * self.left_frac
-        vert_vox = D * self.vert_frac
+        if self._meters_per_voxel > 0.0:
+            fwd_vox  = self._forward_metres / self._meters_per_voxel
+            left_vox = self._left_metres    / self._meters_per_voxel
+            vert_vox = self._vert_metres    / self._meters_per_voxel
+        else:
+            fwd_vox  = D * self.forward_frac
+            left_vox = D * self.left_frac
+            vert_vox = D * self.vert_frac
         panel_center = (
             np.asarray(cam_pos, dtype=float)
             + travel   * fwd_vox
@@ -1371,7 +1379,7 @@ class InfoBillboard3D:
         aspect: float = 4.0,
         tile_scale: float = 1.0,
         meters_per_voxel: float = 0.0,
-        forward_metres: float = 1.0,
+        forward_metres: float = 2.0,
         left_metres: float = 0.0,
         vert_metres: float = 0.375,
     ) -> None:
@@ -1441,6 +1449,9 @@ class InfoBillboard3D:
         if target_ren is None:
             target_ren = plotter.renderers[0]
         target_ren.AddActor(self._actor)
+        # Remove any mapper-level clipping planes so the billboard is
+        # never clipped by them in VR.
+        self._actor.GetMapper().RemoveAllClippingPlanes()
 
         logger.debug(
             "InfoBillboard3D attached  (ang_w=%.1f°, aspect=%.1f, vert_frac=%.2f)",
@@ -1538,10 +1549,15 @@ class InfoBillboard3D:
             return
         right /= r_n
 
-        D = self.focal_dist
-        fwd_vox  = D * self.forward_frac
-        left_vox = D * self.left_frac
-        vert_vox = D * self.vert_frac
+        if self._meters_per_voxel > 0.0:
+            fwd_vox  = self._forward_metres / self._meters_per_voxel
+            left_vox = self._left_metres    / self._meters_per_voxel
+            vert_vox = self._vert_metres    / self._meters_per_voxel
+        else:
+            D = self.focal_dist
+            fwd_vox  = D * self.forward_frac
+            left_vox = D * self.left_frac
+            vert_vox = D * self.vert_frac
         panel_center = (
             np.asarray(cam_pos, dtype=float)
             + travel   * fwd_vox

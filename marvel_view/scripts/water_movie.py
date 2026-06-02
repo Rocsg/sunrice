@@ -128,7 +128,7 @@ PATH_LINE_WIDTH = 4                      # only used in mono / preview
 PATH_TUBE_RADIUS_FRAC    = 0.0008   # flat / preview
 PATH_TUBE_RADIUS_FRAC_VR = 0.00005  # VR (panoramic remap makes tube look larger)
 # Fixed world-space offset above the camera path along the world-up axis.
-PATH_VERTICAL_OFFSET = 3.0
+PATH_VERTICAL_OFFSET = 5.0  # raised 1 m (2 vox at 0.5 m/vox) to clear billboard
 
 
 # ──────────────────────────────────── CLI ────────────────────────────────────
@@ -3853,6 +3853,16 @@ def main(argv: list[str] | None = None) -> int:
             fxaa_contrast=args.fxaa_contrast,
             fxaa_hard_contrast=args.fxaa_hard_contrast,
         )
+        # Remove vtkFrustumCoverageCuller from every renderer.  The culler
+        # uses the *main* camera frustum to zero-out props outside its FOV.
+        # In VR360 the panoramic pass renders 6 cube faces each with a 90°
+        # camera — a billboard at 30° left is inside the cube-face frustum
+        # but outside the (narrow) main-camera FOV, so the culler drops it
+        # from the prop array before any face is rendered.  Without the
+        # culler all visible props are submitted to every cube face and the
+        # GPU clips correctly per-face.
+        for _ren in plt.renderers:
+            _ren.GetCullers().RemoveAllItems()
 
     # World-up and per-frame travel directions — needed by both the VR
     # headlight update and the ortho billboard.  Computed once here so
@@ -3902,6 +3912,10 @@ def main(argv: list[str] | None = None) -> int:
                         focal_dist=_focal_dist,
                         cell_pixels=256,
                         meters_per_voxel=args.meters_per_voxel,
+                        angular_size_deg=16.8,    # 24 ° × 0.7
+                        forward_metres=3.0,       # 3 m forward
+                        left_metres=1.73,         # 3 × tan(30°) → 30 ° to the left
+                        vert_metres=-0.26,        # 5 ° lower (−3 × tan 5°)
                     )
                     print(f"      ortho billboard attached  (Raw={raw_path.name}, "
                           f"shape={raw_volume.shape}, focal_dist={_focal_dist:.1f})")
@@ -3939,8 +3953,11 @@ def main(argv: list[str] | None = None) -> int:
                 plt, _PANEL_TITLE, _init_sub,
                 focal_dist=_focal_dist,
                 meters_per_voxel=args.meters_per_voxel,
-                angular_width_deg=24.0,
+                angular_width_deg=28.8,   # 20 % bigger than previous 24 °
                 tile_scale=1.7,
+                forward_metres=3.0,       # 3 m forward
+                left_metres=0.0,
+                vert_metres=1.40,         # 3 × tan(25°) → 25 ° above
             )
             print("      info billboard attached")
         else:
@@ -4194,6 +4211,8 @@ def main(argv: list[str] | None = None) -> int:
                 cam = renderer.GetActiveCamera()
                 _apply_camera_state(cam, state["camera"])
                 renderer.ResetCameraClippingRange()
+                _nr, _fr = cam.GetClippingRange()
+                cam.SetClippingRange(min(_nr, 2.0), _fr)
             plt.render()
             plt.screenshot(str(frames_dir / f"frame_{i + args._frame_offset:05d}.png"))
         else:
@@ -4211,7 +4230,10 @@ def main(argv: list[str] | None = None) -> int:
             for renderer in plt.renderers:
                 cam = renderer.GetActiveCamera()
                 _apply_camera_state(cam, left_state["camera"])
-                renderer.ResetCameraClippingRange()
+                # Fixed range: panoramic pass calls ResetCameraClippingRange
+                # independently per cube-face camera, but a tight fixed range
+                # on the main camera avoids any legacy Reset on this renderer.
+                cam.SetClippingRange(0.5, 10_000.0)
             plt.render()
             plt.screenshot(str(left_eye_png))
 
@@ -4219,7 +4241,7 @@ def main(argv: list[str] | None = None) -> int:
             for renderer in plt.renderers:
                 cam = renderer.GetActiveCamera()
                 _apply_camera_state(cam, right_state["camera"])
-                renderer.ResetCameraClippingRange()
+                cam.SetClippingRange(0.5, 10_000.0)
             plt.render()
             plt.screenshot(str(right_eye_png))
 
@@ -4369,6 +4391,8 @@ def _run_preview(mesh, path_line, track, *, width, height, fps) -> int:
                 cam = renderer.GetActiveCamera()
                 _apply_camera_state(cam, state["camera"])
                 renderer.ResetCameraClippingRange()
+                _nr, _fr = cam.GetClippingRange()
+                cam.SetClippingRange(min(_nr, 2.0), _fr)
             plt.render()
             _print_progress(i, total, t_start)
             dt = time.time() - tick

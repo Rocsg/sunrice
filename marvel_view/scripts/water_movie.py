@@ -51,6 +51,7 @@ from marvel_view.scripts.water_conductance import (
     DEFAULT_AIR_DUAL_ARROWS_CACHE,
     DEFAULT_ARROWS_CACHE_PATH,
     DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_VTP_CACHE,
     DEFAULT_WATER_DUAL_ARROWS_CACHE,
@@ -72,6 +73,8 @@ from marvel_view.scripts.water_conductance import (
     TRACK_BIN_RADIUS_FADE,
     TRACK_BIN_RADIUS_FULL,
     TRACK_LINE_WIDTH_MOVIE,
+    TRACK_TUBE_RADIUS_MOVIE,
+    TRACK_TUBE_SIDES_MOVIE,
     DEFAULT_MESH_CACHE_PATH,
     DEFAULT_MP4_DIR,
     DEFAULT_PILLARS_CACHE_PATH,
@@ -163,6 +166,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Laplacian smoothing iterations applied to the mesh.")
     p.add_argument("--output", "-o", default=None,
                    help="Output MP4 path (default: alongside the input JSON).")
+    p.add_argument("--prefix", "-P", default=None,
+                   help="String prepended to the auto-generated MP4 / frames-dir names "
+                        "(useful to run two renders in parallel without collisions).")
     p.add_argument("--fps", type=int, default=FPS,
                    help="Frame rate of the output movie.")
     p.add_argument("--seconds-per-segment", type=float,
@@ -307,6 +313,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "Override cube-face with --vr-cube-resolution or "
                         "canvas with --width/--height.  "
                         "Combine with --stresstest to test quickly.")
+    p.add_argument("--compromise-better", action="store_true",
+                   help="VR compromise-better mode: slightly larger canvas than "
+                        "--compromise but still below normal.  "
+                        "Sets SBS canvas to 7168\u00d71792 (3584\u00d71792 per eye, "
+                        "~87%% of normal pixels), cube-face to 3584 px, CRF 14.  "
+                        "A good middle ground when --compromise is too soft but "
+                        "--normal is too heavy for the Quest decoder.")
     p.add_argument("--trick", type=int, default=None, metavar="N",
                    help="Keep only the first N control points before "
                         "building the track.  Handy to quickly render the "
@@ -402,6 +415,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "subdivisions, pre-built by build-meshes).  When "
                         "present, skips vtkSplineFilter at load time.  "
                         f"(default: {DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE})")
+    p.add_argument("--no-tracks-small", action="store_true",
+                   help="In VR mode, use the full splined tracks VTP instead "
+                        "of the lighter half-density version "
+                        "(crown_tracks_splined_small.vtp).  Ignored in flat "
+                        "mode (small VTP is only auto-selected when --vr is "
+                        "set and the small VTP exists).")
     p.add_argument("--ui-transition-seconds", type=float, default=0.5,
                    help="Duration of the smooth ramp at every keyframe "
                         "transition for UI-state values (opacity, hue, "
@@ -439,6 +458,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "bright-near / dark-far floor gradient that helps "
                         "depth perception in enclosed cavern spaces.  "
                         "Only affects VR mode.  Default: 10.")
+    # ── Parallel rendering ─────────────────────────────────────────────────
+    p.add_argument("--parallel", type=int, default=1, metavar="N",
+                   help="Spawn N independent worker subprocesses that each "
+                        "render 1/N of the frame sequence in parallel, then "
+                        "encode once.  Each worker loads all VTK assets "
+                        "independently; ensure enough RAM for N copies.  "
+                        "Not compatible with --preview.")
+    # ── Internal flags injected by --parallel; not intended for end users ──
+    p.add_argument("--_worker", action="store_true", dest="_worker",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--_chunk-start", type=int, default=None,
+                   dest="_chunk_start", help=argparse.SUPPRESS)
+    p.add_argument("--_chunk-end",   type=int, default=None,
+                   dest="_chunk_end",   help=argparse.SUPPRESS)
+    p.add_argument("--_frame-offset", type=int, default=0,
+                   dest="_frame_offset", help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
 
@@ -2369,6 +2404,192 @@ def _summarise_control_points(control_points: List[dict]) -> None:
               f"act.pos={ap}  act.ori={ao}{flag}")
 
 
+def _run_parallel(
+    args: "argparse.Namespace",
+    control_points: list,
+    frames_per_segment: int,
+    hold_frames: int,
+    vr_mode: str,
+    frames_dir: "Path",
+    out_path: "Path",
+) -> int:
+    """Orchestrate N parallel render workers, then encode once.
+
+    The orchestrator calls ``build_track()`` (pure numpy, no VTK) to learn
+    *total_frames*, splits that range into N even chunks, and spawns N
+    independent subprocesses.  Each worker renders its slice directly into
+    *frames_dir* with the correct global frame-number offset so that ffmpeg
+    sees a contiguous ``frame_%05d.png`` sequence when all workers finish.
+    """
+    import subprocess
+
+    N = args.parallel
+
+    # ── Build track (numpy-only, no VTK) to learn total_frames ──────────
+    track, _ = build_track(
+        control_points,
+        frames_per_segment,
+        hold_frames=hold_frames,
+        ease_segments=args.ease_segments,
+        ease_strength=args.ease_strength,
+    )
+    total_frames = len(track)
+
+    # Apply the user's --stresstest slicing so chunk boundaries reflect
+    # the actual window that will be rendered by the workers.
+    if args.stresstest:
+        t_start_s = max(0.0, args.stresstest_start)
+        t_end_s   = args.stresstest_end
+        f_start   = min(total_frames - 1, int(round(t_start_s * args.fps)))
+        f_end     = min(total_frames,     int(round(t_end_s   * args.fps)))
+        total_frames = f_end - f_start
+
+    if total_frames < N:
+        print(f"  [parallel] WARNING: only {total_frames} frames for {N} workers; "
+              f"reducing to {total_frames} worker(s).")
+        N = max(1, total_frames)
+
+    print(f"  [parallel] {total_frames} frames  →  {N} workers  "
+          f"(~{total_frames // N} frames each)")
+
+    # Prepare the shared frames directory.  Clean up once here so workers
+    # don't wipe each other's output.
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    for old in frames_dir.glob("frame_*.png"):
+        old.unlink()
+
+    # ── Build worker argv: start from sys.argv, strip orchestrator flags ──
+    _FLAGS_WITH_VALUE  = {"--parallel", "--_chunk-start", "--_chunk-end", "--_frame-offset"}
+    _FLAGS_NO_VALUE    = {"--_worker"}
+    base_argv: list[str] = []
+    skip_next = False
+    for tok in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _FLAGS_WITH_VALUE:
+            skip_next = True
+            continue
+        if tok in _FLAGS_NO_VALUE:
+            continue
+        if any(tok.startswith(f + "=") for f in _FLAGS_WITH_VALUE):
+            continue
+        base_argv.append(tok)
+
+    # ── Spawn one subprocess per chunk ────────────────────────────────────
+    procs:     list[subprocess.Popen] = []
+    log_paths: list["Path"]             = []
+    for k in range(N):
+        chunk_start = k * total_frames // N
+        chunk_end   = (k + 1) * total_frames // N
+        worker_argv = base_argv + [
+            "--_worker",
+            "--_chunk-start", str(chunk_start),
+            "--_chunk-end",   str(chunk_end),
+            "--_frame-offset", str(chunk_start),
+        ]
+        cmd = [sys.executable, "-m", "marvel_view.scripts.water_movie"] + worker_argv
+        log_path = frames_dir / f"_worker_{k}.log"
+        print(f"  [parallel] spawning worker {k}:  "
+              f"frames {chunk_start}\u2013{chunk_end - 1} "
+              f"({chunk_end - chunk_start} frames)  log={log_path.name}")
+        log_paths.append(log_path)
+        procs.append(subprocess.Popen(cmd,
+                                      stdout=open(log_path, "w"),  # noqa: SIM115
+                                      stderr=subprocess.STDOUT))
+
+    # ── Monitor progress (sliding-window FPS + ETA) ───────────────────────
+    from collections import deque
+    t_mon   = time.time()
+    history: deque[tuple[float, int]] = deque()  # (timestamp, png_count)
+    while any(p.poll() is None for p in procs):
+        time.sleep(0.5)
+        now  = time.time()
+        done = len(list(frames_dir.glob("frame_*.png")))
+        history.append((now, done))
+        cutoff = now - 30.0
+        while history and history[0][0] < cutoff:
+            history.popleft()
+        if len(history) >= 2:
+            dt        = history[-1][0] - history[0][0]
+            df        = history[-1][1] - history[0][1]
+            fps_slide = df / dt if dt > 0 else 0.0
+        else:
+            elapsed_so_far = now - t_mon
+            fps_slide = done / elapsed_so_far if elapsed_so_far > 0 else 0.0
+        elapsed = now - t_mon
+        eta     = (total_frames - done) / fps_slide if fps_slide > 0 else 0.0
+        pct     = 100.0 * done / total_frames if total_frames > 0 else 0.0
+        msg = (
+            f"  frames {done:>5d}/{total_frames}  "
+            f"({pct:5.1f}%)  "
+            f"elapsed {_format_eta(elapsed)}  "
+            f"ETA {_format_eta(eta)}  "
+            f"{fps_slide:5.2f} fps"
+        )
+        sys.stdout.write("\r" + msg)
+        sys.stdout.flush()
+    sys.stdout.write("\n")
+
+    exit_codes = [p.wait() for p in procs]
+    # Close the log file handles that Popen opened.
+    for p in procs:
+        if p.stdout:
+            p.stdout.close()
+    failed = [k for k, ec in enumerate(exit_codes) if ec != 0]
+    if failed:
+        for k in failed:
+            lp = frames_dir / f"_worker_{k}.log"
+            if lp.exists():
+                print(f"\n  ── worker {k} log (last 40 lines) ──────────────")
+                lines = lp.read_text(errors="replace").splitlines()
+                print("\n".join(lines[-40:]))
+        print(f"ERROR: parallel worker(s) {failed} exited with non-zero status. "
+              f"PNG frames are preserved in {frames_dir} for inspection.")
+        return 1
+
+    # ── Codec / CRF / preset (mirrors main()'s late resolution logic) ─────
+    if args.codec == "auto":
+        codec = "h265" if vr_mode != "off" else "h264"
+    else:
+        codec = args.codec
+    crf    = args.crf    if args.crf    is not None else (20 if codec == "h265" else 18)
+    preset = args.preset if args.preset is not None else ("slow" if codec == "h265" else "medium")
+
+    # ── Encode ────────────────────────────────────────────────────────────
+    print(f"[4/4] Encoding MP4 \u2192 {out_path}")
+    ok = _encode_mp4(frames_dir, out_path, fps=args.fps,
+                     codec=codec, crf=crf, preset=preset)
+    if not ok:
+        print("      ffmpeg not available \u2013 PNG frames left in place.")
+        return 0
+
+    if not args.keep_frames:
+        for f in frames_dir.glob("frame_*.png"):
+            f.unlink()
+        try:
+            frames_dir.rmdir()
+        except OSError:
+            pass
+        print("      cleaned up intermediate frames.")
+
+    # ── VR spatial-media metadata ─────────────────────────────────────────
+    if vr_mode != "off":
+        print(f"[5/5] Tagging spatial-media metadata ({vr_mode}, SBS) \u2026")
+        tagged_ok = _tag_spatial_media(out_path, vr_mode)
+        if tagged_ok:
+            print("      MP4 is now flagged as stereoscopic equirectangular "
+                  "(left/right).  Ready for YouTube VR & Meta Quest.")
+        else:
+            print("      Could not inject metadata \u2013 the MP4 is still a "
+                  "regular SBS file but won't auto-detect as VR.")
+
+    _analyse_output_mp4(out_path, total_frames=total_frames,
+                        fps=args.fps, vr_mode=vr_mode)
+    print("Done.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.verbose:
@@ -2480,7 +2701,7 @@ def main(argv: list[str] | None = None) -> int:
     # recover sharpness on distant objects without affecting decode load.
     # For an even sharper result at the cost of render time, override with
     # --vr-cube-resolution 4096.  For a slightly larger canvas (87% of
-    # full, still lower decode load), use --width 7168 --height 1792.
+    # full, still lower decode load), use --compromise-better.
     if args.compromise:
         if not vr_user_set_size:
             if vr_mode != "off":
@@ -2491,6 +2712,18 @@ def main(argv: list[str] | None = None) -> int:
             args.vr_cube_resolution = 3072
         if args.crf is None:
             args.crf = 16
+
+    # ── Compromise-better mode (--compromise-better) ─────────────────────
+    # Slightly larger canvas than --compromise: 87 % of normal pixels,
+    # cube-face 3584 px (halfway between 3072 and 4096), CRF 14.
+    if args.compromise_better:
+        if not vr_user_set_size:
+            if vr_mode != "off":
+                args.width, args.height = 7168, 1792   # 3584×1792 per eye
+        if args.vr_cube_resolution == VR_CUBE_RESOLUTION:
+            args.vr_cube_resolution = 3584
+        if args.crf is None:
+            args.crf = 14
 
     if vr_mode != "off":
         if args.width % 2 != 0:
@@ -2519,6 +2752,8 @@ def main(argv: list[str] | None = None) -> int:
             quality_prefix = "ULTRA_"
         elif args.high:
             quality_prefix = "HIGH_"
+        elif args.compromise_better:
+            quality_prefix = f"COMPB{args.width}_"
         elif args.compromise:
             # Include canvas width so different --width overrides don't collide.
             quality_prefix = f"COMP{args.width}_"
@@ -2528,6 +2763,8 @@ def main(argv: list[str] | None = None) -> int:
             quality_prefix = "NORMAL_"
         if args.stresstest:
             quality_prefix = "STRESS_" + quality_prefix
+        if args.prefix:
+            quality_prefix = args.prefix + "_" + quality_prefix
         suffix = f"_{vr_mode}" if vr_mode != "off" else ""
         out_path = mp4_dir / (quality_prefix + positions_path.stem + suffix + ".mp4")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2582,6 +2819,15 @@ def main(argv: list[str] | None = None) -> int:
     print("═" * 72)
     _summarise_control_points(control_points)
     print("═" * 72)
+
+    # ── Parallel mode: spawn N workers BEFORE loading any VTK asset ────────
+    # The orchestrator only runs build_track() (pure numpy) to learn
+    # total_frames, then delegates all rendering to worker subprocesses.
+    if args.parallel > 1 and not args._worker and not args.preview:
+        return _run_parallel(
+            args, control_points, frames_per_segment, hold_frames,
+            vr_mode, frames_dir, out_path,
+        )
 
     # ── --print-debug: skip heavy loading, go straight to track build ──────
     # All companion-actor and mesh variables are set to empty sentinels so
@@ -2944,6 +3190,30 @@ def main(argv: list[str] | None = None) -> int:
     # position along the volume's longest axis — same system as the viewer.
     # _UiReplayBundle.update_tracks_bins() shows/hides bin actors around the
     # camera each frame, so only nearby paths are rendered at any one time.
+    #
+    # VR auto-select: when --vr is active and the half-density small VTP
+    # exists, swap to it automatically (use --no-tracks-small to override).
+    if args.vr and not getattr(args, "no_tracks_small", False):
+        _small_default = str(DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE)
+        _small_candidate = Path(
+            getattr(args, "crown_tracks_splined_cache", _small_default)
+            or _small_default
+        ).parent / DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE.name
+        if _small_candidate.exists():
+            logger.info(
+                "VR mode: auto-selecting small tracks VTP (%s).  "
+                "Pass --no-tracks-small to use the full set.",
+                _small_candidate,
+            )
+            args.crown_tracks_splined_cache = str(_small_candidate)
+        elif DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE.exists():
+            logger.info(
+                "VR mode: auto-selecting small tracks VTP (%s).",
+                DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE,
+            )
+            args.crown_tracks_splined_cache = str(
+                DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE
+            )
     tracks_bin_actors: list = []
     tracks_axis_info         = None
     if not args.ignore_ui_state and args.crown_tracks_cache:
@@ -3055,6 +3325,7 @@ def main(argv: list[str] | None = None) -> int:
                         _offs_sm = np.asarray(_offs_list, dtype=np.int64)
                         _conn_sm = np.asarray(_conn_list, dtype=np.int64)
                     _lba = []
+                    _bins_geo = "lines"  # updated to "tubes" if TubeFilter succeeds
                     try:
                         _coord_pt = _pts_sm[_conn_sm, _ac].astype(np.float64)
                         _seg_sum  = np.add.reduceat(_coord_pt, _offs_sm[:-1])
@@ -3066,42 +3337,118 @@ def main(argv: list[str] | None = None) -> int:
                             0, _N_BINS - 1,
                         )
                         # ── Line bin actors ───────────────────────────────
+                        # Mirror the viewer's pure-numpy sub-polydata
+                        # construction — avoids vtkExtractCells +
+                        # vtkGeometryFilter which fail on polyline data
+                        # in older VTK builds.
+                        _cell_pt_starts = _offs_sm[:-1]
+                        _cell_pt_counts = np.diff(_offs_sm)
+                        _tort_arr_np_mv = None
+                        if _tort_lut_mv is not None and _tort_arr_mv is not None:
+                            _tort_arr_np_mv = _v2n(_tort_arr_mv).astype(np.float32)
                         for _bi in range(_N_BINS):
                             _ids = np.where(_cell_bin == _bi)[0]
                             if len(_ids) == 0:
                                 continue
-                            _idl = _vtk_t.vtkIdList()
-                            _idl.SetNumberOfIds(len(_ids))
-                            for _k2, _cid in enumerate(_ids):
-                                _idl.SetId(_k2, int(_cid))
-                            _extr = _vtk_t.vtkExtractCells()
-                            _extr.SetInputData(_pd_sm)
-                            _extr.SetCellList(_idl)
-                            _extr.Update()
-                            _geo = _vtk_t.vtkGeometryFilter()
-                            _geo.SetInputConnection(_extr.GetOutputPort())
-                            _geo.Update()
-                            _a = _vedo_trk.Mesh(_geo.GetOutput())
-                            if _tort_lut_mv is not None:
-                                _sub_cd = _geo.GetOutput().GetCellData()
-                                if _sub_cd.GetArray("tortuosity") is not None:
-                                    _sub_cd.SetActiveScalars("tortuosity")
-                                _mm = _a.mapper()
-                                _mm.SetLookupTable(_tort_lut_mv)
-                                _mm.SetScalarRange(TORTUOSITY_VMIN, TORTUOSITY_VMAX)
-                                _mm.ScalarVisibilityOn()
-                                _mm.SetColorModeToMapScalars()
-                            else:
-                                try:
-                                    _a.mapper().ScalarVisibilityOff()
-                                except Exception:  # noqa: BLE001
-                                    pass
-                                _a.c(_WATER_RGB)
-                            _a.lw(TRACK_LINE_WIDTH_MOVIE).alpha(0.40)
+                            _sel_starts = _cell_pt_starts[_ids]
+                            _sel_counts = _cell_pt_counts[_ids]
+                            # Build contiguous point array for this bin.
+                            _flat_idx = np.concatenate([
+                                _conn_sm[int(_s):int(_s) + int(_c)]
+                                for _s, _c in zip(_sel_starts, _sel_counts)
+                            ])
+                            _sub_pts_vtk = _vtk_t.vtkPoints()
+                            _sub_pts_vtk.SetDataTypeToDouble()
+                            _sub_pts_vtk.SetData(
+                                _n2v(_pts_sm[_flat_idx].astype(np.float64),
+                                     deep=True,
+                                     array_type=_vtk_t.VTK_DOUBLE))
+                            # Legacy cell-array: [n0, 0,1,..., n1, c,c+1,...]
+                            _parts: list = []
+                            _local_off = 0
+                            for _nc in _sel_counts.tolist():
+                                _parts.append(_nc)
+                                _parts.extend(range(_local_off,
+                                                    _local_off + _nc))
+                                _local_off += _nc
+                            _vtk_ids = _n2v(
+                                np.array(_parts, dtype=np.int64),
+                                deep=True,
+                                array_type=_vtk_t.VTK_ID_TYPE)
+                            _ca_sub = _vtk_t.vtkCellArray()
+                            _ca_sub.SetCells(len(_ids), _vtk_ids)
+                            _sub_pd = _vtk_t.vtkPolyData()
+                            _sub_pd.SetPoints(_sub_pts_vtk)
+                            _sub_pd.SetLines(_ca_sub)
+                            if _tort_arr_np_mv is not None:
+                                # CellData: one value per path
+                                _tsub_cd = _n2v(
+                                    _tort_arr_np_mv[_ids], deep=True,
+                                    array_type=_vtk_t.VTK_FLOAT)
+                                _tsub_cd.SetName("tortuosity")
+                                _sub_pd.GetCellData().AddArray(_tsub_cd)
+                                _sub_pd.GetCellData().SetActiveScalars(
+                                    "tortuosity")
+                                # PointData: repeat per-cell value for every
+                                # point in that cell (np.repeat avoids
+                                # vtkCellDataToPointData which is unreliable
+                                # on legacy-format cell arrays).
+                                _tsub_pt = _n2v(
+                                    np.repeat(
+                                        _tort_arr_np_mv[_ids],
+                                        _sel_counts.astype(np.int64),
+                                    ).astype(np.float32),
+                                    deep=True,
+                                    array_type=_vtk_t.VTK_FLOAT)
+                                _tsub_pt.SetName("tortuosity")
+                                _sub_pd.GetPointData().AddArray(_tsub_pt)
+                                _sub_pd.GetPointData().SetActiveScalars(
+                                    "tortuosity")
+                            # ── TubeFilter: real 3D geometry, required in
+                            # VR where screen-space lines vanish across
+                            # panoramic cube-face seams. ──────────────────
+                            _use_tubes  = False
+                            _mapped_pd  = _sub_pd
                             try:
-                                _a.lighting("off")
+                                _tubef = _vtk_t.vtkTubeFilter()
+                                _tubef.SetInputData(_sub_pd)
+                                _tubef.SetRadius(TRACK_TUBE_RADIUS_MOVIE
+                                    * (0.8 if vr_mode != "off" else 1.0))
+                                _tubef.SetNumberOfSides(
+                                    TRACK_TUBE_SIDES_MOVIE)
+                                _tubef.CappingOff()
+                                _tubef.Update()
+                                _tube_out = _tubef.GetOutput()
+                                if _tube_out.GetNumberOfCells() > 0:
+                                    _mapped_pd = _tube_out
+                                    _use_tubes = True
+                                    _bins_geo  = "tubes"
                             except Exception:  # noqa: BLE001
                                 pass
+                            _mp = _vtk_t.vtkPolyDataMapper()
+                            _mp.SetInputData(_mapped_pd)
+                            if _tort_lut_mv is not None and _tort_arr_np_mv is not None:
+                                if _use_tubes:
+                                    _mp.SetScalarModeToUsePointData()
+                                else:
+                                    _mp.SetScalarModeToUseCellData()
+                                _mp.SetLookupTable(_tort_lut_mv)
+                                _mp.SetScalarRange(TORTUOSITY_VMIN,
+                                                   TORTUOSITY_VMAX)
+                                _mp.ScalarVisibilityOn()
+                                _mp.SetColorModeToMapScalars()
+                            else:
+                                _mp.ScalarVisibilityOff()
+                            _a = _vtk_t.vtkActor()
+                            _a.SetMapper(_mp)
+                            _prop = _a.GetProperty()
+                            if _tort_lut_mv is None or _tort_arr_np_mv is None:
+                                _prop.SetColor(*_WATER_RGB)
+                            if not _use_tubes:
+                                _prop.SetLineWidth(
+                                    float(TRACK_LINE_WIDTH_MOVIE))
+                            _prop.SetOpacity(0.40)
+                            _prop.LightingOff()
                             _a._bin_idx    = _bi
                             _a._base_alpha = 0.40
                             getattr(_a, "actor", _a).SetVisibility(0)
@@ -3120,19 +3467,40 @@ def main(argv: list[str] | None = None) -> int:
                             "falling back to single tracks actor.",
                             _bin_exc,
                         )
-                        # Use raw VTK directly: vedo.Mesh wraps triangle
-                        # meshes, not polylines, so its mapper may not
-                        # honour cell-data LUTs reliably.
-                        _map_fallback = _vtk_t.vtkPolyDataMapper()
-                        _map_fallback.SetInputData(_pd_sm)
+                        # Single-actor fallback: try TubeFilter first, then
+                        # fall through to plain polylines.
                         _has_tort = (
                             _tort_lut_mv is not None
                             and _pd_sm.GetCellData().GetArray("tortuosity")
                                is not None
                         )
+                        _fb_use_tubes = False
+                        _fb_pd = _pd_sm
+                        try:
+                            _fb_c2p = _vtk_t.vtkCellDataToPointData()
+                            _fb_c2p.SetInputData(_pd_sm)
+                            _fb_c2p.Update()
+                            _fb_tubef = _vtk_t.vtkTubeFilter()
+                            _fb_tubef.SetInputData(_fb_c2p.GetOutput())
+                            _fb_tubef.SetRadius(TRACK_TUBE_RADIUS_MOVIE
+                                * (0.8 if vr_mode != "off" else 1.0))
+                            _fb_tubef.SetNumberOfSides(TRACK_TUBE_SIDES_MOVIE)
+                            _fb_tubef.CappingOff()
+                            _fb_tubef.Update()
+                            if _fb_tubef.GetOutput().GetNumberOfCells() > 0:
+                                _fb_pd = _fb_tubef.GetOutput()
+                                _fb_use_tubes = True
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _map_fallback = _vtk_t.vtkPolyDataMapper()
+                        _map_fallback.SetInputData(_fb_pd)
                         if _has_tort:
-                            _pd_sm.GetCellData().SetActiveScalars("tortuosity")
-                            _map_fallback.SetScalarModeToUseCellData()
+                            if _fb_use_tubes:
+                                _map_fallback.SetScalarModeToUsePointData()
+                            else:
+                                _pd_sm.GetCellData().SetActiveScalars(
+                                    "tortuosity")
+                                _map_fallback.SetScalarModeToUseCellData()
                             _map_fallback.SetLookupTable(_tort_lut_mv)
                             _map_fallback.SetScalarRange(
                                 TORTUOSITY_VMIN, TORTUOSITY_VMAX)
@@ -3142,7 +3510,9 @@ def main(argv: list[str] | None = None) -> int:
                             _map_fallback.ScalarVisibilityOff()
                         _a = _vtk_t.vtkActor()
                         _a.SetMapper(_map_fallback)
-                        _a.GetProperty().SetLineWidth(float(TRACK_LINE_WIDTH_MOVIE))
+                        if not _fb_use_tubes:
+                            _a.GetProperty().SetLineWidth(
+                                float(TRACK_LINE_WIDTH_MOVIE))
                         _a.GetProperty().SetOpacity(0.40)
                         _a.GetProperty().LightingOff()
                         if not _has_tort:
@@ -3152,9 +3522,10 @@ def main(argv: list[str] | None = None) -> int:
                         getattr(_a, "actor", _a).SetVisibility(0)
                         _lba = [_a]
                         tracks_axis_info = None
-                    print(f"      [ui_state] crown tracks lines: "
-                          f"{_pd_t.GetNumberOfCells()} paths → "
-                          f"{len(_lba)} populated line bins")
+                    _n_rendered = _pd_sm.GetNumberOfCells() if _pd_sm is not None else _pd_t.GetNumberOfCells()
+                    print(f"      [ui_state] crown tracks ({_bins_geo}): "
+                          f"{_n_rendered} paths → "
+                          f"{len(_lba)} populated bins")
                     # Commit line actors immediately so that a failure in the
                     # arrow loading block below does not leave tracks empty.
                     tracks_bin_actors = list(_lba)
@@ -3247,6 +3618,14 @@ def main(argv: list[str] | None = None) -> int:
               f"({t_start_s:.1f}s – {t_end_s:.1f}s)  "
               f"→ {total_frames} frames")
 
+    # ── Worker chunk slicing (injected by --parallel; exact frame indices) ──
+    if args._chunk_start is not None:
+        track    = track   [args._chunk_start : args._chunk_end]
+        t_out_ui = t_out_ui[args._chunk_start : args._chunk_end]
+        total_frames = len(track)
+        print(f"      [worker] chunk [{args._chunk_start}, {args._chunk_end})  "
+              f"→ {total_frames} frames  (png_offset={args._frame_offset})")
+
     # In VR mode, lock the orientation to the first keyframe so the
     # spline only carries the translation component.  Any orientation
     # change in a headset is interpreted as the world tilting around
@@ -3335,8 +3714,9 @@ def main(argv: list[str] | None = None) -> int:
     # ── 3b. Render frames off-screen ──────────────────────────────────────
     print(f"[3/4] Rendering frames to {frames_dir} …")
     frames_dir.mkdir(parents=True, exist_ok=True)
-    for old in frames_dir.glob("frame_*.png"):
-        old.unlink()
+    if not args._worker:   # orchestrator already cleaned; workers share the dir
+        for old in frames_dir.glob("frame_*.png"):
+            old.unlink()
 
     if args.egl:
         try:
@@ -3559,7 +3939,7 @@ def main(argv: list[str] | None = None) -> int:
                 plt, _PANEL_TITLE, _init_sub,
                 focal_dist=_focal_dist,
                 meters_per_voxel=args.meters_per_voxel,
-                angular_width_deg=34.0,
+                angular_width_deg=24.0,
                 tile_scale=1.7,
             )
             print("      info billboard attached")
@@ -3589,27 +3969,33 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if vr_mode != "off":
             from marvel_view.visualization.colormap_bar import ColormapBar3DBillboard as _CB3D  # noqa: PLC0415
+            _cbar_vr_font = round(11 * 1.8)  # 20 — bigger text for VR headset
             _cbar_mv_density = _CB3D(
                 plt, cmap="viridis",  vmin=0.0, vmax=1.0, title="Density",
                 focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.15,
+                font_size=_cbar_vr_font,
             )
             _cbar_mv_radial = _CB3D(
                 plt, cmap="coolwarm", vmin=-1.0, vmax=1.0, title="Slope of radial density",
                 focal_dist=_focal_dist, left_frac=-0.38, vert_frac=-0.05,
+                font_size=_cbar_vr_font,
             )
             _cbar_mv_water = _CB3D(
                 plt, cmap=_WATER_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Water",
                 focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.15,
+                font_size=_cbar_vr_font,
             )
             _cbar_mv_air = _CB3D(
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Air",
                 focal_dist=_focal_dist, left_frac=-0.38, vert_frac=-0.05,
+                font_size=_cbar_vr_font,
             )
             _cbar_mv_tortuosity = _CB3D(
                 plt, cmap=TORTUOSITY_CMAP_STOPS,
                 vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
                 title="Tortuosity",
                 focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.05,
+                font_size=_cbar_vr_font,
             )
             print("      colormap billboards attached")
         else:
@@ -3680,8 +4066,9 @@ def main(argv: list[str] | None = None) -> int:
     # and every frame ends up identical to the first one (resulting in
     # an absurdly small MP4 — symptom: a 1-MB file for an 8K stereo
     # 47 s clip where every frame is bit-for-bit the same).
-    left_eye_png  = frames_dir / "_eye_left.png"
-    right_eye_png = frames_dir / "_eye_right.png"
+    _eye_suffix   = f"_{args._frame_offset}" if args._worker else ""
+    left_eye_png  = frames_dir / f"_eye_left{_eye_suffix}.png"
+    right_eye_png = frames_dir / f"_eye_right{_eye_suffix}.png"
 
     t_start = time.time()
     # Compute physical IPD once — used in the VR stereo offset per frame.
@@ -3808,7 +4195,7 @@ def main(argv: list[str] | None = None) -> int:
                 _apply_camera_state(cam, state["camera"])
                 renderer.ResetCameraClippingRange()
             plt.render()
-            plt.screenshot(str(frames_dir / f"frame_{i:05d}.png"))
+            plt.screenshot(str(frames_dir / f"frame_{i + args._frame_offset:05d}.png"))
         else:
             offset = _eye_offset(state, args.ipd_frac, _ipd_abs)
             left_state  = _shift_camera_state(state, -offset)
@@ -3849,10 +4236,12 @@ def main(argv: list[str] | None = None) -> int:
                 left_img = left_img[:h, :w]
                 right_img = right_img[:h, :w]
             sbs = np.concatenate([left_img, right_img], axis=1)
-            imageio.imwrite(str(frames_dir / f"frame_{i:05d}.png"), sbs)
+            imageio.imwrite(str(frames_dir / f"frame_{i + args._frame_offset:05d}.png"), sbs)
 
-        _print_progress(i, total_frames, t_start)
-    sys.stdout.write("\n")
+        if not args._worker:
+            _print_progress(i, total_frames, t_start)
+    if not args._worker:
+        sys.stdout.write("\n")
 
     # Clean up the per-eye scratch PNGs.
     for p in (left_eye_png, right_eye_png):
@@ -3863,6 +4252,12 @@ def main(argv: list[str] | None = None) -> int:
     del pano_passes  # explicit – release the panoramic pass references
     print(f"      rendered {total_frames} frames in "
           f"{_format_eta(time.time() - t_start)}")
+
+    # Workers: rendering done; encoding is handled by the orchestrator
+    # once all workers have finished their respective frame slices.
+    if args._worker:
+        print("      [worker] chunk complete \u2014 returning to orchestrator.")
+        return 0
 
     # Save the middle frame as a standalone, uncompressed PNG next to
     # the future MP4 so the user can verify whether residual aliasing

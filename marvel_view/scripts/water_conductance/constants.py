@@ -280,8 +280,8 @@ DEFAULT_ARROWS_CACHE_PATH: Path = (
 DEFAULT_DILATATION_TIFF_PATH: Path = (
     acfg.DEFAULT_INPUT_DIR / "dilatation_scalar_field.tiff"
 )
-DEFAULT_ARROW_STRIDE: int = 8          # draw stride on perpendicular axes (voxels)
-DEFAULT_LONG_AXIS_STRIDE: int = 15     # draw stride on the long volume axis
+DEFAULT_ARROW_STRIDE: int = 10         # draw stride on perpendicular axes (voxels)
+DEFAULT_LONG_AXIS_STRIDE: int = 20     # draw stride on the long volume axis
 DEFAULT_FINE_STRIDE: int = 3           # analyse field (∇, div) at this finer resolution
 DEFAULT_ARROW_LENGTH: float = 8.4 / 3  # world units – 7.0/3 × 1.2
 DEFAULT_ARROW_THICKNESS: float = 7.56  # vedo.Arrows `thickness=` base multiplier – 6.3 × 1.2
@@ -400,11 +400,24 @@ del _np_tort
 DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE: Path = (
     DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_splined.vtp"
 )
+# Subsampled version (stride=2 → half the paths).  Used automatically by
+# ``marvel-water-movie --vr`` to keep VR frame budgets manageable.
+# Built alongside the full splined VTP by
+# ``marvel-water-conductance-build-meshes``.
+DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_splined_small.vtp"
+)
 
 # Line width for track lines: interactor uses a thin line (4 pt),
 # movies use a thicker one for visibility on screen / in VR.
 TRACK_LINE_WIDTH_INTERACTOR: int = 4
 TRACK_LINE_WIDTH_MOVIE: int = 6
+
+# Tube rendering for track lines in movies: replaces screen-space lw() with real
+# 3D tubes, which render consistently across cube-face seams in VR panoramic mode.
+# Radius is in world units; sides=4 is a square cross-section (cheap + clean in VR).
+TRACK_TUBE_RADIUS_MOVIE: float = 0.18   # world-unit radius of each track tube
+TRACK_TUBE_SIDES_MOVIE:  int   = 4      # polygon sides (4=square, 6=rounder)
 
 # Bin-based track visibility (mirrors the viewer + movie bin-culling system).
 # Increasing RADIUS values shows more of the root depth at any one time.

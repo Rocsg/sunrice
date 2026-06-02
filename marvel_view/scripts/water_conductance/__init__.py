@@ -45,6 +45,7 @@ from .pipeline import (  # noqa: F401
     _load_or_build_mesh,
     _load_or_build_overlay_mesh,
     _parse_central_axis,
+    _write_splined_tracks_small_vtp,
     _write_splined_tracks_vtp,
     _write_tracks_arrows_vtp,
     _write_tracks_vtp,

@@ -677,7 +677,7 @@ class OrthoPanel3DBillboard:
         forward_frac: float = 0.50,
         left_frac: float = 0.38,
         vert_frac: float = 0.00,
-        angular_size_deg: float = 20.0,
+        angular_size_deg: float = 14.0,
         cell_pixels: int = 256,
         dot_radius: int = 6,
         dot_color: Tuple[int, int, int] = (255, 50, 50),
@@ -687,8 +687,8 @@ class OrthoPanel3DBillboard:
         cone_length: int = 40,
         cone_half_width: int = 16,
         meters_per_voxel: float = 0.0,
-        forward_metres: float = 2.0,
-        left_metres: float = 1.0,
+        forward_metres: float = 1.0,
+        left_metres: float = 0.5,
         vert_metres: float = 0.0,
     ) -> None:
         if raw_volume.ndim != 3:
@@ -753,34 +753,6 @@ class OrthoPanel3DBillboard:
         except AttributeError:
             pass
         self._actor.GetProperty().BackfaceCullingOff()
-
-        # ── Always-on-top depth override ────────────────────────────────
-        # When the camera passes through a tissue mesh the billboard can end
-        # up geometrically behind the mesh.  All 6 cubemap faces then fail
-        # the depth test and the panel disappears for the duration of the
-        # transit.  Two approaches applied together for robustness across VTK
-        # builds:
-        #   1. Fragment shader: override the written depth value directly.
-        #   2. Vertex shader:   force clip-space z to near-clip so the depth
-        #      test itself is won even when tag (1) is absent in this build.
-        try:
-            _sp = self._actor.GetShaderProperty()
-            _sp.AddFragmentShaderReplacement(
-                "//VTK::Depth::Impl", True,
-                "gl_FragDepth = 0.0001;\n",
-                False,
-            )
-            _sp.AddVertexShaderReplacement(
-                "//VTK::PositionVC::Impl", True,
-                "//VTK::PositionVC::Impl\n  gl_Position.z = -0.999 * gl_Position.w;\n",
-                False,
-            )
-        except Exception as _e:  # noqa: BLE001
-            logger.warning(
-                "OrthoPanel3DBillboard depth override failed (%s); "
-                "billboard may be occluded by scene geometry.",
-                _e,
-            )
 
         # Add to layer-0 renderer (passes through the panoramic pass).
         main_ren = (
@@ -959,15 +931,10 @@ class OrthoPanel3DBillboard:
             return
         right /= r_n
 
-        if self._meters_per_voxel > 0.0:
-            fwd_vox  = self._forward_metres / self._meters_per_voxel
-            left_vox = self._left_metres    / self._meters_per_voxel
-            vert_vox = self._vert_metres    / self._meters_per_voxel
-        else:
-            D = self.focal_dist
-            fwd_vox  = D * self.forward_frac
-            left_vox = D * self.left_frac
-            vert_vox = D * self.vert_frac
+        D = self.focal_dist
+        fwd_vox  = D * self.forward_frac
+        left_vox = D * self.left_frac
+        vert_vox = D * self.vert_frac
         panel_center = (
             np.asarray(cam_pos, dtype=float)
             + travel   * fwd_vox
@@ -1400,13 +1367,13 @@ class InfoBillboard3D:
         forward_frac: float = 0.50,
         left_frac: float = 0.0,
         vert_frac: float = 0.15,
-        angular_width_deg: float = 20.0,
+        angular_width_deg: float = 14.3,
         aspect: float = 4.0,
         tile_scale: float = 1.0,
         meters_per_voxel: float = 0.0,
-        forward_metres: float = 2.0,
+        forward_metres: float = 1.0,
         left_metres: float = 0.0,
-        vert_metres: float = 0.75,
+        vert_metres: float = 0.375,
     ) -> None:
         self._title       = title
         self._subtitle    = initial_subtitle
@@ -1464,26 +1431,6 @@ class InfoBillboard3D:
         except Exception:  # noqa: BLE001
             pass
         self._actor.GetProperty().BackfaceCullingOff()
-
-        # Always-on-top depth override (same rationale as OrthoPanel3DBillboard).
-        try:
-            _sp = self._actor.GetShaderProperty()
-            _sp.AddFragmentShaderReplacement(
-                "//VTK::Depth::Impl", True,
-                "gl_FragDepth = 0.0001;\n",
-                False,
-            )
-            _sp.AddVertexShaderReplacement(
-                "//VTK::PositionVC::Impl", True,
-                "//VTK::PositionVC::Impl\n  gl_Position.z = -0.999 * gl_Position.w;\n",
-                False,
-            )
-        except Exception as _e:  # noqa: BLE001
-            logger.warning(
-                "InfoBillboard3D depth override failed (%s); "
-                "billboard may be occluded by scene geometry.",
-                _e,
-            )
 
         # Add to the layer-0 renderer (panoramic pass operates on layer 0).
         target_ren = None
@@ -1591,15 +1538,10 @@ class InfoBillboard3D:
             return
         right /= r_n
 
-        if self._meters_per_voxel > 0.0:
-            fwd_vox  = self._forward_metres / self._meters_per_voxel
-            left_vox = self._left_metres    / self._meters_per_voxel
-            vert_vox = self._vert_metres    / self._meters_per_voxel
-        else:
-            D = self.focal_dist
-            fwd_vox  = D * self.forward_frac
-            left_vox = D * self.left_frac
-            vert_vox = D * self.vert_frac
+        D = self.focal_dist
+        fwd_vox  = D * self.forward_frac
+        left_vox = D * self.left_frac
+        vert_vox = D * self.vert_frac
         panel_center = (
             np.asarray(cam_pos, dtype=float)
             + travel   * fwd_vox

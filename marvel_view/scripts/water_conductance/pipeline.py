@@ -1469,6 +1469,117 @@ def _write_splined_tracks_vtp(
     )
 
 
+def _write_splined_tracks_small_vtp(
+    splined_vtp_path: Path,
+    small_vtp_path: Path,
+    *,
+    stride: int = 4,
+) -> None:
+    """Write a subsampled version of the pre-splined tracks VTP.
+
+    Every ``stride``-th polyline cell is kept (default stride=4 → quarter the
+    paths).  Points are compacted so only referenced vertices are stored.
+    CellData arrays (tortuosity, boost, …) are subsampled accordingly.
+
+    Uses ``InitTraversal`` / ``GetNextCell`` for VTK-version-safe iteration
+    (avoids ``GetOffsetsArray`` / ``GetConnectivityArray`` which return None
+    in older VTK builds).
+    """
+    import numpy as np
+    import vtk
+    from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+
+    reader = vtk.vtkXMLPolyDataReader()
+    reader.SetFileName(str(splined_vtp_path))
+    reader.Update()
+    pd = reader.GetOutput()
+    n_cells = pd.GetNumberOfCells()
+    if n_cells == 0:
+        logger.warning(
+            "_write_splined_tracks_small_vtp: source VTP has no cells: %s",
+            splined_vtp_path,
+        )
+        return
+
+    pts_np = vtk_to_numpy(pd.GetPoints().GetData()).astype(np.float64)
+
+    # VTK-version-safe: collect per-cell point-index lists via traversal.
+    ca = pd.GetLines()
+    ca.InitTraversal()
+    idl = vtk.vtkIdList()
+    all_ids: list[list[int]] = []
+    while ca.GetNextCell(idl):
+        all_ids.append([idl.GetId(j) for j in range(idl.GetNumberOfIds())])
+
+    sel_indices = list(range(0, len(all_ids), stride))
+
+    # Build compact point array (only referenced points, renumbered 0…M-1).
+    flat_old = np.concatenate(
+        [np.array(all_ids[i], dtype=np.int64) for i in sel_indices]
+    )
+    unique_old = np.unique(flat_old)          # sorted unique old indices
+    old_to_new = np.full(len(pts_np), -1, dtype=np.int64)
+    old_to_new[unique_old] = np.arange(len(unique_old), dtype=np.int64)
+    new_pts_np = pts_np[unique_old]
+
+    # Legacy cell-array format: [n0, p0, p1, …, n1, q0, q1, …, …]
+    parts: list[int] = []
+    for i in sel_indices:
+        raw_ids = np.array(all_ids[i], dtype=np.int64)
+        parts.append(len(raw_ids))
+        parts.extend(old_to_new[raw_ids].tolist())
+
+    vtk_pts = vtk.vtkPoints()
+    vtk_pts.SetDataTypeToDouble()
+    vtk_pts.SetData(
+        numpy_to_vtk(new_pts_np, deep=True, array_type=vtk.VTK_DOUBLE)
+    )
+    vtk_ids = numpy_to_vtk(
+        np.array(parts, dtype=np.int64), deep=True, array_type=vtk.VTK_ID_TYPE
+    )
+    ca_new = vtk.vtkCellArray()
+    ca_new.SetCells(len(sel_indices), vtk_ids)
+    pd_new = vtk.vtkPolyData()
+    pd_new.SetPoints(vtk_pts)
+    pd_new.SetLines(ca_new)
+
+    # Subsample each numeric CellData array.
+    src_cd = pd.GetCellData()
+    active_scalars_name: str | None = None
+    if src_cd.GetScalars() is not None:
+        active_scalars_name = src_cd.GetScalars().GetName()
+    for ai in range(src_cd.GetNumberOfArrays()):
+        arr = src_cd.GetArray(ai)
+        if arr is None:
+            continue
+        try:
+            np_arr = vtk_to_numpy(arr)
+        except Exception:  # noqa: BLE001
+            continue
+        sub = np_arr[sel_indices]
+        vtk_arr = numpy_to_vtk(np.ascontiguousarray(sub), deep=True)
+        vtk_arr.SetName(arr.GetName())
+        pd_new.GetCellData().AddArray(vtk_arr)
+    if active_scalars_name is not None:
+        pd_new.GetCellData().SetActiveScalars(active_scalars_name)
+
+    small_vtp_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetFileName(str(small_vtp_path))
+    writer.SetInputData(pd_new)
+    writer.SetDataModeToBinary()
+    writer.Write()
+    logger.info(
+        "Splined small crown tracks VTP written to %s  "
+        "(%d/%d polylines, stride=%d, %d points)",
+        small_vtp_path,
+        len(sel_indices),
+        n_cells,
+        stride,
+        len(unique_old),
+    )
+
+
 def _write_tracks_arrows_vtp(vtp_path: Path, arrows_vtp_path: Path,
                               n_arrows: int = 10) -> None:
     """Sample ``n_arrows`` evenly-spaced arrow glyphs per splined path and

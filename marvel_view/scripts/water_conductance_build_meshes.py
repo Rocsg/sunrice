@@ -41,6 +41,7 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_CENTRAL_AXIS_PATH,
     DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_CACHE,
+    DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE,
     DEFAULT_CROWN_TRACKS_VTP_CACHE,
     DEFAULT_DENSITY_ALL_CACHE,
@@ -101,6 +102,7 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     _build_radial_gradient_facet_scalars,
     _build_mesh,
     _parse_central_axis,
+    _write_splined_tracks_small_vtp,
     _write_splined_tracks_vtp,
     _write_tracks_arrows_vtp,
     _write_tracks_vtp,
@@ -461,6 +463,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Where to write the pre-splined polylines .vtp (64 "
                         "subdivisions).  When present the viewer and movie "
                         "skip the vtkSplineFilter step at load time.")
+    p.add_argument("--tracks-splined-small-vtp-output",
+                   default=str(DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE),
+                   help="Where to write the subsampled splined polylines .vtp "
+                        "(stride=2, half the paths).  Used automatically by "
+                        "marvel-water-movie --vr.  "
+                        f"(default: {DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE})")
     p.add_argument("--dp-epsilon", type=float, default=1.5,
                    help="Douglas-Peucker epsilon (voxels) for staircase "
                         "simplification before splining.  Larger values "
@@ -1293,6 +1301,19 @@ def main(argv: list[str] | None = None) -> int:
                             dp_epsilon=args.dp_epsilon,
                             spline_tension=args.spline_tension,
                         )
+                        # Write the half-density small VTP for VR rendering.
+                        small_vtp_path = Path(
+                            args.tracks_splined_small_vtp_output
+                        ).expanduser().resolve()
+                        if small_vtp_path.exists() and not args.force:
+                            logger.error(
+                                "Crown tracks small VTP already exists: %s  "
+                                "(use --force to overwrite).", small_vtp_path,
+                            )
+                        else:
+                            _write_splined_tracks_small_vtp(
+                                splined_vtp_path, small_vtp_path,
+                            )
     elif args.tracks_vtp_from_cache:
         # ── VTP-only rebuild from existing .npz (no Dijkstra re-run) ──
         import numpy as np
@@ -1350,6 +1371,19 @@ def main(argv: list[str] | None = None) -> int:
             dp_epsilon=args.dp_epsilon,
             spline_tension=args.spline_tension,
         )
+        # Write the half-density small VTP for VR rendering.
+        small_vtp_path_fc = Path(
+            args.tracks_splined_small_vtp_output
+        ).expanduser().resolve()
+        if small_vtp_path_fc.exists() and not args.force:
+            logger.error(
+                "Crown tracks small VTP already exists: %s  "
+                "(use --force to overwrite).", small_vtp_path_fc,
+            )
+        else:
+            _write_splined_tracks_small_vtp(
+                splined_vtp_path_fc, small_vtp_path_fc,
+            )
         logger.info("VTP-from-cache rebuild complete.")
     else:
         logger.info("Skipping crown tracks build (--skip-tracks).")

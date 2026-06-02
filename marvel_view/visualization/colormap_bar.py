@@ -449,6 +449,7 @@ class ColormapBar3DBillboard:
         label_w: int = _DEFAULT_LABEL_W,
         title_h: int = _DEFAULT_TITLE_H,
         pad: int = _DEFAULT_PAD,
+        font_size: int = 11,
     ) -> None:
         import math
         self._cmap = cmap
@@ -467,6 +468,7 @@ class ColormapBar3DBillboard:
             cmap, vmin, vmax, title,
             bar_w=bar_w, bar_h=bar_h,
             label_w=label_w, title_h=title_h, pad=pad,
+            font_size=font_size,
         )
         total_h, total_w = self._img.shape[:2]
         self._aspect = float(total_h) / float(total_w) if total_w > 0 else 1.0

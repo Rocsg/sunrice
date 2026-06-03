@@ -3927,9 +3927,9 @@ def main(argv: list[str] | None = None) -> int:
                         cell_pixels=256,
                         meters_per_voxel=args.meters_per_voxel,
                         angular_size_deg=16.8,    # 24 ° × 0.7
-                        forward_metres=3.0,       # 3 m forward
-                        left_metres=1.40,         # 3 × tan(25°) → 25 ° to the left
-                        vert_metres=-0.26,        # 5 ° lower (−3 × tan 5°)
+                        forward_metres=10.0,      # 10 m forward (↓ parallax)
+                        left_metres=4.67,         # 10 × tan(25°) → 25 ° to the left
+                        vert_metres=-0.87,        # 10 × tan(5°) → 5 ° lower
                     )
                     print(f"      ortho billboard attached  (Raw={raw_path.name}, "
                           f"shape={raw_volume.shape}, focal_dist={_focal_dist:.1f})")

@@ -3618,20 +3618,14 @@ def main(argv: list[str] | None = None) -> int:
               f"({t_start_s:.1f}s – {t_end_s:.1f}s)  "
               f"→ {total_frames} frames")
 
-    # ── Worker chunk slicing (injected by --parallel; exact frame indices) ──
-    if args._chunk_start is not None:
-        track    = track   [args._chunk_start : args._chunk_end]
-        t_out_ui = t_out_ui[args._chunk_start : args._chunk_end]
-        total_frames = len(track)
-        print(f"      [worker] chunk [{args._chunk_start}, {args._chunk_end})  "
-              f"→ {total_frames} frames  (png_offset={args._frame_offset})")
-
     # In VR mode, lock the orientation to the first keyframe so the
     # spline only carries the translation component.  Any orientation
     # change in a headset is interpreted as the world tilting around
     # the user → reliable motion-sickness trigger.  The user can still
     # look around freely with their head; we just keep the *virtual
     # camera basis* steady.
+    # NOTE: must run on the full track BEFORE chunk slicing so that all
+    # workers share the same locked orientation (track[0] = global frame 0).
     if vr_mode != "off":
         _lock_orientation_for_vr(track)
         print("      [VR] orientation locked to first keyframe "
@@ -3642,10 +3636,26 @@ def main(argv: list[str] | None = None) -> int:
     # info-billboard.  Wider window for VR (comfort-critical) than flat.
     # _smooth_track_positions handles short tracks (stresstest) by auto-
     # padding the signal before filtfilt — no edge-ringing artefacts.
+    # NOTE: must run on the full track BEFORE chunk slicing; applying it
+    # per-chunk would cause boundary discontinuities (each filtfilt run
+    # has independent edge-padding → positional jumps at chunk joints).
     _smooth_window = 1.0 if vr_mode != "off" else 0.6
     _smooth_track_positions(track, args.fps, window_s=_smooth_window)
     logger.info("Stage-C smoothing applied (window=%.1f s, %d frames)",
                 _smooth_window, len(track))
+
+    # ── Worker chunk slicing (injected by --parallel; exact frame indices) ──
+    # Kept AFTER VR-lock and Stage-C smoothing so those operate on the full
+    # sequence and produce consistent results across all workers.
+    # The full track is also saved for _build_path_line (cable-car line must
+    # span the whole trajectory in every worker's rendered frame).
+    full_track = track   # reference to the unsliced sequence
+    if args._chunk_start is not None:
+        track    = track   [args._chunk_start : args._chunk_end]
+        t_out_ui = t_out_ui[args._chunk_start : args._chunk_end]
+        total_frames = len(track)
+        print(f"      [worker] chunk [{args._chunk_start}, {args._chunk_end})  "
+              f"→ {total_frames} frames  (png_offset={args._frame_offset})")
 
     # ── --print-debug: analyse track, skip rendering ──────────────────
     if args.print_debug:
@@ -3691,13 +3701,17 @@ def main(argv: list[str] | None = None) -> int:
 
     path_line = None
     if show_path:
+        # Build the cable-car line from the *full* track so the green path
+        # covers the entire trajectory regardless of which chunk this worker
+        # is rendering.  Using the sliced `track` here would produce a short
+        # stub that changes shape at every chunk boundary in the final movie.
         path_line = _build_path_line(
-            track, PATH_VERTICAL_OFFSET,
+            full_track, PATH_VERTICAL_OFFSET,
             as_tube=(vr_mode != "off"),
             radius_frac=PATH_TUBE_RADIUS_FRAC_VR if vr_mode != "off" else PATH_TUBE_RADIUS_FRAC,
         )
         kind = "tube" if vr_mode != "off" else "line"
-        print(f"      built green path {kind} over {total_frames} samples")
+        print(f"      built green path {kind} over {len(full_track)} samples")
 
     # ── 3a. Preview mode: interactive replay, no PNGs, no encoding ────────
     if args.preview:
@@ -3953,8 +3967,8 @@ def main(argv: list[str] | None = None) -> int:
                 plt, _PANEL_TITLE, _init_sub,
                 focal_dist=_focal_dist,
                 meters_per_voxel=args.meters_per_voxel,
-                angular_width_deg=28.8,   # 20 % bigger than previous 24 °
-                tile_scale=1.7,
+                angular_width_deg=40.32,  # 28.8 × 1.4
+                tile_scale=2.38,          # 1.7 × 1.4
                 forward_metres=3.0,       # 3 m forward
                 left_metres=0.0,
                 vert_metres=1.40,         # 3 × tan(25°) → 25 ° above

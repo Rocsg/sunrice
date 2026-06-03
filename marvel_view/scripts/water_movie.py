@@ -214,14 +214,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "distance.  Default 0.5 m/vox (= 200 m object for "
                         "400 vox).  Set to 0 to revert to the legacy "
                         "--ipd-frac × cam-distance formula.")
-    p.add_argument("--ipd-metres", type=float, default=0.020,
+    p.add_argument("--ipd-metres", type=float, default=0.0325,
                    help="Real human inter-pupillary distance in metres "
-                        "(default 0.020 = 20 mm, reduced for VR stereo comfort). "
+                        "(default 0.0325 = 32.5 mm, half of real IPD for VR stereo comfort). "
                         "Only used together with --meters-per-voxel.")
-    p.add_argument("--panel-forward-metres", type=float, default=5.0,
+    p.add_argument("--panel-forward-metres", type=float, default=8.0,
                    help="Distance in physical metres at which VR billboard "
                         "panels (ortho map, info, colormap bars) are placed "
-                        "in front of the camera.  Default: 5 m (lower stereo "
+                        "in front of the camera.  Default: 8 m (lower stereo "
                         "parallax; use 10 m for more distant placement).")
     p.add_argument("--vr-cube-resolution", type=int, default=VR_CUBE_RESOLUTION,
                    help="Internal cubemap face size (px) used by the "

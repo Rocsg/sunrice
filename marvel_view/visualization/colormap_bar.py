@@ -444,6 +444,8 @@ class ColormapBar3DBillboard:
         left_frac: float = 0.45,
         vert_frac: float = 0.0,
         angular_size_deg: float = 6.0,
+        meters_per_voxel: float = 0.0,
+        forward_metres: float = 0.0,
         bar_w: int = _DEFAULT_BAR_W,
         bar_h: int = _DEFAULT_BAR_H,
         label_w: int = _DEFAULT_LABEL_W,
@@ -460,6 +462,8 @@ class ColormapBar3DBillboard:
         self.forward_frac = float(forward_frac)
         self.left_frac = float(left_frac)
         self.vert_frac = float(vert_frac)
+        self._meters_per_voxel = float(meters_per_voxel)
+        self._forward_metres   = float(forward_metres)
         self._angular_size_deg = float(angular_size_deg)
         # half-angle tangent for the bar *width*
         self._panel_tan_w = math.tan(math.radians(angular_size_deg / 2.0))
@@ -638,9 +642,14 @@ class ColormapBar3DBillboard:
         right /= r_n
 
         D = self.focal_dist
-        fwd_vox  = D * self.forward_frac
-        left_vox = D * self.left_frac
-        vert_vox = D * self.vert_frac
+        if self._meters_per_voxel > 0.0:
+            fwd_vox  = self._forward_metres / self._meters_per_voxel
+            left_vox = self.left_frac * fwd_vox   # left_frac = tan(horiz angle)
+            vert_vox = self.vert_frac * fwd_vox   # vert_frac = tan(vert angle)
+        else:
+            fwd_vox  = D * self.forward_frac
+            left_vox = D * self.left_frac
+            vert_vox = D * self.vert_frac
         panel_center = (
             np.asarray(cam_pos, dtype=float)
             + travel   * fwd_vox

@@ -214,10 +214,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "distance.  Default 0.5 m/vox (= 200 m object for "
                         "400 vox).  Set to 0 to revert to the legacy "
                         "--ipd-frac × cam-distance formula.")
-    p.add_argument("--ipd-metres", type=float, default=0.065,
+    p.add_argument("--ipd-metres", type=float, default=0.020,
                    help="Real human inter-pupillary distance in metres "
-                        "(default 0.065 = 65 mm).  Only used together with "
-                        "--meters-per-voxel.")
+                        "(default 0.020 = 20 mm, reduced for VR stereo comfort). "
+                        "Only used together with --meters-per-voxel.")
+    p.add_argument("--panel-forward-metres", type=float, default=5.0,
+                   help="Distance in physical metres at which VR billboard "
+                        "panels (ortho map, info, colormap bars) are placed "
+                        "in front of the camera.  Default: 5 m (lower stereo "
+                        "parallax; use 10 m for more distant placement).")
     p.add_argument("--vr-cube-resolution", type=int, default=VR_CUBE_RESOLUTION,
                    help="Internal cubemap face size (px) used by the "
                         "panoramic projection pass.  Higher = sharper but "
@@ -3899,6 +3904,7 @@ def main(argv: list[str] | None = None) -> int:
     ortho_overlay = None
     ortho_billboard = None
     _focal_dist = 100.0  # default; overwritten by the ortho-panel block below
+    _pfm = args.panel_forward_metres  # physical metres for all VR billboard panels
     if not args.no_ortho_panel:
         raw_path = (
             Path(args.raw).expanduser().resolve()
@@ -3927,9 +3933,9 @@ def main(argv: list[str] | None = None) -> int:
                         cell_pixels=256,
                         meters_per_voxel=args.meters_per_voxel,
                         angular_size_deg=16.8,    # 24 ° × 0.7
-                        forward_metres=10.0,      # 10 m forward (↓ parallax)
-                        left_metres=4.67,         # 10 × tan(25°) → 25 ° to the left
-                        vert_metres=-0.87,        # 10 × tan(5°) → 5 ° lower
+                        forward_metres=_pfm,
+                        left_metres=_pfm * 0.4663,   # tan(25°) → 25° to the left
+                        vert_metres=_pfm * -0.0875,  # tan(−5°) → 5° lower
                     )
                     print(f"      ortho billboard attached  (Raw={raw_path.name}, "
                           f"shape={raw_volume.shape}, focal_dist={_focal_dist:.1f})")
@@ -3969,9 +3975,9 @@ def main(argv: list[str] | None = None) -> int:
                 meters_per_voxel=args.meters_per_voxel,
                 angular_width_deg=40.32,  # 28.8 × 1.4
                 tile_scale=2.38,          # 1.7 × 1.4
-                forward_metres=10.0,      # 10 m forward (↓ parallax vs 3 m)
+                forward_metres=_pfm,
                 left_metres=0.0,
-                vert_metres=3.64,         # 10 × tan(20°) → 20° above
+                vert_metres=_pfm * 0.3640,   # tan(20°) → 20° above
             )
             print("      info billboard attached")
         else:
@@ -4001,32 +4007,34 @@ def main(argv: list[str] | None = None) -> int:
         if vr_mode != "off":
             from marvel_view.visualization.colormap_bar import ColormapBar3DBillboard as _CB3D  # noqa: PLC0415
             _cbar_vr_font = round(11 * 1.8)  # 20 — bigger text for VR headset
+            _cbar_kwargs = dict(
+                focal_dist=_focal_dist,
+                meters_per_voxel=args.meters_per_voxel,
+                forward_metres=_pfm,
+                left_frac=-0.38,   # tan(−20.8°) → 20.8° to the right
+                font_size=_cbar_vr_font,
+            )
             _cbar_mv_density = _CB3D(
                 plt, cmap="viridis",  vmin=0.0, vmax=1.0, title="Density",
-                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.15,
-                font_size=_cbar_vr_font,
+                vert_frac=0.15, **_cbar_kwargs,
             )
             _cbar_mv_radial = _CB3D(
                 plt, cmap="coolwarm", vmin=-1.0, vmax=1.0, title="Slope of radial density",
-                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=-0.05,
-                font_size=_cbar_vr_font,
+                vert_frac=-0.05, **_cbar_kwargs,
             )
             _cbar_mv_water = _CB3D(
                 plt, cmap=_WATER_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Water",
-                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.15,
-                font_size=_cbar_vr_font,
+                vert_frac=0.15, **_cbar_kwargs,
             )
             _cbar_mv_air = _CB3D(
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Air",
-                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=-0.05,
-                font_size=_cbar_vr_font,
+                vert_frac=-0.05, **_cbar_kwargs,
             )
             _cbar_mv_tortuosity = _CB3D(
                 plt, cmap=TORTUOSITY_CMAP_STOPS,
                 vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
                 title="Tortuosity",
-                focal_dist=_focal_dist, left_frac=-0.38, vert_frac=0.05,
-                font_size=_cbar_vr_font,
+                vert_frac=0.05, **_cbar_kwargs,
             )
             print("      colormap billboards attached")
         else:

@@ -3928,7 +3928,7 @@ def main(argv: list[str] | None = None) -> int:
                         meters_per_voxel=args.meters_per_voxel,
                         angular_size_deg=16.8,    # 24 ° × 0.7
                         forward_metres=3.0,       # 3 m forward
-                        left_metres=1.73,         # 3 × tan(30°) → 30 ° to the left
+                        left_metres=1.40,         # 3 × tan(25°) → 25 ° to the left
                         vert_metres=-0.26,        # 5 ° lower (−3 × tan 5°)
                     )
                     print(f"      ortho billboard attached  (Raw={raw_path.name}, "
@@ -3969,9 +3969,9 @@ def main(argv: list[str] | None = None) -> int:
                 meters_per_voxel=args.meters_per_voxel,
                 angular_width_deg=40.32,  # 28.8 × 1.4
                 tile_scale=2.38,          # 1.7 × 1.4
-                forward_metres=3.0,       # 3 m forward
+                forward_metres=10.0,      # 10 m forward (↓ parallax vs 3 m)
                 left_metres=0.0,
-                vert_metres=1.40,         # 3 × tan(25°) → 25 ° above
+                vert_metres=3.64,         # 10 × tan(20°) → 20° above
             )
             print("      info billboard attached")
         else:

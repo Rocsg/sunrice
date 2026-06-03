@@ -1382,6 +1382,7 @@ class InfoBillboard3D:
         forward_metres: float = 2.0,
         left_metres: float = 0.0,
         vert_metres: float = 0.375,
+        hide_when_reversed: bool = False,
     ) -> None:
         self._title       = title
         self._subtitle    = initial_subtitle
@@ -1394,6 +1395,8 @@ class InfoBillboard3D:
         self._forward_metres   = float(forward_metres)
         self._left_metres      = float(left_metres)
         self._vert_metres      = float(vert_metres)
+        self._hide_when_reversed: bool = hide_when_reversed
+        self._initial_travel: "np.ndarray | None" = None
         self._tan_x = math.tan(math.radians(float(angular_width_deg) / 2.0))
         self._tan_y = self._tan_x / float(aspect)
         self.panel_w = max(1, round(_INFO_W * tile_scale))
@@ -1454,10 +1457,12 @@ class InfoBillboard3D:
         self._actor.GetMapper().RemoveAllClippingPlanes()
 
         logger.debug(
-            "InfoBillboard3D attached  (ang_w=%.1f°, aspect=%.1f, vert_frac=%.2f)",
+            "InfoBillboard3D attached  (ang_w=%.1f°, aspect=%.1f, vert_frac=%.2f, "
+            "hide_when_reversed=%s)",
             math.degrees(2.0 * math.atan(self._tan_x)),
             self._tan_x / self._tan_y,
             self.vert_frac,
+            hide_when_reversed,
         )
 
     # ------------------------------------------------------------------
@@ -1558,6 +1563,24 @@ class InfoBillboard3D:
             fwd_vox  = D * self.forward_frac
             left_vox = D * self.left_frac
             vert_vox = D * self.vert_frac
+
+        # ── Visibility: hide when travel direction has reversed ───────────
+        # On the first call we record the initial travel direction as reference.
+        # On subsequent calls, if hide_when_reversed is set and the dot product
+        # with the initial direction is negative (angle > 90°), the billboard
+        # is hidden to avoid pseudoscopic stereo during U-turns.
+        if self._hide_when_reversed:
+            if self._initial_travel is None:
+                self._initial_travel = travel.copy()
+                self._actor.VisibilityOn()
+            else:
+                dot = float(np.dot(travel, self._initial_travel))
+                if dot < 0.0:
+                    self._actor.VisibilityOff()
+                    return
+                else:
+                    self._actor.VisibilityOn()
+
         panel_center = (
             np.asarray(cam_pos, dtype=float)
             + travel   * fwd_vox

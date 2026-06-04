@@ -118,17 +118,31 @@ VR_CUBE_RESOLUTION = 2048                # internal cube-face size (px) – 2048
                                          # gives noticeably sharper output
                                          # than 1024 with ~2× cost.
 
-# Green "cable-car" trajectory line.
-PATH_COLOR = (0, 220, 60)
-PATH_LINE_WIDTH = 4                      # only used in mono / preview
+# "Cable-car" trajectory line — visual style.  1 voxel ≈ 0.5 m in world space.
+PATH_COLOR            = (155, 231, 199)   # #9BE7C7 — desaturated cyan-green
+PATH_RING_COLOR       = (200, 240, 228)   # #C8F0E4 — graduation collars (flat)
+PATH_RING_COLOR_VR    = (214, 245, 236)   # #D6F5EC — graduation collars (VR, pale opaque)
+PATH_CHEVRON_COLOR    = (155, 231, 199)   # same as cable (flat)
+PATH_CHEVRON_COLOR_VR = (214, 245, 236)   # pale (VR)
+PATH_OPACITY          = 0.55             # cable flat/preview  (VR always 1.0 — see note)
+PATH_RING_OPACITY     = 0.40             # collars flat/preview (VR always 1.0)
+PATH_CHEVRON_OPACITY  = 0.40             # chevrons flat/preview (VR always 1.0)
+# NOTE on VR transparency: vtkPanoramicProjectionPass bypasses VTK's GL-state
+# cache between cube faces, making translucency unreliable (see _setup_panoramic_pass
+# for details).  All path decorations are therefore forced to alpha=1.0 in VR;
+# the desaturated palette keeps them visually unobtrusive.
+PATH_LINE_WIDTH          = 4                 # only used in mono / preview
 # Tube radius as a fraction of the median camera-to-focal distance.
 # A real 3D tube (vs. a screen-space Line) is needed for VR because
 # vtkPanoramicProjectionPass remaps 6 cube faces to equirect, and a
 # 4-px-wide Line shrinks to sub-pixel — invisible — after that remap.
-PATH_TUBE_RADIUS_FRAC    = 0.0008   # flat / preview
-PATH_TUBE_RADIUS_FRAC_VR = 0.00005  # VR (panoramic remap makes tube look larger)
+PATH_TUBE_RADIUS_FRAC    = 0.00072   # flat / preview  (−10 % vs former 0.0008)
+PATH_TUBE_RADIUS_FRAC_VR = 0.000045  # VR              (−10 % vs former 0.00005)
+# Decoration spacing: 10 vox ≈ 5 m, 20 vox ≈ 10 m.
+PATH_RING_SPACING     = 10.0   # collar every  5 m
+PATH_CHEVRON_SPACING  = 20.0   # direction cone every 10 m
 # Fixed world-space offset above the camera path along the world-up axis.
-PATH_VERTICAL_OFFSET = 5.0  # raised 1 m (2 vox at 0.5 m/vox) to clear billboard
+PATH_VERTICAL_OFFSET = 8.0  # raised 4 m (8 vox at 0.5 m/vox) to clear billboard
 
 
 # ──────────────────────────────────── CLI ────────────────────────────────────
@@ -1943,8 +1957,9 @@ def _world_up_from_track(track: Sequence[dict]) -> np.ndarray:
 
 
 def _build_path_line(track: Sequence[dict], offset: float,
-                     *, as_tube: bool = False, radius_frac: float = PATH_TUBE_RADIUS_FRAC):
-    """Return a green trajectory above the camera path.
+                     *, as_tube: bool = False, radius_frac: float = PATH_TUBE_RADIUS_FRAC,
+                     vr_mode: str = "off"):
+    """Return the cable-car trajectory line above the camera path.
 
     When ``as_tube`` is true a real 3-D :class:`vedo.Tube` is returned
     instead of a :class:`vedo.Line`.  This is required for VR rendering
@@ -1952,6 +1967,9 @@ def _build_path_line(track: Sequence[dict], offset: float,
     into an equirectangular image, and a screen-space Line collapses to
     sub-pixel width during that remap (so it disappears).  A tube is
     real geometry and is sampled correctly by any projection.
+
+    Returns the actor **and** the computed tube radius so callers can
+    reuse it for decoration sizing without recomputing.
     """
     import vedo
     cam_positions = np.array([t["camera"]["position"] for t in track])
@@ -1961,6 +1979,7 @@ def _build_path_line(track: Sequence[dict], offset: float,
     up = _world_up_from_track(track)
     line_pts = cam_positions + up * offset
     color = [c / 255.0 for c in PATH_COLOR]
+    _opacity = 1.0 if vr_mode != "off" else PATH_OPACITY
     if as_tube:
         radius = median_dist * radius_frac
         obj = vedo.Tube(line_pts, r=radius, c=color, res=16)
@@ -1985,13 +2004,159 @@ def _build_path_line(track: Sequence[dict], offset: float,
             pass
         obj.color(color)
     else:
+        radius = median_dist * radius_frac
         obj = vedo.Line(line_pts, c=color, lw=PATH_LINE_WIDTH)
+    obj.alpha(_opacity)
     try:
         obj.lighting("off")
     except Exception:  # noqa: BLE001
         pass
     obj.name = "cable_car_path"
-    return obj
+    return obj, radius
+
+
+def _build_path_rings(
+    track: Sequence[dict],
+    offset: float,
+    tube_radius: float,
+    *,
+    vr_mode: str = "off",
+) -> list:
+    """Return torus-like collar actors evenly spaced along the cable.
+
+    Each collar is a thin :class:`vedo.Tube` wrapped around a circle in
+    the plane perpendicular to the local path tangent.  Spacing is
+    ``PATH_RING_SPACING`` voxels (≈ 5 m at 0.5 m/vox).  In VR, alpha is
+    forced to 1.0 (translucency unreliable — see ``_setup_panoramic_pass``).
+    """
+    import vedo
+
+    cam_positions = np.array([t["camera"]["position"] for t in track])
+    up = _world_up_from_track(track)
+    line_pts = cam_positions + up * offset
+
+    seg_lens = np.linalg.norm(np.diff(line_pts, axis=0), axis=1)
+    arc_len = np.concatenate([[0.0], np.cumsum(seg_lens)])
+    total_len = arc_len[-1]
+    if total_len < 1e-6 or tube_radius < 1e-12:
+        return []
+
+    color = [c / 255.0 for c in (PATH_RING_COLOR_VR if vr_mode != "off" else PATH_RING_COLOR)]
+    alpha = 1.0 if vr_mode != "off" else PATH_RING_OPACITY
+    ring_r = 3.0 * tube_radius
+    ring_thickness = 0.5 * tube_radius
+
+    actors: list = []
+    s = PATH_RING_SPACING
+    while s < total_len:
+        idx = int(np.searchsorted(arc_len, s)) - 1
+        idx = int(np.clip(idx, 0, len(line_pts) - 2))
+        frac = (s - arc_len[idx]) / max(arc_len[idx + 1] - arc_len[idx], 1e-12)
+        pos = line_pts[idx] + frac * (line_pts[idx + 1] - line_pts[idx])
+
+        i0 = max(idx - 1, 0)
+        i1 = min(idx + 1, len(line_pts) - 1)
+        tangent = _normalize(line_pts[i1] - line_pts[i0])
+
+        # Two orthogonal vectors spanning the plane perpendicular to tangent.
+        ref = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(tangent, ref)) > 0.9:
+            ref = np.array([1.0, 0.0, 0.0])
+        u = _normalize(np.cross(tangent, ref))
+        v = np.cross(tangent, u)
+        angles = np.linspace(0.0, 2.0 * np.pi, 25)
+        circle_pts = pos + ring_r * (
+            np.outer(np.cos(angles), u) + np.outer(np.sin(angles), v)
+        )
+
+        ring = vedo.Tube(circle_pts, r=ring_thickness, c=color, res=8)
+        try:
+            pd = ring.dataset
+        except AttributeError:
+            pd = ring.polydata()
+        for _attr in (pd.GetPointData(), pd.GetCellData()):
+            for _i in range(_attr.GetNumberOfArrays() - 1, -1, -1):
+                _attr.RemoveArray(_i)
+        try:
+            _mp = ring.mapper
+            if callable(_mp):
+                _mp = _mp()
+            if _mp is not None:
+                _mp.ScalarVisibilityOff()
+        except Exception:  # noqa: BLE001
+            pass
+        ring.color(color)
+        ring.alpha(alpha)
+        try:
+            ring.lighting("off")
+        except Exception:  # noqa: BLE001
+            pass
+        ring.name = "cable_car_ring"
+        actors.append(ring)
+        s += PATH_RING_SPACING
+
+    return actors
+
+
+def _build_path_chevrons(
+    track: Sequence[dict],
+    offset: float,
+    tube_radius: float,
+    *,
+    vr_mode: str = "off",
+) -> list:
+    """Return small cone actors pointing in the direction of travel.
+
+    Cones are placed every ``PATH_CHEVRON_SPACING`` voxels (≈ 10 m).
+    In VR, alpha is forced to 1.0 (see ``_setup_panoramic_pass``).
+    """
+    import vedo
+
+    cam_positions = np.array([t["camera"]["position"] for t in track])
+    up = _world_up_from_track(track)
+    line_pts = cam_positions + up * offset
+
+    seg_lens = np.linalg.norm(np.diff(line_pts, axis=0), axis=1)
+    arc_len = np.concatenate([[0.0], np.cumsum(seg_lens)])
+    total_len = arc_len[-1]
+    if total_len < 1e-6 or tube_radius < 1e-12:
+        return []
+
+    color = [c / 255.0 for c in (PATH_CHEVRON_COLOR_VR if vr_mode != "off" else PATH_CHEVRON_COLOR)]
+    alpha = 1.0 if vr_mode != "off" else PATH_CHEVRON_OPACITY
+    cone_r = 2.5 * tube_radius
+    cone_h = 5.0 * tube_radius
+
+    actors: list = []
+    s = PATH_CHEVRON_SPACING
+    while s < total_len:
+        idx = int(np.searchsorted(arc_len, s)) - 1
+        idx = int(np.clip(idx, 0, len(line_pts) - 2))
+        frac = (s - arc_len[idx]) / max(arc_len[idx + 1] - arc_len[idx], 1e-12)
+        pos = line_pts[idx] + frac * (line_pts[idx + 1] - line_pts[idx])
+
+        i0 = max(idx - 1, 0)
+        i1 = min(idx + 1, len(line_pts) - 1)
+        tangent = _normalize(line_pts[i1] - line_pts[i0])
+
+        cone = vedo.Cone(
+            pos=pos.tolist(),
+            r=cone_r,
+            height=cone_h,
+            axis=tangent.tolist(),
+            c=color,
+            res=12,
+        )
+        cone.alpha(alpha)
+        try:
+            cone.lighting("off")
+        except Exception:  # noqa: BLE001
+            pass
+        cone.name = "cable_car_chevron"
+        actors.append(cone)
+        s += PATH_CHEVRON_SPACING
+
+    return actors
 
 
 # ─────────────────────────── anti-aliasing helpers ───────────────────────────
@@ -2820,7 +2985,7 @@ def main(argv: list[str] | None = None) -> int:
                     else ("slow" if _codec_pick == "h265" else "medium"))
     print(f"  Encoder          : {_codec_pick}  CRF {_crf_pick}  "
           f"preset {_preset_pick}")
-    print(f"  Show path line   : {'yes (green)' if show_path else 'no'}")
+    print(f"  Show path line   : {'yes' if show_path else 'no'}")
     print("═" * 72)
     _summarise_control_points(control_points)
     print("═" * 72)
@@ -3705,18 +3870,26 @@ def main(argv: list[str] | None = None) -> int:
             _entry["ui_state"] = _ui
 
     path_line = None
+    path_extras: list = []
     if show_path:
-        # Build the cable-car line from the *full* track so the green path
+        # Build the cable-car line from the *full* track so the path
         # covers the entire trajectory regardless of which chunk this worker
         # is rendering.  Using the sliced `track` here would produce a short
         # stub that changes shape at every chunk boundary in the final movie.
-        path_line = _build_path_line(
+        _rfrac = PATH_TUBE_RADIUS_FRAC_VR if vr_mode != "off" else PATH_TUBE_RADIUS_FRAC
+        path_line, _tube_r = _build_path_line(
             full_track, PATH_VERTICAL_OFFSET,
             as_tube=(vr_mode != "off"),
-            radius_frac=PATH_TUBE_RADIUS_FRAC_VR if vr_mode != "off" else PATH_TUBE_RADIUS_FRAC,
+            radius_frac=_rfrac,
+            vr_mode=vr_mode,
+        )
+        path_extras = (
+            _build_path_rings(full_track, PATH_VERTICAL_OFFSET, _tube_r, vr_mode=vr_mode)
+            + _build_path_chevrons(full_track, PATH_VERTICAL_OFFSET, _tube_r, vr_mode=vr_mode)
         )
         kind = "tube" if vr_mode != "off" else "line"
-        print(f"      built green path {kind} over {len(full_track)} samples")
+        print(f"      built cable-car path {kind} over {len(full_track)} samples"
+              f", {len(path_extras)} decoration actors")
 
     # ── 3a. Preview mode: interactive replay, no PNGs, no encoding ────────
     if args.preview:
@@ -3728,6 +3901,7 @@ def main(argv: list[str] | None = None) -> int:
             width=min(args.width, 1920),
             height=min(args.height, 1080),
             fps=args.fps,
+            path_extras=path_extras,
         )
 
     # ── 3b. Render frames off-screen ──────────────────────────────────────
@@ -3798,6 +3972,8 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning("Could not add lames actor: %s", exc)
     if path_line is not None:
         plt.add(path_line)
+    for _pex in path_extras:
+        plt.add(_pex)
     plt.show(interactive=False, resetcam=True)
 
     # Enable FXAA on every renderer (post-process; works for both mono
@@ -3932,7 +4108,7 @@ def main(argv: list[str] | None = None) -> int:
                         focal_dist=_focal_dist,
                         cell_pixels=256,
                         meters_per_voxel=args.meters_per_voxel,
-                        angular_size_deg=16.8,    # 24 ° × 0.7
+                        angular_size_deg=14.28,   # 16.8 × 0.85
                         forward_metres=_pfm,
                         left_metres=_pfm * 0.4663,   # tan(25°) → 25° to the left
                         vert_metres=_pfm * -0.0875,  # tan(−5°) → 5° lower
@@ -3973,7 +4149,7 @@ def main(argv: list[str] | None = None) -> int:
                 plt, _PANEL_TITLE, _init_sub,
                 focal_dist=_focal_dist,
                 meters_per_voxel=args.meters_per_voxel,
-                angular_width_deg=40.32,  # 28.8 × 1.4
+                angular_width_deg=34.27,  # 40.32 × 0.85
                 tile_scale=2.38,          # 1.7 × 1.4
                 forward_metres=_pfm,
                 left_metres=0.0,
@@ -4379,7 +4555,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _run_preview(mesh, path_line, track, *, width, height, fps) -> int:
+def _run_preview(mesh, path_line, track, *, width, height, fps, path_extras=None) -> int:
     """Open an interactive window and animate through ``track``.
 
     Closing the window stops playback.  Camera + actor are driven the
@@ -4396,6 +4572,8 @@ def _run_preview(mesh, path_line, track, *, width, height, fps) -> int:
     plt.add(mesh)
     if path_line is not None:
         plt.add(path_line)
+    for _pex in (path_extras or []):
+        plt.add(_pex)
     plt.show(interactive=False, resetcam=True)
 
     actor = getattr(mesh, "actor", None) or mesh

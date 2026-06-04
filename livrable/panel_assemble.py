@@ -11,12 +11,11 @@ Panel layout  (soft boundaries are 10° past each cardinal point):
   Panel4:   0° (hard) → 100° (soft)   North hard-start, East+10°S soft-end
   Panel3: 100° (soft) → 190° (soft)   South+10°W soft-end
   Panel2: 190° (soft) → 280° (soft)   West+10°N soft-end
-  Panel1: 280° (soft) → 360°/0° (hard)  sharp cut into Panel4
+  Panel1: 280° (soft) → 0°/360° (soft)  back to Panel4
 
 Transitions:
-  - Variable-width cross-fade at 100°, 190°, 280° boundaries
+  - Variable-width cross-fade at ALL 4 boundaries: 0°, 100°, 190°, 280°
   - Width: 15° at periphery (r=900), 40° at centre (r=0), linear in r
-  - Hard cuts at 0° (Panel4 start = Panel1 end)
 
 Dependencies: numpy, Pillow  (no VTK required)
 """
@@ -91,13 +90,28 @@ def main():
     a_3_2 = alpha(B_3_2)   # 0 = Panel3 side,  1 = Panel2 side
     a_2_1 = alpha(B_2_1)   # 0 = Panel2 side,  1 = Panel1 side
 
-    # ── Weight maps ───────────────────────────────────────────────────────────
-    # Product formula: each panel fades in through its left boundary and
-    # fades out through its right boundary.  Weights sum to 1 in all
-    # transition zones; the 350°–360° black gap has total weight 0.
+    # Wrap-aware alpha at the 0°/360° boundary (Panel1 → Panel4).
+    # Map angles in (180°, 360°) to negative values so the boundary at 0°
+    # is treated symmetrically: e.g. 355° → -5°, 5° → +5°.
+    d_1_4 = np.where(angles > 180.0, angles - 360.0, angles)
+    a_1_4 = np.clip((d_1_4 + half_T) / T, 0.0, 1.0)  # 0 = Panel1 side, 1 = Panel4 side
 
-    # Panel4: hard start at 0°, soft end at B_4_3
-    w4 = np.clip(1.0 - a_4_3, 0.0, 1.0)
+    # In the wrap-transition zone around 0°/360°, a_2_1 is erroneously 0
+    # (angle 0° is far from boundary 280°), but Panel1 is fully faded in there.
+    # Force it to 1 so the product formula gives the correct fade-out via a_1_4.
+    # In the wrap-transition zone (|d_1_4| < half_T):
+    #   - Panel1 is fully faded-in from its left boundary → force a_2_1 = 1
+    #   - Panel4 hasn't yet passed its right boundary (B_4_3) → force a_4_3 = 0
+    in_wrap = np.abs(d_1_4) < half_T
+    a_2_1 = np.where(in_wrap, 1.0, a_2_1)
+    a_4_3 = np.where(in_wrap, 0.0, a_4_3)
+
+    # ── Weight maps ───────────────────────────────────────────────────────────
+    # Product formula: each panel fades in at its left boundary and out at its
+    # right boundary.  Weights sum to 1 everywhere.
+
+    # Panel4: soft start at 0° (from Panel1), soft end at B_4_3
+    w4 = np.clip(a_1_4, 0.0, 1.0) * np.clip(1.0 - a_4_3, 0.0, 1.0)
 
     # Panel3: soft start at B_4_3, soft end at B_3_2
     w3 = np.clip(a_4_3, 0.0, 1.0) * np.clip(1.0 - a_3_2, 0.0, 1.0)
@@ -105,8 +119,8 @@ def main():
     # Panel2: soft start at B_3_2, soft end at B_2_1
     w2 = np.clip(a_3_2, 0.0, 1.0) * np.clip(1.0 - a_2_1, 0.0, 1.0)
 
-    # Panel1: soft start at B_2_1, hard cut at 360°/0° (sharp join with Panel4)
-    w1 = np.clip(a_2_1, 0.0, 1.0)
+    # Panel1: soft start at B_2_1, soft end at 0°/360°
+    w1 = np.clip(a_2_1, 0.0, 1.0) * np.clip(1.0 - a_1_4, 0.0, 1.0)
 
     # ── Composite ─────────────────────────────────────────────────────────────
     print("Compositing…")

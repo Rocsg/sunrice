@@ -811,48 +811,61 @@ class OrthoPanel3DBillboard:
     # ── bottom-right label tile ──────────────────────────────────────────
 
     def _make_br_label_tile(self, speed_text: str) -> np.ndarray:
-        """Render a ``(cell, cell, 3)`` tile: 'Maps' header + travel speed line."""
+        """Render a ``(cell, cell, 3)`` tile: 'Map' header + travel speed lines.
+
+        Layout (top → bottom):
+          • "Map"   — 2× bigger than the former title font
+          • blank line gap
+          • "Speed" — 2× bigger than the former speed font
+          • speed value (same large font)
+        """
         tile = np.zeros((self.cell, self.cell, 3), dtype=np.uint8)
         try:
             from PIL import Image as _PIL_Image, ImageDraw as _PIL_Draw, ImageFont as _PIL_Font  # noqa: PLC0415
             _fg_header = (200, 200, 200)
             _fg_speed  = (160, 220, 255)
-            _bg        = (12, 12, 12)
             _lm        = max(3, self.cell // 32)
-            _fsize_big = max(8, round(self.cell / 8))
-            _fsize_sm  = max(7, round(self.cell / 12))
+            # 2× the former sizes (were cell/8 and cell/12).
+            _fsize_title = max(8, round(self.cell / 4))   # was cell/8
+            _fsize_spd   = max(7, round(self.cell / 6))   # was cell/12
             try:
-                _font_big = _PIL_Font.load_default(size=_fsize_big)
-                _font_sm  = _PIL_Font.load_default(size=_fsize_sm)
+                _font_title = _PIL_Font.load_default(size=_fsize_title)
+                _font_spd   = _PIL_Font.load_default(size=_fsize_spd)
             except TypeError:
-                _font_big = _font_sm = _PIL_Font.load_default()
+                _font_title = _font_spd = _PIL_Font.load_default()
             _pil = _PIL_Image.new("RGB", (self.cell, self.cell), (0, 0, 0))
             _d   = _PIL_Draw.Draw(_pil)
-            _box_w = self.cell - 2 * _lm
-            # measure heights
-            try:
-                _bb1 = _d.textbbox((0, 0), "Maps", font=_font_big)
-                _h1  = _bb1[3] - _bb1[1]
-                _spd_label = f"travel speed={speed_text}" if speed_text else "travel speed="
-                _bb2 = _d.textbbox((0, 0), _spd_label, font=_font_sm)
-                _h2  = _bb2[3] - _bb2[1]
-            except AttributeError:
-                _h1 = _fsize_big; _h2 = _fsize_sm; _spd_label = f"travel speed={speed_text}" if speed_text else "travel speed="
-            _gap   = max(2, self.cell // 32)
-            _total = _h1 + _gap + _h2
-            _box_h = _total + 2 * _gap
-            _vy    = (self.cell - _box_h) // 2
-            _d.rectangle([_lm, _vy, _lm + _box_w, _vy + _box_h], fill=_bg)
-            try:
-                _tw1 = _bb1[2] - _bb1[0]
-                _d.text((_lm + (_box_w - _tw1) // 2, _vy + _gap), "Maps",
-                        font=_font_big, fill=_fg_header)
-                _tw2 = _bb2[2] - _bb2[0]
-                _d.text((_lm + (_box_w - _tw2) // 2, _vy + _gap + _h1 + _gap),
-                        _spd_label, font=_font_sm, fill=_fg_speed)
-            except Exception:  # noqa: BLE001
-                _d.text((_lm + 2, _vy + _gap), "Maps", fill=_fg_header)
-                _d.text((_lm + 2, _vy + _gap + _h1 + _gap), _spd_label, fill=_fg_speed)
+            _gap  = max(2, self.cell // 32)
+            _bw   = self.cell - 2 * _lm
+
+            def _tw(text, font):
+                try:
+                    bb = _d.textbbox((0, 0), text, font=font)
+                    return bb[2] - bb[0], bb[3] - bb[1]
+                except AttributeError:
+                    return self.cell - 2 * _lm, _fsize_title
+
+            _w_map, _h_map   = _tw("Map",   _font_title)
+            _w_spd, _h_spd   = _tw("Speed", _font_spd)
+            _val_text = speed_text if speed_text else "\u2014"
+            _w_val, _h_val   = _tw(_val_text, _font_spd)
+
+            # Total height: "Map" + gap + blank-line + "Speed" + gap + value.
+            _blank = _h_spd   # blank line = one speed-font height
+            _total = _h_map + _gap + _blank + _gap + _h_spd + _gap + _h_val
+            _vy    = max(_gap, (self.cell - _total) // 2)
+
+            _d.text((_lm + (_bw - _w_map) // 2, _vy),
+                    "Map", font=_font_title, fill=_fg_header)
+
+            _y_spd = _vy + _h_map + _gap + _blank + _gap
+            _d.text((_lm + (_bw - _w_spd) // 2, _y_spd),
+                    "Speed", font=_font_spd, fill=_fg_speed)
+
+            _y_val = _y_spd + _h_spd + _gap
+            _d.text((_lm + (_bw - _w_val) // 2, _y_val),
+                    _val_text, font=_font_spd, fill=_fg_speed)
+
             tile = np.array(_pil, dtype=np.uint8)
         except Exception:  # noqa: BLE001
             pass

@@ -138,11 +138,11 @@ PATH_LINE_WIDTH          = 4                 # only used in mono / preview
 # 4-px-wide Line shrinks to sub-pixel — invisible — after that remap.
 PATH_TUBE_RADIUS_FRAC    = 0.00072   # flat / preview  (−10 % vs former 0.0008)
 PATH_TUBE_RADIUS_FRAC_VR = 0.000045  # VR              (−10 % vs former 0.00005)
-# Decoration spacing: 10 vox ≈ 5 m, 20 vox ≈ 10 m.
-PATH_RING_SPACING     = 10.0   # collar every  5 m
-PATH_CHEVRON_SPACING  = 20.0   # direction cone every 10 m
+# Decoration spacing in voxels.  Voxel size ≈ 6.8 µm → 100 µm / 6.8 ≈ 14.7 vox.
+PATH_RING_SPACING     = 14.7   # collar every 100 µm
+PATH_CHEVRON_SPACING  = 20.0   # direction cone every 10 m (unused – kept for reference)
 # Fixed world-space offset above the camera path along the world-up axis.
-PATH_VERTICAL_OFFSET = 8.0  # raised 4 m (8 vox at 0.5 m/vox) to clear billboard
+PATH_VERTICAL_OFFSET = 5.0  # raised 2.5 m (5 vox at 0.5 m/vox) — lowered 1.5 m vs previous
 
 
 # ──────────────────────────────────── CLI ────────────────────────────────────
@@ -3883,9 +3883,8 @@ def main(argv: list[str] | None = None) -> int:
             radius_frac=_rfrac,
             vr_mode=vr_mode,
         )
-        path_extras = (
-            _build_path_rings(full_track, PATH_VERTICAL_OFFSET, _tube_r, vr_mode=vr_mode)
-            + _build_path_chevrons(full_track, PATH_VERTICAL_OFFSET, _tube_r, vr_mode=vr_mode)
+        path_extras = _build_path_rings(
+            full_track, PATH_VERTICAL_OFFSET, _tube_r, vr_mode=vr_mode
         )
         kind = "tube" if vr_mode != "off" else "line"
         print(f"      built cable-car path {kind} over {len(full_track)} samples"
@@ -4155,7 +4154,7 @@ def main(argv: list[str] | None = None) -> int:
                 subtitle_font_scale=1.15,          # subtitle font +15 %
                 forward_metres=_pfm,
                 left_metres=0.0,
-                vert_metres=_pfm * 0.3640 - 1.0,  # 1 m lower than before
+                vert_metres=_pfm * 0.2765 - 1.0,  # 5° lower (tan15° vs former tan20°)
             )
             print("      info billboard attached")
         else:
@@ -4325,17 +4324,21 @@ def main(argv: list[str] | None = None) -> int:
         _track_speeds_um_s = np.convolve(_raw_spd, _kern, mode="same")
 
     # Pre-compute per-frame info-panel visibility (start 5 s + 4 s after mode change).
+    # Debounced: only fires when a non-empty view_mode changes to a DIFFERENT
+    # non-empty value — this prevents multiple refires when the same mode appears
+    # at consecutive control points (the smoothstep interpolation can cause brief
+    # blank-mode frames between keyframes, which would otherwise re-trigger).
     _info_visible_frames: np.ndarray = np.zeros(len(track), dtype=bool)
     if info_billboard is not None or info_overlay is not None:
         _fps_int = max(1, round(args.fps))
         _info_visible_frames[:5 * _fps_int] = True
-        _prev_mode_vis = None
+        _last_fired_mode = ""
         for _vi, _vs in enumerate(track):
-            _mode_vi = (_vs.get("ui_state") or {}).get("view_mode", "")
-            if _prev_mode_vis is not None and _mode_vi != _prev_mode_vis:
+            _mode_vi = ((_vs.get("ui_state") or {}).get("view_mode") or "")
+            if _mode_vi and _mode_vi != _last_fired_mode:
                 _end_vi = min(len(track), _vi + 4 * _fps_int)
                 _info_visible_frames[_vi:_end_vi] = True
-            _prev_mode_vis = _mode_vi
+                _last_fired_mode = _mode_vi
 
     for i, state in enumerate(track):
         _apply_actor_state(actor, state["actor"])

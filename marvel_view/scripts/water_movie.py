@@ -2043,7 +2043,7 @@ def _build_path_rings(
 
     color = [c / 255.0 for c in (PATH_RING_COLOR_VR if vr_mode != "off" else PATH_RING_COLOR)]
     alpha = 1.0 if vr_mode != "off" else PATH_RING_OPACITY
-    ring_r = 3.0 * tube_radius
+    ring_r = 1.6 * tube_radius   # inner edge ≈ 1.1 × tube_r — collar sits on cable
     ring_thickness = 0.5 * tube_radius
 
     actors: list = []
@@ -2124,8 +2124,8 @@ def _build_path_chevrons(
 
     color = [c / 255.0 for c in (PATH_CHEVRON_COLOR_VR if vr_mode != "off" else PATH_CHEVRON_COLOR)]
     alpha = 1.0 if vr_mode != "off" else PATH_CHEVRON_OPACITY
-    cone_r = 2.5 * tube_radius
-    cone_h = 5.0 * tube_radius
+    cone_r = 4.0 * tube_radius
+    cone_h = 9.0 * tube_radius
 
     actors: list = []
     s = PATH_CHEVRON_SPACING
@@ -4146,18 +4146,26 @@ def main(argv: list[str] | None = None) -> int:
         _init_sub  = _VIEW_MODE_SUBTITLES.get(_init_mode, "")
         if vr_mode != "off":
             info_billboard = _InfoBB(
-                plt, _PANEL_TITLE, _init_sub,
+                plt, "", _init_sub,          # title="" → subtitle-only display
                 focal_dist=_focal_dist,
                 meters_per_voxel=args.meters_per_voxel,
-                angular_width_deg=34.27,  # 40.32 × 0.85
-                tile_scale=2.38,          # 1.7 × 1.4
+                angular_width_deg=34.27 * 1.05,   # +5 % wider  ≈ 35.98°
+                aspect=8.0,                        # height ÷ 2 (was 4.0)
+                tile_scale=2.38,                   # 1.7 × 1.4
+                subtitle_font_scale=1.15,          # subtitle font +15 %
                 forward_metres=_pfm,
                 left_metres=0.0,
-                vert_metres=_pfm * 0.3640,   # tan(20°) → 20° above
+                vert_metres=_pfm * 0.3640 - 1.0,  # 1 m lower than before
             )
             print("      info billboard attached")
         else:
-            info_overlay = _InfoPO(plt, _PANEL_TITLE, _init_sub, opacity=0.72)
+            info_overlay = _InfoPO(
+                plt, "", _init_sub,         # title="" → subtitle-only display
+                opacity=0.72,
+                width_frac=0.38 * 1.05,    # +5 % wider  ≈ 0.399
+                height_frac=0.064 / 2,     # height ÷ 2  = 0.032
+                subtitle_font_scale=1.15,  # subtitle font +15 %
+            )
             print("      info overlay attached")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to attach info panel: %s", exc)
@@ -4299,7 +4307,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Pre-compute per-frame travel speed (µm/s) for the info panel speed line.
     _track_speeds_um_s: np.ndarray = np.zeros(len(track))
-    if len(track) > 1 and (info_billboard is not None or info_overlay is not None):
+    if len(track) > 1 and (
+        info_billboard is not None or info_overlay is not None
+        or ortho_billboard is not None
+    ):
         try:
             from marvel_view.scripts.water_conductance.constants import (
                 VOXEL_SIZE_UM as _VOXEL_SIZE_UM,
@@ -4312,6 +4323,19 @@ def main(argv: list[str] | None = None) -> int:
         _spd_win  = max(1, args.fps // 4)
         _kern     = np.ones(_spd_win) / _spd_win
         _track_speeds_um_s = np.convolve(_raw_spd, _kern, mode="same")
+
+    # Pre-compute per-frame info-panel visibility (start 5 s + 4 s after mode change).
+    _info_visible_frames: np.ndarray = np.zeros(len(track), dtype=bool)
+    if info_billboard is not None or info_overlay is not None:
+        _fps_int = max(1, round(args.fps))
+        _info_visible_frames[:5 * _fps_int] = True
+        _prev_mode_vis = None
+        for _vi, _vs in enumerate(track):
+            _mode_vi = (_vs.get("ui_state") or {}).get("view_mode", "")
+            if _prev_mode_vis is not None and _mode_vi != _prev_mode_vis:
+                _end_vi = min(len(track), _vi + 4 * _fps_int)
+                _info_visible_frames[_vi:_end_vi] = True
+            _prev_mode_vis = _mode_vi
 
     for i, state in enumerate(track):
         _apply_actor_state(actor, state["actor"])
@@ -4347,6 +4371,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 mono_dir = np.array([0.0, 0.0, -1.0])
             if ortho_billboard is not None:
+                # Update speed text tile before compose() runs inside update().
+                ortho_billboard.set_speed_text(f"{_track_speeds_um_s[i]:.1f} um/s")
                 ortho_billboard.update(mono_pos, mono_dir, vr_travel_dirs[i], vr_world_up)
             else:
                 ortho_overlay.update(mono_pos, mono_dir)
@@ -4385,16 +4411,20 @@ def main(argv: list[str] | None = None) -> int:
                     if _b is not None and _vis:
                         _b.update_pose(_cb_pos, vr_travel_dirs[i], vr_world_up)
 
-        # ── Info panel update (pose + subtitle) ─────────────────────────────
+        # ── Info panel update (pose + subtitle + auto-hide) ──────────────────
         if info_billboard is not None or info_overlay is not None:
             _ui_st    = state.get("ui_state") or {}
             _sub_text = _VIEW_MODE_SUBTITLES.get(_ui_st.get("view_mode", ""), "")
-            _spd_text = f"Travelling speed:  {_track_speeds_um_s[i]:.1f} um/s"
+            _panel_vis = bool(_info_visible_frames[i])
             if info_billboard is not None:
-                _ipos = np.asarray(state["camera"]["position"], dtype=float)
-                info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text, _spd_text)
+                info_billboard.set_visible(_panel_vis)
+                if _panel_vis:
+                    _ipos = np.asarray(state["camera"]["position"], dtype=float)
+                    info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text)
             elif info_overlay is not None:
-                info_overlay.update(_sub_text, _spd_text)
+                info_overlay.set_visible(_panel_vis)
+                if _panel_vis:
+                    info_overlay.update(_sub_text)
 
         if vr_mode == "off":
             if debug_idx_text is not None:

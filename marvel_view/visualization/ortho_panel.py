@@ -767,38 +767,11 @@ class OrthoPanel3DBillboard:
         self._poly_mapper.RemoveAllClippingPlanes()
 
         # ── Bottom-right label tile ──────────────────────────────────────
+        self._br_speed_text: str = ""
         self._br_label_tile: np.ndarray = np.zeros(
             (self.cell, self.cell, 3), dtype=np.uint8
         )
-        try:
-            from PIL import Image as _PIL_Image, ImageDraw as _PIL_Draw, ImageFont as _PIL_Font  # noqa: PLC0415
-            _text = "Map"
-            _fg = (200, 200, 200)
-            _bg = (12, 12, 12)              # near-black background rectangle
-            _lm = max(3, self.cell // 32)   # left/right margin
-            _box_h = self.cell // 3         # compact height (~1/3 of quadrant)
-            _box_w = self.cell - 2 * _lm
-            _vy = (self.cell - _box_h) // 2  # box vertically centred in square
-            _fsize = max(8, round(self.cell / 16)) * 4   # ×4 of base cell formula
-            try:
-                _font = _PIL_Font.load_default(size=_fsize)
-            except TypeError:   # Pillow < 9.2
-                _font = _PIL_Font.load_default()
-            _pil = _PIL_Image.new("RGB", (self.cell, self.cell), (0, 0, 0))
-            _d = _PIL_Draw.Draw(_pil)
-            _d.rectangle([_lm, _vy, _lm + _box_w, _vy + _box_h], fill=_bg)
-            try:
-                _bbox = _d.textbbox((0, 0), _text, font=_font)
-                _tw = _bbox[2] - _bbox[0]
-                _th = _bbox[3] - _bbox[1]
-                _tx = _lm + (_box_w - _tw) // 2
-                _ty = _vy + (_box_h - _th) // 2
-                _d.text((_tx, _ty), _text, font=_font, fill=_fg)
-            except Exception:  # noqa: BLE001
-                _d.text((_lm + 2, _vy + 2), _text, fill=_fg)
-            self._br_label_tile = np.array(_pil, dtype=np.uint8)
-        except Exception:  # noqa: BLE001
-            pass
+        self._br_label_tile = self._make_br_label_tile("")
 
         # Initial placement (overwritten on first update_pose call).
         Z, Y, X = self.volume.shape
@@ -834,6 +807,64 @@ class OrthoPanel3DBillboard:
             self._texture.Modified()
         except Exception:  # noqa: BLE001
             pass
+
+    # ── bottom-right label tile ──────────────────────────────────────────
+
+    def _make_br_label_tile(self, speed_text: str) -> np.ndarray:
+        """Render a ``(cell, cell, 3)`` tile: 'Maps' header + travel speed line."""
+        tile = np.zeros((self.cell, self.cell, 3), dtype=np.uint8)
+        try:
+            from PIL import Image as _PIL_Image, ImageDraw as _PIL_Draw, ImageFont as _PIL_Font  # noqa: PLC0415
+            _fg_header = (200, 200, 200)
+            _fg_speed  = (160, 220, 255)
+            _bg        = (12, 12, 12)
+            _lm        = max(3, self.cell // 32)
+            _fsize_big = max(8, round(self.cell / 8))
+            _fsize_sm  = max(7, round(self.cell / 12))
+            try:
+                _font_big = _PIL_Font.load_default(size=_fsize_big)
+                _font_sm  = _PIL_Font.load_default(size=_fsize_sm)
+            except TypeError:
+                _font_big = _font_sm = _PIL_Font.load_default()
+            _pil = _PIL_Image.new("RGB", (self.cell, self.cell), (0, 0, 0))
+            _d   = _PIL_Draw.Draw(_pil)
+            _box_w = self.cell - 2 * _lm
+            # measure heights
+            try:
+                _bb1 = _d.textbbox((0, 0), "Maps", font=_font_big)
+                _h1  = _bb1[3] - _bb1[1]
+                _spd_label = f"travel speed={speed_text}" if speed_text else "travel speed="
+                _bb2 = _d.textbbox((0, 0), _spd_label, font=_font_sm)
+                _h2  = _bb2[3] - _bb2[1]
+            except AttributeError:
+                _h1 = _fsize_big; _h2 = _fsize_sm; _spd_label = f"travel speed={speed_text}" if speed_text else "travel speed="
+            _gap   = max(2, self.cell // 32)
+            _total = _h1 + _gap + _h2
+            _box_h = _total + 2 * _gap
+            _vy    = (self.cell - _box_h) // 2
+            _d.rectangle([_lm, _vy, _lm + _box_w, _vy + _box_h], fill=_bg)
+            try:
+                _tw1 = _bb1[2] - _bb1[0]
+                _d.text((_lm + (_box_w - _tw1) // 2, _vy + _gap), "Maps",
+                        font=_font_big, fill=_fg_header)
+                _tw2 = _bb2[2] - _bb2[0]
+                _d.text((_lm + (_box_w - _tw2) // 2, _vy + _gap + _h1 + _gap),
+                        _spd_label, font=_font_sm, fill=_fg_speed)
+            except Exception:  # noqa: BLE001
+                _d.text((_lm + 2, _vy + _gap), "Maps", fill=_fg_header)
+                _d.text((_lm + 2, _vy + _gap + _h1 + _gap), _spd_label, fill=_fg_speed)
+            tile = np.array(_pil, dtype=np.uint8)
+        except Exception:  # noqa: BLE001
+            pass
+        return tile
+
+    def set_speed_text(self, speed_text: str) -> None:
+        """Update the bottom-right speed display tile (called before each frame)."""
+        if speed_text == self._br_speed_text:
+            return
+        self._br_speed_text = speed_text
+        self._br_label_tile = self._make_br_label_tile(speed_text)
+
 
     # ── geometry ─────────────────────────────────────────────────────────
 
@@ -1140,6 +1171,7 @@ def _render_info_tile(
     speed_text: str = "",
     w: int = _INFO_W,
     h: int = _INFO_H,
+    subtitle_font_scale: float = 1.0,
 ) -> np.ndarray:
     """PIL-render a ``(h, w, 3)`` uint8 tile: title + speed + subtitle, all centred."""
     tile = np.full((h, w, 3), 10, dtype=np.uint8)   # near-black background
@@ -1151,7 +1183,7 @@ def _render_info_tile(
         _fscale = max(0.5, h / 54)
         try:
             font_small = _PF.load_default(size=max(8, round(11 * _fscale)))
-            font_sub   = _PF.load_default(size=max(9, round(14 * _fscale)))
+            font_sub   = _PF.load_default(size=max(9, round(14 * _fscale * subtitle_font_scale)))
         except TypeError:       # Pillow < 9.2: load_default has no 'size' arg
             font_small = font_sub = _PF.load_default()
         line_gap   = max(2, round(4 * _fscale))   # px between the two rows
@@ -1224,12 +1256,14 @@ class InfoPanelOverlay:
         opacity: float = 0.72,
         width_frac: float = 0.38,
         height_frac: float = 0.064,
+        subtitle_font_scale: float = 1.0,
     ) -> None:
         self._title       = title
         self._subtitle    = initial_subtitle
         self._speed_text  = ""
         self._width_frac  = width_frac
         self._height_frac = height_frac
+        self._subtitle_font_scale = subtitle_font_scale
         self._cached_bytes: bytes = b""
 
         # ── VTK pipeline ──────────────────────────────────────────────────
@@ -1242,6 +1276,7 @@ class InfoPanelOverlay:
         self.panel_w = max(100, int(win_w * width_frac))
         self.panel_h = max(20,  int(win_h * height_frac))
         canvas = _render_info_tile(title, initial_subtitle,
+                                   subtitle_font_scale=subtitle_font_scale,
                                    w=self.panel_w, h=self.panel_h)
         n_layers = renwin.GetNumberOfLayers()
         renwin.SetNumberOfLayers(max(n_layers, 2))
@@ -1312,6 +1347,7 @@ class InfoPanelOverlay:
             self._importer.SetDataExtent(0, pw - 1, 0, ph - 1, 0, 0)
             self._push_pixels(_render_info_tile(
                 self._title, self._subtitle, self._speed_text,
+                subtitle_font_scale=self._subtitle_font_scale,
                 w=pw, h=ph))
         # Bottom-left of the actor in normalised display coords — actor is
         # rendered upward from this point (VTK convention).
@@ -1326,6 +1362,7 @@ class InfoPanelOverlay:
         self._subtitle   = subtitle
         self._speed_text = speed_text
         self._push_pixels(_render_info_tile(self._title, subtitle, speed_text,
+                                            subtitle_font_scale=self._subtitle_font_scale,
                                             w=self.panel_w, h=self.panel_h))
 
     def set_visible(self, visible: bool) -> None:
@@ -1383,6 +1420,7 @@ class InfoBillboard3D:
         left_metres: float = 0.0,
         vert_metres: float = 0.375,
         hide_when_reversed: bool = False,
+        subtitle_font_scale: float = 1.0,
     ) -> None:
         self._title       = title
         self._subtitle    = initial_subtitle
@@ -1397,12 +1435,14 @@ class InfoBillboard3D:
         self._vert_metres      = float(vert_metres)
         self._hide_when_reversed: bool = hide_when_reversed
         self._initial_travel: "np.ndarray | None" = None
+        self._subtitle_font_scale: float = float(subtitle_font_scale)
         self._tan_x = math.tan(math.radians(float(angular_width_deg) / 2.0))
         self._tan_y = self._tan_x / float(aspect)
         self.panel_w = max(1, round(_INFO_W * tile_scale))
         self.panel_h = max(1, round(_INFO_H * tile_scale))
 
         canvas = _render_info_tile(title, initial_subtitle,
+                                   subtitle_font_scale=self._subtitle_font_scale,
                                    w=self.panel_w, h=self.panel_h)
         _premultiply_tile(canvas)
         self._cached_bytes: bytes = b""
@@ -1589,6 +1629,13 @@ class InfoBillboard3D:
         )
         self._place_plane(panel_center, cam_pos, up)
 
+    def set_visible(self, visible: bool) -> None:
+        """Show or hide the info billboard."""
+        if visible:
+            self._actor.VisibilityOn()
+        else:
+            self._actor.VisibilityOff()
+
     def update_image(self, subtitle: str, speed_text: str = "") -> None:
         """Re-render the PIL tile only when content has changed."""
         if subtitle == self._subtitle and speed_text == self._speed_text:
@@ -1596,6 +1643,7 @@ class InfoBillboard3D:
         self._subtitle   = subtitle
         self._speed_text = speed_text
         canvas = _render_info_tile(self._title, subtitle, speed_text,
+                                   subtitle_font_scale=self._subtitle_font_scale,
                                    w=self.panel_w, h=self.panel_h)
         _premultiply_tile(canvas)
         self._push_pixels(canvas)

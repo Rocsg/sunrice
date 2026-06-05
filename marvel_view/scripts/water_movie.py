@@ -2001,7 +2001,7 @@ def _build_path_line(track: Sequence[dict], offset: float,
     _opacity = 1.0   # tubes are 3-D geometry: always opaque (0.55 line opacity was for screen-space Lines)
     if as_tube:
         radius = median_dist * radius_frac
-        obj = vedo.Tube(line_pts, r=radius, c=color, res=16)
+        obj = vedo.Tube(line_pts, r=radius, c=color, res=32)
         # vedo.Tube stores parametric / vertex-index scalar data that VTK
         # maps through a rainbow LUT, overriding the solid colour.  Strip
         # all point- and cell-data arrays from the polydata, then turn off
@@ -2099,12 +2099,12 @@ def _build_path_rings(
             ref = np.array([1.0, 0.0, 0.0])
         u = _normalize(np.cross(tangent, ref))
         v = np.cross(tangent, u)
-        angles = np.linspace(0.0, 2.0 * np.pi, 25)
+        angles = np.linspace(0.0, 2.0 * np.pi, 60)
         circle_pts = pos + ring_r * (
             np.outer(np.cos(angles), u) + np.outer(np.sin(angles), v)
         )
 
-        ring = vedo.Tube(circle_pts, r=ring_thickness, c=color, res=8)
+        ring = vedo.Tube(circle_pts, r=ring_thickness, c=color, res=16)
         try:
             pd = ring.dataset
         except AttributeError:

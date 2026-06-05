@@ -140,7 +140,7 @@ PATH_LINE_WIDTH          = 4                 # only used in mono / preview
 PATH_TUBE_RADIUS_FRAC    = 0.00009   # flat / preview — tube (2× VR; was 0.00072 for screen-space Line + rings)
 PATH_TUBE_RADIUS_FRAC_VR = 0.000045  # VR              (−10 % vs former 0.00005)
 # Decoration spacing in voxels.  Voxel size ≈ 6.8 µm → 100 µm / 6.8 ≈ 14.7 vox.
-PATH_RING_SPACING     = 14.7   # collar every 100 µm
+PATH_RING_SPACING     = 29.4   # collar every ~200 µm (one every two former positions)
 PATH_CHEVRON_SPACING  = 20.0   # direction cone every 10 m (unused – kept for reference)
 # Fixed world-space offset above the camera path along the world-up axis.
 PATH_VERTICAL_OFFSET = 5.0  # raised 2.5 m (5 vox at 0.5 m/vox) — lowered 1.5 m vs previous
@@ -2272,6 +2272,13 @@ def _load_image_texture(path: "Path") -> "tuple[vtk.vtkTexture, int, int] | None
         _pil = _PIL_Image.open(str(path)).convert("RGB")
         iw, ih = _pil.size
         arr = np.ascontiguousarray(np.array(_pil, dtype=np.uint8)[::-1, :, :])
+        # Subtle radial vignette: edges darkened up to 25 % → less flat-panel look.
+        _h, _w = arr.shape[:2]
+        _yy, _xx = np.mgrid[0:_h, 0:_w]
+        _yd = ((_yy / max(_h - 1, 1)) * 2.0 - 1.0) ** 2
+        _xd = ((_xx / max(_w - 1, 1)) * 2.0 - 1.0) ** 2
+        _wt = (1.0 - 0.25 * np.sqrt(np.clip((_yd + _xd) / 2.0, 0.0, 1.0))).astype(np.float32)
+        arr = np.clip(arr.astype(np.float32) * _wt[:, :, np.newaxis], 0, 255).astype(np.uint8)
         imp = _vtk.vtkImageImport()
         imp.SetDataScalarTypeToUnsignedChar()
         imp.SetNumberOfScalarComponents(3)
@@ -2348,6 +2355,78 @@ def _make_image_panel_actor(
     return actor
 
 
+def _make_panel_frame_actor(
+    center: "np.ndarray",
+    panel_up: "np.ndarray",
+    panel_right: "np.ndarray",
+    half_w: float,
+    half_h: float,
+    *,
+    tube_radius: float = 0.6,
+    n_sides: int = 24,
+) -> "vtk.vtkActor":
+    """Return a rounded tube-frame border around a billboard panel.
+
+    Builds a closed-rectangle polyline at the panel edges, then sweeps it
+    through ``vtkTubeFilter`` (``n_sides`` facets) for a smooth 3-D border.
+    Tinted in the cable-car ring colour so it reads as part of the scene.
+    Offset slightly toward the viewer to avoid z-fighting with the image.
+    """
+    import vtk as _vtk
+    normal = np.cross(panel_right, panel_up)
+    _nlen  = np.linalg.norm(normal)
+    if _nlen > 1e-12:
+        normal = normal / _nlen
+    c = np.asarray(center, dtype=float) + normal * 0.2   # slight forward offset
+
+    corners = [
+        c - panel_right * half_w - panel_up * half_h,  # bottom-left
+        c + panel_right * half_w - panel_up * half_h,  # bottom-right
+        c + panel_right * half_w + panel_up * half_h,  # top-right
+        c - panel_right * half_w + panel_up * half_h,  # top-left
+        c - panel_right * half_w - panel_up * half_h,  # close loop
+    ]
+
+    pts = _vtk.vtkPoints()
+    for _corner in corners:
+        pts.InsertNextPoint(*_corner.tolist())
+
+    lines = _vtk.vtkCellArray()
+    lines.InsertNextCell(5)
+    for _i in range(5):
+        lines.InsertCellPoint(_i)
+
+    pd = _vtk.vtkPolyData()
+    pd.SetPoints(pts)
+    pd.SetLines(lines)
+
+    tube = _vtk.vtkTubeFilter()
+    tube.SetInputData(pd)
+    tube.SetRadius(tube_radius)
+    tube.SetNumberOfSides(n_sides)
+    tube.CappingOn()
+    tube.Update()
+
+    mapper = _vtk.vtkPolyDataMapper()
+    mapper.SetInputConnection(tube.GetOutputPort())
+    mapper.RemoveAllClippingPlanes()
+
+    actor = _vtk.vtkActor()
+    actor.SetMapper(mapper)
+    prop = actor.GetProperty()
+    r, g, b = [x / 255.0 for x in PATH_RING_COLOR]
+    prop.SetColor(r, g, b)
+    prop.SetOpacity(1.0)
+    # Phong shading so the round tube cross-section catches scene light.
+    prop.SetAmbient(0.30)
+    prop.SetDiffuse(0.65)
+    prop.SetSpecular(0.80)
+    prop.SetSpecularPower(50)
+    prop.BackfaceCullingOff()
+    actor.SetVisibility(0)
+    return actor
+
+
 def _build_sponsors_panel(
     mesh,
     sponsors_path: str | None,
@@ -2355,26 +2434,27 @@ def _build_sponsors_panel(
     panel_width_voxels: float = 35.0,
     center_offset: tuple[float, float, float] = (1.0, 0.0, -3.0),
     panel_gap_voxels: float = 5.0,
-) -> "list[vtk.vtkActor]":
-    """Build static textured 3-D panels for the sponsors and entrance images.
+) -> "dict | None":
+    """Build animated 3-D image panels for sponsors (3 variants) and entrance.
 
-    Both panels share the same orientation and width.  The *entrance* panel
-    (``entrance.jpg``, expected in the same directory as *sponsors_path*) is
-    stacked directly above the sponsors panel along the panel's vertical axis,
-    with a ``panel_gap_voxels`` gap between the two.
+    Looks for ``sponsors_1.jpg``, ``sponsors_2.jpg``, ``sponsors_3.jpg`` in the
+    same directory as *sponsors_path*.  Creates four sponsors actors (indices
+    0-2 = images, 3 = white-flash) and one entrance actor, all initially
+    hidden.  The caller pre-computes per-frame visibility with
+    ``_sponsors_state`` / ``_entrance_vis`` and toggles them in the render loop.
 
-    Returns a (possibly empty) list of ``vtkActor`` objects ready to be added
-    to the main renderer.
+    Returns ``{"sp_actors": list, "ep_actor": actor|None, "sp_half_h": float}``
+    or ``None`` when no usable image is found.
     """
     from pathlib import Path as _Path
     import math as _math
 
     if sponsors_path is None:
-        return []
-    sp = _Path(sponsors_path)
-    if not sp.exists():
-        logger.warning("Sponsors image not found: %s — panels skipped.", sponsors_path)
-        return []
+        return None
+    sp_dir = _Path(sponsors_path).parent
+    if not sp_dir.exists():
+        logger.warning("Sponsors directory not found: %s — panels skipped.", sp_dir)
+        return None
 
     # ── Mesh bounds → sponsors panel centre ──────────────────────────────
     try:
@@ -2390,8 +2470,6 @@ def _build_sponsors_panel(
     ], dtype=float)
 
     # ── Panel orientation (shared by both panels) ─────────────────────────
-    # Base axes: vertical=(0,0.866,0.5), left=(0,-0.5,0.866), normal=(-1,0,0).
-    # Rotated 10° clockwise as seen face-on (up → right direction).
     _theta  = _math.radians(10.0)
     _c, _s  = _math.cos(_theta), _math.sin(_theta)
     _up0    = np.array([0.0,  0.866,  0.5  ], dtype=float)
@@ -2399,59 +2477,147 @@ def _build_sponsors_panel(
     panel_up    = _c * _up0    + _s * _right0
     panel_right = -_s * _up0   + _c * _right0
 
-    # Apply global offset: 4 voxels up (panel vertical) + 5 voxels left (−panel_right, i.e. 10−3−2).
     sponsors_center = (
         sponsors_center
-        + 4.0  * panel_up
-        - 5.0 * panel_right
+        + 16.0 * panel_up
+        - 12.0 * panel_right
     )
 
-    half_w = panel_width_voxels / 2.0
+    half_w = panel_width_voxels * 1.2 / 2.0   # ×1.5 then ×0.8 = ×1.2
+    sp_half_h = half_w   # fallback height (square)
 
-    actors: list = []
+    # ── Helper: white VTK texture ──────────────────────────────────────
+    def _white_texture():
+        import vtk as _vtk  # noqa: PLC0415
+        from PIL import Image as _PIL_Image  # noqa: PLC0415
+        _w = _PIL_Image.new("RGB", (4, 4), (255, 255, 255))
+        _arr = np.ascontiguousarray(np.array(_w, dtype=np.uint8)[::-1])
+        _imp = _vtk.vtkImageImport()
+        _imp.SetDataScalarTypeToUnsignedChar()
+        _imp.SetNumberOfScalarComponents(3)
+        _imp.SetWholeExtent(0, 3, 0, 3, 0, 0)
+        _imp.SetDataExtent(0, 3, 0, 3, 0, 0)
+        _imp.SetDataSpacing(1.0, 1.0, 1.0)
+        _imp.SetDataOrigin(0.0, 0.0, 0.0)
+        _raw = _arr.tobytes()
+        _imp.CopyImportVoidPointer(_raw, len(_raw))
+        _imp.Update()
+        _tex = _vtk.vtkTexture()
+        _tex.SetInputConnection(_imp.GetOutputPort())
+        _tex.InterpolateOn()
+        _tex.RepeatOff()
+        return _tex
 
-    # ── Sponsors panel ────────────────────────────────────────────────────
-    sp_tex_result = _load_image_texture(sp)
-    if sp_tex_result is not None:
-        sp_tex, sp_iw, sp_ih = sp_tex_result
-        sp_half_h = half_w * (float(sp_ih) / float(sp_iw))
-        sp_actor = _make_image_panel_actor(
-            sponsors_center, panel_up, panel_right, half_w, sp_half_h, sp_tex,
+    # ── Sponsors actors: index 0/1/2 = images, 3 = white flash ──────────
+    sp_actors: list = []
+    for _k in (1, 2, 3):
+        _ip = sp_dir / f"sponsors_{_k}.jpg"
+        if not _ip.exists():
+            _ip = sp_dir / f"sponsors_{_k}.png"
+            if not _ip.exists():
+                _ip = None
+        _res = _load_image_texture(_ip) if _ip is not None else None
+        if _res is not None:
+            _tex, _iw, _ih = _res
+            _h = half_w * (_ih / _iw)
+            if _k == 1:
+                sp_half_h = _h   # derive reference height from first image
+            _act = _make_image_panel_actor(
+                sponsors_center, panel_up, panel_right, half_w, sp_half_h, _tex,
+            )
+            logger.info("Sponsors panel %d: %.0f×%.0f vox  img=%dx%d",
+                        _k, half_w * 2, sp_half_h * 2, _iw, _ih)
+        else:
+            # Missing image → white placeholder
+            try:
+                _act = _make_image_panel_actor(
+                    sponsors_center, panel_up, panel_right, half_w, sp_half_h,
+                    _white_texture(),
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        _act.SetVisibility(0)
+        sp_actors.append(_act)
+
+    # White-flash actor (always at index 3 in the cycle)
+    try:
+        _wact = _make_image_panel_actor(
+            sponsors_center, panel_up, panel_right, half_w, sp_half_h,
+            _white_texture(),
         )
-        actors.append(sp_actor)
-        logger.info(
-            "Sponsors panel: center=(%.1f,%.1f,%.1f)  %.1f×%.1f vox  img=%dx%d",
-            *sponsors_center, half_w * 2, sp_half_h * 2, sp_iw, sp_ih,
+        _wact.SetVisibility(0)
+        sp_actors.append(_wact)
+    except Exception as _we:  # noqa: BLE001
+        logger.debug("White-flash actor failed: %s", _we)
+
+    if not sp_actors:
+        logger.warning("No sponsors images loaded from %s — panels skipped.", sp_dir)
+        return None
+
+    # Dark backing frame behind sponsors (always at sponsors position/size).
+    sp_backing = None
+    try:
+        sp_backing = _make_panel_frame_actor(
+            sponsors_center, panel_up, panel_right, half_w, sp_half_h,
         )
-    else:
-        sp_half_h = half_w   # fallback size so entrance can still be placed
+    except Exception as _sbe:  # noqa: BLE001
+        logger.debug("Sponsors backing actor failed: %s", _sbe)
 
     # ── Entrance panel (entrance.jpg in same directory) ───────────────────
-    ep = sp.parent / "entrance.jpg"
+    ep_actor = None
+    ep = sp_dir / "entrance.jpg"
     if not ep.exists():
-        ep = sp.parent / "entrance.png"   # also try PNG
+        ep = sp_dir / "entrance.png"
+    ep_white_actor = None
+    ep_backing = None
     if ep.exists():
         ep_tex_result = _load_image_texture(ep)
         if ep_tex_result is not None:
             ep_tex, ep_iw, ep_ih = ep_tex_result
-            ep_half_h = half_w * (float(ep_ih) / float(ep_iw))
-            # Centre = top edge of sponsors + gap + half-height of entrance.
+            ep_half_w = half_w * 0.6              # entrance 40 % smaller
+            ep_half_h = ep_half_w * (float(ep_ih) / float(ep_iw))
+            # Base position above sponsors, then shifted +2 vox up and +50 vox right.
             entrance_center = (
                 sponsors_center
-                + panel_up * (sp_half_h + panel_gap_voxels + ep_half_h)
+                + panel_up   * (sp_half_h + panel_gap_voxels + ep_half_h + 2.0)
+                + panel_right * 50.0
             )
             ep_actor = _make_image_panel_actor(
-                entrance_center, panel_up, panel_right, half_w, ep_half_h, ep_tex,
+                entrance_center, panel_up, panel_right, ep_half_w, ep_half_h, ep_tex,
             )
-            actors.append(ep_actor)
+            ep_actor.SetVisibility(0)
+            # White-rectangle actor for blink "off" state (same size/position).
+            try:
+                ep_white_actor = _make_image_panel_actor(
+                    entrance_center, panel_up, panel_right, ep_half_w, ep_half_h,
+                    _white_texture(),
+                )
+                ep_white_actor.SetVisibility(0)
+            except Exception as _ewe:  # noqa: BLE001
+                logger.debug("Entrance white actor failed: %s", _ewe)
+            # Tube-frame border around entrance panel.
+            try:
+                ep_backing = _make_panel_frame_actor(
+                    entrance_center, panel_up, panel_right, ep_half_w, ep_half_h,
+                )
+            except Exception as _ebe:  # noqa: BLE001
+                logger.debug("Entrance backing actor failed: %s", _ebe)
+                ep_backing = None
             logger.info(
                 "Entrance panel: center=(%.1f,%.1f,%.1f)  %.1f×%.1f vox  img=%dx%d",
-                *entrance_center, half_w * 2, ep_half_h * 2, ep_iw, ep_ih,
+                *entrance_center, ep_half_w * 2, ep_half_h * 2, ep_iw, ep_ih,
             )
     else:
-        logger.info("No entrance.jpg found in %s — single sponsors panel only.", sp.parent)
+        logger.info("No entrance.jpg found in %s — single sponsors panel only.", sp_dir)
 
-    return actors
+    return {
+        "sp_actors":      sp_actors,
+        "sp_backing":     sp_backing,
+        "ep_actor":       ep_actor,
+        "ep_white_actor": ep_white_actor,
+        "ep_backing":     ep_backing,
+        "sp_half_h":      sp_half_h,
+    }
 
 
 def _force_phong(*meshes) -> None:
@@ -4444,27 +4610,28 @@ def main(argv: list[str] | None = None) -> int:
                 left_frac=-0.38,   # tan(−20.8°) → 20.8° to the right
                 font_size=_cbar_vr_font,
             )
+            # vert_frac = tan(angle); −10° = −0.1763 applied to all bars.
             _cbar_mv_density = _CB3D(
                 plt, cmap="viridis",  vmin=0.0, vmax=1.0, title="Density",
-                vert_frac=0.15, **_cbar_kwargs,
+                vert_frac=-0.026, **_cbar_kwargs,
             )
             _cbar_mv_radial = _CB3D(
                 plt, cmap="coolwarm", vmin=-1.0, vmax=1.0, title="Slope of radial density",
-                vert_frac=-0.05, **_cbar_kwargs,
+                vert_frac=-0.226, **_cbar_kwargs,
             )
             _cbar_mv_water = _CB3D(
                 plt, cmap=_WATER_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Water",
-                vert_frac=0.15, **_cbar_kwargs,
+                vert_frac=-0.026, **_cbar_kwargs,
             )
             _cbar_mv_air = _CB3D(
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Air",
-                vert_frac=-0.05, **_cbar_kwargs,
+                vert_frac=-0.226, **_cbar_kwargs,
             )
             _cbar_mv_tortuosity = _CB3D(
                 plt, cmap=TORTUOSITY_CMAP_STOPS,
                 vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
                 title="Tortuosity",
-                vert_frac=0.05, **_cbar_kwargs,
+                vert_frac=-0.126, **_cbar_kwargs,
             )
             print("      colormap billboards attached")
         else:
@@ -4512,30 +4679,86 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as _cbar_mv_exc:  # noqa: BLE001
         logger.warning("Failed to attach colormap bars: %s", _cbar_mv_exc)
 
-    # ── Sponsors + entrance image panels (static 3-D textured planes) ────────
-    # Visible in both flat and VR renders.  No per-frame update needed.
+    # ── Sponsors + entrance image panels (animated 3-D textured planes) ─────
+    # Sponsors cycles through 3 variants; entrance blinks.  All hidden until
+    # t ≥ 10 s.  Per-frame visibility is driven by pre-computed arrays below.
     _sponsors_path = getattr(args, "sponsors", None)
     if getattr(args, "no_sponsors", False):
         _sponsors_path = None
     elif _sponsors_path and _sponsors_path.lower() in ("", "none", "no", "off"):
         _sponsors_path = None
+    _sp_actors: list = []
+    _ep_actor = None
+    _ep_white_actor = None
+    _sp_backing = None
+    _ep_backing = None
     if _sponsors_path:
         try:
-            _panel_actors = _build_sponsors_panel(mesh, _sponsors_path)
-            if _panel_actors:
+            _panel_result = _build_sponsors_panel(mesh, _sponsors_path)
+            if _panel_result:
+                _sp_actors      = _panel_result.get("sp_actors", [])
+                _sp_backing     = _panel_result.get("sp_backing")
+                _ep_actor       = _panel_result.get("ep_actor")
+                _ep_white_actor = _panel_result.get("ep_white_actor")
+                _ep_backing     = _panel_result.get("ep_backing")
                 main_ren_sp = (
                     plt.renderers[0]
                     if hasattr(plt, "renderers") and plt.renderers
                     else plt.renderer
                 )
-                for _pa in _panel_actors:
+                _all_panel = (
+                    _sp_actors
+                    + [_a for _a in (_sp_backing, _ep_actor, _ep_white_actor, _ep_backing)
+                       if _a is not None]
+                )
+                for _pa in _all_panel:
                     main_ren_sp.AddActor(_pa)
-                print(f"      {len(_panel_actors)} image panel(s) attached  "
-                      f"(sponsors + entrance from {_sponsors_path})")
+                print(f"      sponsors ({len(_sp_actors)} variants) + entrance panel attached  "
+                      f"(from {_sponsors_path})")
         except Exception as _sp_exc:  # noqa: BLE001
             logger.warning("Failed to attach image panels: %s", _sp_exc)
 
     actor = getattr(mesh, "actor", None) or mesh
+
+    # ── Per-frame sponsors / entrance panel state (parallel-safe) ────────────
+    # Pre-computed here so every parallel worker uses correct absolute times.
+    # _sponsors_state: 0/1/2 = which image is shown, 3 = white flash, -1 = hidden
+    # _sponsors_state: 0/1/2 = sponsors image index, 3 = white flash, -1 = hidden
+    # _entrance_vis:   0 = hidden, 1 = show image, 2 = show white rectangle
+    _sponsors_state: np.ndarray = np.full(len(track), -1, dtype=np.int8)
+    _entrance_vis:   np.ndarray = np.zeros(len(track), dtype=np.int8)
+    if _sp_actors or _ep_actor is not None:
+        _pnl_fps    = max(1.0, float(args.fps))
+        _pnl_offset = int(getattr(args, "_frame_offset", 0) or 0)
+        _SP_DELAY = 12.0  # sponsors appear after this many seconds
+        _SP_SHOW  = 4.4   # seconds each sponsors image is shown
+        _SP_FLASH = 0.6   # seconds of white flash between images
+        _SP_CYCLE = 3.0 * (_SP_SHOW + _SP_FLASH)   # = 15.0 s
+        _EP_DELAY = 25.0  # entrance appears after this many seconds
+        _EP_ON    = 2.0   # entrance image visible (s)
+        _EP_CYCLE = 3.0   # entrance blink period: on + white (s)
+        for _fi in range(len(track)):
+            _t = (_pnl_offset + _fi) / _pnl_fps
+            # -- sponsors --
+            if _t >= _SP_DELAY:
+                _sp_rel = _t - _SP_DELAY
+                _sp_ph  = _sp_rel % _SP_CYCLE
+                if   _sp_ph < _SP_SHOW:
+                    _sponsors_state[_fi] = 0
+                elif _sp_ph < _SP_SHOW + _SP_FLASH:
+                    _sponsors_state[_fi] = 3                  # white
+                elif _sp_ph < 2 * _SP_SHOW + _SP_FLASH:
+                    _sponsors_state[_fi] = 1
+                elif _sp_ph < 2 * (_SP_SHOW + _SP_FLASH):
+                    _sponsors_state[_fi] = 3                  # white
+                elif _sp_ph < 3 * _SP_SHOW + 2 * _SP_FLASH:
+                    _sponsors_state[_fi] = 2
+                else:
+                    _sponsors_state[_fi] = 3                  # white
+            # -- entrance --
+            if _t >= _EP_DELAY:
+                _ep_rel = _t - _EP_DELAY
+                _entrance_vis[_fi] = 1 if (_ep_rel % _EP_CYCLE) < _EP_ON else 2
 
     # Optional debug overlay: indicative keyframe index in [0, N-1].
     # Only added in flat (mono) mode — vtkPanoramicProjectionPass remaps
@@ -4613,8 +4836,21 @@ def main(argv: list[str] | None = None) -> int:
     _info_visible_frames: np.ndarray = np.zeros(len(track), dtype=bool)
     if info_billboard is not None or info_overlay is not None:
         _fps_int = max(1, round(args.fps))
-        _info_visible_frames[:5 * _fps_int] = True
-        _last_fired_mode = ""
+        # In parallel workers the track is a sub-chunk whose local index 0
+        # does NOT correspond to video frame 0.  Use _frame_offset (the
+        # absolute index of the first frame in this chunk) so the initial
+        # 5-second block and the mode-debounce initialisation are correct.
+        _frame_offset = int(getattr(args, "_frame_offset", 0) or 0)
+        _init_frames = max(0, 5 * _fps_int - _frame_offset)
+        _info_visible_frames[:_init_frames] = True
+        # Seed _last_fired_mode from the first frame's mode so we don't
+        # re-trigger for the same mode that a previous chunk already showed.
+        if _frame_offset > 0 and track:
+            _last_fired_mode = (
+                (track[0].get("ui_state") or {}).get("view_mode") or ""
+            )
+        else:
+            _last_fired_mode = ""
         for _vi, _vs in enumerate(track):
             _mode_vi = ((_vs.get("ui_state") or {}).get("view_mode") or "")
             if _mode_vi and _mode_vi != _last_fired_mode:
@@ -4711,6 +4947,21 @@ def main(argv: list[str] | None = None) -> int:
                 info_overlay.set_visible(_panel_vis)
                 if _panel_vis:
                     info_overlay.update(_sub_text)
+
+        # ── Animated panels: sponsors cycle + entrance blink ─────────────
+        if _sp_actors:
+            _sp_st = int(_sponsors_state[i])
+            for _k, _sa in enumerate(_sp_actors):
+                _sa.SetVisibility(1 if _sp_st == _k else 0)
+            if _sp_backing is not None:
+                _sp_backing.SetVisibility(1 if _sp_st != -1 else 0)
+        _ep_vis = int(_entrance_vis[i])
+        if _ep_actor is not None:
+            _ep_actor.SetVisibility(1 if _ep_vis == 1 else 0)
+        if _ep_white_actor is not None:
+            _ep_white_actor.SetVisibility(1 if _ep_vis == 2 else 0)
+        if _ep_backing is not None:
+            _ep_backing.SetVisibility(1 if _ep_vis != 0 else 0)
 
         if vr_mode == "off":
             if debug_idx_text is not None:

@@ -2078,8 +2078,8 @@ def _build_path_rings(
 
     color = [c / 255.0 for c in (PATH_RING_COLOR_VR if vr_mode != "off" else PATH_RING_COLOR)]
     alpha = 1.0   # always opaque (was PATH_RING_OPACITY=0.40 in flat)
-    ring_r = 1.52 * tube_radius   # −5 % vs former 1.6 × tube_r
-    ring_thickness = 0.5 * tube_radius
+    ring_r         = 0.90 * tube_radius   # centre inside cable → ring flush with surface
+    ring_thickness  = 0.35 * tube_radius   # outer ≈ 1.25 × tube_r
 
     actors: list = []
     s = PATH_RING_SPACING
@@ -2486,17 +2486,21 @@ def _build_sponsors_panel(
     half_w = panel_width_voxels * 1.2 / 2.0   # ×1.5 then ×0.8 = ×1.2
     sp_half_h = half_w   # fallback height (square)
 
-    # ── Helper: white VTK texture ──────────────────────────────────────
+    # ── Helper: white VTK texture (with same vignette as loaded images) ──
     def _white_texture():
         import vtk as _vtk  # noqa: PLC0415
-        from PIL import Image as _PIL_Image  # noqa: PLC0415
-        _w = _PIL_Image.new("RGB", (4, 4), (255, 255, 255))
-        _arr = np.ascontiguousarray(np.array(_w, dtype=np.uint8)[::-1])
+        _sz = 64
+        _yy, _xx = np.mgrid[0:_sz, 0:_sz]
+        _yd = ((_yy / (_sz - 1)) * 2.0 - 1.0) ** 2
+        _xd = ((_xx / (_sz - 1)) * 2.0 - 1.0) ** 2
+        _wt = (1.0 - 0.25 * np.sqrt(np.clip((_yd + _xd) / 2.0, 0.0, 1.0))).astype(np.float32)
+        _v   = np.clip(255.0 * _wt, 0, 255).astype(np.uint8)
+        _arr = np.ascontiguousarray(np.stack([_v, _v, _v], axis=-1)[::-1])
         _imp = _vtk.vtkImageImport()
         _imp.SetDataScalarTypeToUnsignedChar()
         _imp.SetNumberOfScalarComponents(3)
-        _imp.SetWholeExtent(0, 3, 0, 3, 0, 0)
-        _imp.SetDataExtent(0, 3, 0, 3, 0, 0)
+        _imp.SetWholeExtent(0, _sz - 1, 0, _sz - 1, 0, 0)
+        _imp.SetDataExtent(0, _sz - 1, 0, _sz - 1, 0, 0)
         _imp.SetDataSpacing(1.0, 1.0, 1.0)
         _imp.SetDataOrigin(0.0, 0.0, 0.0)
         _raw = _arr.tobytes()
@@ -2576,10 +2580,10 @@ def _build_sponsors_panel(
             ep_tex, ep_iw, ep_ih = ep_tex_result
             ep_half_w = half_w * 0.6              # entrance 40 % smaller
             ep_half_h = ep_half_w * (float(ep_ih) / float(ep_iw))
-            # Base position above sponsors, then shifted +2 vox up and +50 vox right.
+            # Base position above sponsors, then shifted +0.5 vox up and +50 vox right.
             entrance_center = (
                 sponsors_center
-                + panel_up   * (sp_half_h + panel_gap_voxels + ep_half_h + 2.0)
+                + panel_up   * (sp_half_h + panel_gap_voxels + ep_half_h + 0.5)
                 + panel_right * 50.0
             )
             ep_actor = _make_image_panel_actor(

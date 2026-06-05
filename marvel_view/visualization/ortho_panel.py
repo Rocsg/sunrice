@@ -108,6 +108,7 @@ class OrthoPanelOverlay:
         cone_length: int = 48,
         cone_half_width: int = 18,
         center_vertically: bool = False,
+        font_scale: float = 1.0,
     ) -> None:
         if raw_volume.ndim != 3:
             raise ValueError("raw_volume must be a 3-D array (Z, Y, X).")
@@ -139,6 +140,7 @@ class OrthoPanelOverlay:
         self.cone_alpha = float(cone_alpha)
         self.cone_length = float(cone_length)
         self.cone_half_width = float(cone_half_width)
+        self._font_scale = max(0.5, float(font_scale))
 
         # Reused canvas + strong byte-buffer ref for vtkImageImport.
         self._canvas = np.zeros((self.panel_h, self.panel_w, 3), dtype=np.uint8)
@@ -161,7 +163,7 @@ class OrthoPanelOverlay:
             _box_w = self.cell - 2 * _lm
             _vy = (self.cell - _box_h) // 2  # vertically centred in the tile
             # Font size scales with cell (~11 px at cell=180, the normal-mode ref).
-            _fsize = max(8, round(self.cell / 16))
+            _fsize = max(8, round(self.cell / 16 * self._font_scale))
             try:
                 _font = _PIL_Font.load_default(size=_fsize)
             except TypeError:   # Pillow < 9.2: load_default has no 'size' arg
@@ -594,8 +596,8 @@ class OrthoPanelOverlay:
             _fg_header = (200, 200, 200)
             _fg_speed  = (160, 220, 255)
             _lm        = max(3, self.cell // 32)
-            _fsize_title = max(8, round(self.cell / 8))   # ×2 of former cell/16
-            _fsize_spd   = max(7, round(self.cell / 10))
+            _fsize_title = max(8, round(self.cell / 8 * self._font_scale))   # ×2 of former cell/16
+            _fsize_spd   = max(7, round(self.cell / 10 * self._font_scale))
             try:
                 _font_title = _PIL_Font.load_default(size=_fsize_title)
                 _font_spd   = _PIL_Font.load_default(size=_fsize_spd)
@@ -760,6 +762,7 @@ class OrthoPanel3DBillboard:
         forward_metres: float = 2.0,
         left_metres: float = 0.5,
         vert_metres: float = 0.0,
+        font_scale: float = 1.0,
     ) -> None:
         if raw_volume.ndim != 3:
             raise ValueError("raw_volume must be a 3-D array (Z, Y, X).")
@@ -785,6 +788,7 @@ class OrthoPanel3DBillboard:
         self.cone_alpha = float(cone_alpha)
         self.cone_length = float(cone_length)
         self.cone_half_width = float(cone_half_width)
+        self._font_scale = max(0.5, float(font_scale))
         self._canvas = np.zeros((self.panel_h, self.panel_w, 3), dtype=np.uint8)
         self._cached_bytes: bytes = b""
 
@@ -896,8 +900,8 @@ class OrthoPanel3DBillboard:
             _fg_speed  = (160, 220, 255)
             _lm        = max(3, self.cell // 32)
             # 2× the former sizes (were cell/8 and cell/12).
-            _fsize_title = max(8, round(self.cell / 4))   # was cell/8
-            _fsize_spd   = max(7, round(self.cell / 6))   # was cell/12
+            _fsize_title = max(8, round(self.cell / 4 * self._font_scale))   # was cell/8
+            _fsize_spd   = max(7, round(self.cell / 6 * self._font_scale))   # was cell/12
             try:
                 _font_title = _PIL_Font.load_default(size=_fsize_title)
                 _font_spd   = _PIL_Font.load_default(size=_fsize_spd)

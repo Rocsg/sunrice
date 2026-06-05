@@ -2078,8 +2078,12 @@ def _build_path_rings(
 
     color = [c / 255.0 for c in (PATH_RING_COLOR_VR if vr_mode != "off" else PATH_RING_COLOR)]
     alpha = 1.0   # always opaque (was PATH_RING_OPACITY=0.40 in flat)
-    ring_r         = 0.90 * tube_radius   # centre inside cable → ring flush with surface
-    ring_thickness  = 0.18 * tube_radius   # thin band, outer ≈ 1.08 × tube_r
+    if vr_mode != "off":
+        ring_r         = 3.6 * tube_radius   # VR: 4× bigger vs 0.90 (rings too thin in headset)
+        ring_thickness = 0.72 * tube_radius  # VR: 4× bigger vs 0.18
+    else:
+        ring_r         = 0.90 * tube_radius   # centre inside cable → ring flush with surface
+        ring_thickness = 0.18 * tube_radius   # thin band, outer ≈ 1.08 × tube_r
 
     actors: list = []
     s = PATH_RING_SPACING
@@ -2479,11 +2483,12 @@ def _build_sponsors_panel(
 
     sponsors_center = (
         sponsors_center
-        + 16.0 * panel_up
-        - 12.0 * panel_right
+        + 26.0 * panel_up      # +10 vox higher (was 16.0)
+        - 22.0 * panel_right   # +10 vox to the left (was -12.0)
     )
 
-    half_w = panel_width_voxels * 1.2 / 2.0   # ×1.5 then ×0.8 = ×1.2
+    half_w_base = panel_width_voxels * 1.2 / 2.0   # ×1.5 then ×0.8 = ×1.2
+    half_w = half_w_base * 1.7       # 70 % bigger sponsors panel
     sp_half_h = half_w   # fallback height (square)
 
     # ── Helper: white VTK texture (with same vignette as loaded images) ──
@@ -2494,6 +2499,33 @@ def _build_sponsors_panel(
         _yd = ((_yy / (_sz - 1)) * 2.0 - 1.0) ** 2
         _xd = ((_xx / (_sz - 1)) * 2.0 - 1.0) ** 2
         _wt = (1.0 - 0.25 * np.sqrt(np.clip((_yd + _xd) / 2.0, 0.0, 1.0))).astype(np.float32)
+        _v   = np.clip(255.0 * _wt, 0, 255).astype(np.uint8)
+        _arr = np.ascontiguousarray(np.stack([_v, _v, _v], axis=-1)[::-1])
+        _imp = _vtk.vtkImageImport()
+        _imp.SetDataScalarTypeToUnsignedChar()
+        _imp.SetNumberOfScalarComponents(3)
+        _imp.SetWholeExtent(0, _sz - 1, 0, _sz - 1, 0, 0)
+        _imp.SetDataExtent(0, _sz - 1, 0, _sz - 1, 0, 0)
+        _imp.SetDataSpacing(1.0, 1.0, 1.0)
+        _imp.SetDataOrigin(0.0, 0.0, 0.0)
+        _raw = _arr.tobytes()
+        _imp.CopyImportVoidPointer(_raw, len(_raw))
+        _imp.Update()
+        _tex = _vtk.vtkTexture()
+        _tex.SetInputConnection(_imp.GetOutputPort())
+        _tex.InterpolateOn()
+        _tex.RepeatOff()
+        return _tex
+
+    def _dark_gradient_texture():
+        """Near-black panel with a subtle centre highlight — reversed additive gradient."""
+        import vtk as _vtk  # noqa: PLC0415
+        _sz = 64
+        _yy, _xx = np.mgrid[0:_sz, 0:_sz]
+        _yd = ((_yy / (_sz - 1)) * 2.0 - 1.0) ** 2
+        _xd = ((_xx / (_sz - 1)) * 2.0 - 1.0) ** 2
+        # Reversed of white: 0 at edges, ~0.12 at centre
+        _wt = (0.12 * (1.0 - np.sqrt(np.clip((_yd + _xd) / 2.0, 0.0, 1.0)))).astype(np.float32)
         _v   = np.clip(255.0 * _wt, 0, 255).astype(np.uint8)
         _arr = np.ascontiguousarray(np.stack([_v, _v, _v], axis=-1)[::-1])
         _imp = _vtk.vtkImageImport()
@@ -2578,27 +2610,28 @@ def _build_sponsors_panel(
         ep_tex_result = _load_image_texture(ep)
         if ep_tex_result is not None:
             ep_tex, ep_iw, ep_ih = ep_tex_result
-            ep_half_w = half_w * 0.6              # entrance 40 % smaller
+            ep_half_w = half_w_base * 0.6              # entrance size based on original (unscaled) width
             ep_half_h = ep_half_w * (float(ep_ih) / float(ep_iw))
-            # Base position above sponsors, then shifted +0.5 vox up and +50 vox right.
+            # Base position above sponsors, then shifted up and right.
+            # −2 vox vertical adjustment so the panel sits slightly lower.
             entrance_center = (
                 sponsors_center
-                + panel_up   * (sp_half_h + panel_gap_voxels + ep_half_h + 0.5)
+                + panel_up   * (sp_half_h + panel_gap_voxels + ep_half_h + 0.5 - 2.0)
                 + panel_right * 50.0
             )
             ep_actor = _make_image_panel_actor(
                 entrance_center, panel_up, panel_right, ep_half_w, ep_half_h, ep_tex,
             )
             ep_actor.SetVisibility(0)
-            # White-rectangle actor for blink "off" state (same size/position).
+            # Dark-gradient actor for blink "off" state — near-black reversed gradient.
             try:
                 ep_white_actor = _make_image_panel_actor(
                     entrance_center, panel_up, panel_right, ep_half_w, ep_half_h,
-                    _white_texture(),
+                    _dark_gradient_texture(),
                 )
                 ep_white_actor.SetVisibility(0)
             except Exception as _ewe:  # noqa: BLE001
-                logger.debug("Entrance white actor failed: %s", _ewe)
+                logger.debug("Entrance dark actor failed: %s", _ewe)
             # Tube-frame border around entrance panel.
             try:
                 ep_backing = _make_panel_frame_actor(
@@ -4528,6 +4561,7 @@ def main(argv: list[str] | None = None) -> int:
                         forward_metres=_pfm,
                         left_metres=-_pfm * 0.5774,  # tan(30°) → 30° to the right
                         vert_metres=_pfm * 0.2765 - 1.0,  # aligned with info billboard
+                        font_scale=1.12,            # +12 % font for VR headset
                     )
                     print(f"      ortho billboard attached  (Raw={raw_path.name}, "
                           f"shape={raw_volume.shape}, focal_dist={_focal_dist:.1f})")
@@ -4538,6 +4572,7 @@ def main(argv: list[str] | None = None) -> int:
                         viewport=(0.02, 0.50, 0.34, 0.98),   # top-left, 2% gap all sides
                         cell_pixels=round(90 * eye_h / 540),   # ×0.7²  of full size
                         center_vertically=False,
+                        font_scale=1.3,              # +30 % font for flat display
                     )
                     print(f"      ortho panel attached  (Raw={raw_path.name}, "
                           f"shape={raw_volume.shape})")
@@ -4734,13 +4769,13 @@ def main(argv: list[str] | None = None) -> int:
     if _sp_actors or _ep_actor is not None:
         _pnl_fps    = max(1.0, float(args.fps))
         _pnl_offset = int(getattr(args, "_frame_offset", 0) or 0)
-        _SP_DELAY = 12.0  # sponsors appear after this many seconds
+        _SP_DELAY = 14.0  # sponsors appear after this many seconds (was 12.0, +2 s)
         _SP_SHOW  = 4.4   # seconds each sponsors image is shown
         _SP_FLASH = 0.6   # seconds of white flash between images
         _SP_CYCLE = 3.0 * (_SP_SHOW + _SP_FLASH)   # = 15.0 s
         _EP_DELAY = 25.0  # entrance appears after this many seconds
-        _EP_ON    = 2.0   # entrance image visible (s)
-        _EP_CYCLE = 3.0   # entrance blink period: on + white (s)
+        _EP_ON    = 0.8   # entrance image visible (s)  — short equal-duration cycles
+        _EP_CYCLE = 1.6   # entrance blink period: 0.8 s on + 0.8 s off
         for _fi in range(len(track)):
             _t = (_pnl_offset + _fi) / _pnl_fps
             # -- sponsors --
@@ -4845,8 +4880,7 @@ def main(argv: list[str] | None = None) -> int:
         # absolute index of the first frame in this chunk) so the initial
         # 5-second block and the mode-debounce initialisation are correct.
         _frame_offset = int(getattr(args, "_frame_offset", 0) or 0)
-        _init_frames = max(0, 5 * _fps_int - _frame_offset)
-        _info_visible_frames[:_init_frames] = True
+        _INTRO_END_S = 35.0  # info panel inhibited during intro; first fire at cave entry
         # Seed _last_fired_mode from the first frame's mode so we don't
         # re-trigger for the same mode that a previous chunk already showed.
         if _frame_offset > 0 and track:
@@ -4857,6 +4891,13 @@ def main(argv: list[str] | None = None) -> int:
             _last_fired_mode = ""
         for _vi, _vs in enumerate(track):
             _mode_vi = ((_vs.get("ui_state") or {}).get("view_mode") or "")
+            _abs_t = (_frame_offset + _vi) / _fps_int
+            if _abs_t < _INTRO_END_S:
+                # Still in intro: track mode changes to seed debounce but
+                # do NOT show the info panel.
+                if _mode_vi:
+                    _last_fired_mode = _mode_vi
+                continue
             if _mode_vi and _mode_vi != _last_fired_mode:
                 _end_vi = min(len(track), _vi + 4 * _fps_int)
                 _info_visible_frames[_vi:_end_vi] = True

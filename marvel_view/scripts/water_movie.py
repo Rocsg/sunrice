@@ -2079,7 +2079,7 @@ def _build_path_rings(
     color = [c / 255.0 for c in (PATH_RING_COLOR_VR if vr_mode != "off" else PATH_RING_COLOR)]
     alpha = 1.0   # always opaque (was PATH_RING_OPACITY=0.40 in flat)
     if vr_mode != "off":
-        ring_r         = 3.6 * tube_radius   # VR: 4× bigger vs 0.90 (rings too thin in headset)
+        ring_r         = 1.6 * tube_radius   # VR: 4× bigger vs 0.90 (rings too thin in headset)
         ring_thickness = 0.72 * tube_radius  # VR: 4× bigger vs 0.18
     else:
         ring_r         = 0.90 * tube_radius   # centre inside cable → ring flush with surface
@@ -2612,12 +2612,13 @@ def _build_sponsors_panel(
             ep_tex, ep_iw, ep_ih = ep_tex_result
             ep_half_w = half_w_base * 0.6              # entrance size based on original (unscaled) width
             ep_half_h = ep_half_w * (float(ep_ih) / float(ep_iw))
-            # Base position above sponsors, then shifted up and right.
-            # −2 vox vertical adjustment so the panel sits slightly lower.
+            # Position uses half_w_base (unscaled sponsor height) so the entrance
+            # sits just above the original sponsor footprint regardless of the
+            # 70 % sponsor scale-up.  −1 vox lowers it slightly from the baseline.
             entrance_center = (
                 sponsors_center
-                + panel_up   * (sp_half_h + panel_gap_voxels + ep_half_h + 0.5 - 2.0)
-                + panel_right * 50.0
+                + panel_up   * (half_w_base + panel_gap_voxels + ep_half_h + 0.5 - 1.0 - 8.0)
+                + panel_right * (50.0 + 6.0)
             )
             ep_actor = _make_image_panel_actor(
                 entrance_center, panel_up, panel_right, ep_half_w, ep_half_h, ep_tex,
@@ -4769,11 +4770,11 @@ def main(argv: list[str] | None = None) -> int:
     if _sp_actors or _ep_actor is not None:
         _pnl_fps    = max(1.0, float(args.fps))
         _pnl_offset = int(getattr(args, "_frame_offset", 0) or 0)
-        _SP_DELAY = 14.0  # sponsors appear after this many seconds (was 12.0, +2 s)
-        _SP_SHOW  = 4.4   # seconds each sponsors image is shown
+        _SP_DELAY = 18.5 if vr_mode != "off" else 8.0  # VR: +1 s later; flat: −2 s earlier
+        _SP_SHOW  = 3.9   # seconds each sponsors image is shown (was 4.4, −0.5 s)
         _SP_FLASH = 0.6   # seconds of white flash between images
-        _SP_CYCLE = 3.0 * (_SP_SHOW + _SP_FLASH)   # = 15.0 s
-        _EP_DELAY = 25.0  # entrance appears after this many seconds
+        _SP_CYCLE = 3.0 * (_SP_SHOW + _SP_FLASH)   # = 13.5 s
+        _EP_DELAY = 23.0  # entrance appears after this many seconds (was 25.0, −2 s)
         _EP_ON    = 0.8   # entrance image visible (s)  — short equal-duration cycles
         _EP_CYCLE = 1.6   # entrance blink period: 0.8 s on + 0.8 s off
         for _fi in range(len(track)):

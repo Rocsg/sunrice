@@ -2079,7 +2079,7 @@ def _build_path_rings(
     color = [c / 255.0 for c in (PATH_RING_COLOR_VR if vr_mode != "off" else PATH_RING_COLOR)]
     alpha = 1.0   # always opaque (was PATH_RING_OPACITY=0.40 in flat)
     ring_r         = 0.90 * tube_radius   # centre inside cable → ring flush with surface
-    ring_thickness  = 0.35 * tube_radius   # outer ≈ 1.25 × tube_r
+    ring_thickness  = 0.18 * tube_radius   # thin band, outer ≈ 1.08 × tube_r
 
     actors: list = []
     s = PATH_RING_SPACING

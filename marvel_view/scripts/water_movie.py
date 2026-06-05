@@ -2077,8 +2077,8 @@ def _build_path_rings(
         return []
 
     color = [c / 255.0 for c in (PATH_RING_COLOR_VR if vr_mode != "off" else PATH_RING_COLOR)]
-    alpha = 1.0 if vr_mode != "off" else PATH_RING_OPACITY
-    ring_r = 1.6 * tube_radius   # inner edge ≈ 1.1 × tube_r — collar sits on cable
+    alpha = 1.0   # always opaque (was PATH_RING_OPACITY=0.40 in flat)
+    ring_r = 1.52 * tube_radius   # −5 % vs former 1.6 × tube_r
     ring_thickness = 0.5 * tube_radius
 
     actors: list = []
@@ -2131,7 +2131,7 @@ def _build_path_rings(
                 specular_color=[0.85, 0.95, 1.0],
             )
             try:
-                ring.GetProperty().SetInterpolationToPhong()
+                ring.GetProperty().SetInterpolationToGouraud()
             except Exception:  # noqa: BLE001
                 pass
         except Exception:  # noqa: BLE001
@@ -4356,7 +4356,7 @@ def main(argv: list[str] | None = None) -> int:
                         meters_per_voxel=args.meters_per_voxel,
                         angular_size_deg=14.28,   # 16.8 × 0.85
                         forward_metres=_pfm,
-                        left_metres=_pfm * 0.5774,   # tan(30°) → 30° to the left (was 25°)
+                        left_metres=-_pfm * 0.5774,  # tan(30°) → 30° to the right
                         vert_metres=_pfm * 0.2765 - 1.0,  # aligned with info billboard
                     )
                     print(f"      ortho billboard attached  (Raw={raw_path.name}, "
@@ -4365,7 +4365,7 @@ def main(argv: list[str] | None = None) -> int:
                     # ── Flat mode: 2-D HUD anchored vertically centered ─────────
                     ortho_overlay = OrthoPanelOverlay(
                         plt, raw_volume,
-                        viewport=(0.02, 0.50, 0.34, 1.0),   # top-left corner
+                        viewport=(0.02, 0.50, 0.34, 0.98),   # top-left, 2% gap all sides
                         cell_pixels=round(90 * eye_h / 540),   # ×0.7²  of full size
                         center_vertically=False,
                     )

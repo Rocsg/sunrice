@@ -80,6 +80,7 @@ from marvel_view.scripts.water_conductance import (
     DEFAULT_PILLARS_CACHE_PATH,
     DEFAULT_POSITIONS_DIR,
     DEFAULT_SMOOTH_ITER,
+    DEFAULT_VTK_OUTPUT_DIR,
     _build_lames_step_polydatas,
     _load_lames,
     load_lame2_normals_cache,
@@ -136,7 +137,7 @@ PATH_LINE_WIDTH          = 4                 # only used in mono / preview
 # A real 3D tube (vs. a screen-space Line) is needed for VR because
 # vtkPanoramicProjectionPass remaps 6 cube faces to equirect, and a
 # 4-px-wide Line shrinks to sub-pixel — invisible — after that remap.
-PATH_TUBE_RADIUS_FRAC    = 0.00072   # flat / preview  (−10 % vs former 0.0008)
+PATH_TUBE_RADIUS_FRAC    = 0.00009   # flat / preview — tube (2× VR; was 0.00072 for screen-space Line + rings)
 PATH_TUBE_RADIUS_FRAC_VR = 0.000045  # VR              (−10 % vs former 0.00005)
 # Decoration spacing in voxels.  Voxel size ≈ 6.8 µm → 100 µm / 6.8 ≈ 14.7 vox.
 PATH_RING_SPACING     = 14.7   # collar every 100 µm
@@ -345,6 +346,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "beginning of a trajectory without touching the "
                         "positions file.  E.g. --trick 12 stops at the "
                         "12th saved position.")
+
+    p.add_argument("--sponsors", default=str(DEFAULT_VTK_OUTPUT_DIR / "sponsors.jpg"),
+                   metavar="IMG",
+                   help="Path to a sponsors JPEG/PNG image.  A static "
+                        "texture-mapped panel is inserted just beyond the "
+                        "root-entry corner (Xmax+20, Ymid, Zmax+20) with the "
+                        "panel vertical axis ≈ (0, 0.866, 0.5).  Works for "
+                        "both flat and VR renders.  Set to '' or 'none' to "
+                        "disable.  "
+                        f"(default: {DEFAULT_VTK_OUTPUT_DIR / 'sponsors.jpg'})")
+    p.add_argument("--no-sponsors", action="store_true",
+                   help="Disable the sponsors panel even if the default image exists.")
 
     p.add_argument("--debugdisplayindexframes", action="store_true",
                    help="Flat-mode only: burn an indicative keyframe index "
@@ -1880,6 +1893,12 @@ class _UiReplayBundle:
                 _vis = _vis and (_cur_vm in _VR_ARROWS)
                 if _sty == "glow":
                     _sty = "solid"
+            else:
+                # In flat mode, pillars render oddly in cortex mesh modes — hide them.
+                _MESH_MODES = {"mesh_bridges", "mesh_all"}
+                _cur_vm = vm or "mesh_bridges"
+                if _cur_vm in _MESH_MODES:
+                    _vis = False
             self._apply_pillars(
                 visible=_vis,
                 style=_sty,
@@ -1979,7 +1998,7 @@ def _build_path_line(track: Sequence[dict], offset: float,
     up = _world_up_from_track(track)
     line_pts = cam_positions + up * offset
     color = [c / 255.0 for c in PATH_COLOR]
-    _opacity = 1.0 if vr_mode != "off" else PATH_OPACITY
+    _opacity = 1.0   # tubes are 3-D geometry: always opaque (0.55 line opacity was for screen-space Lines)
     if as_tube:
         radius = median_dist * radius_frac
         obj = vedo.Tube(line_pts, r=radius, c=color, res=16)
@@ -2008,7 +2027,23 @@ def _build_path_line(track: Sequence[dict], offset: float,
         obj = vedo.Line(line_pts, c=color, lw=PATH_LINE_WIDTH)
     obj.alpha(_opacity)
     try:
-        obj.lighting("off")
+        # Use vedo's native lighting() so the call goes through vedo's
+        # abstraction layer reliably (direct VTK property access is fragile
+        # across vedo versions and caused the tube to look dark / transparent).
+        obj.lighting(
+            ambient=0.40,
+            diffuse=0.65,
+            specular=0.70,
+            specular_power=40,
+            specular_color=[0.85, 0.95, 1.0],
+        )
+        # Force per-fragment (Phong) interpolation via VTK — vedo's lighting()
+        # does not expose this parameter directly.
+        try:
+            _vtk_prop = obj.GetProperty()
+            _vtk_prop.SetInterpolationToPhong()
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001
         pass
     obj.name = "cable_car_path"
@@ -2088,7 +2123,17 @@ def _build_path_rings(
         ring.color(color)
         ring.alpha(alpha)
         try:
-            ring.lighting("off")
+            ring.lighting(
+                ambient=0.40,
+                diffuse=0.65,
+                specular=0.70,
+                specular_power=40,
+                specular_color=[0.85, 0.95, 1.0],
+            )
+            try:
+                ring.GetProperty().SetInterpolationToPhong()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             pass
         ring.name = "cable_car_ring"
@@ -2213,6 +2258,200 @@ def _setup_antialiasing(plt, *, msaa: int, fxaa: bool,
             logger.debug("FXAA setup failed on %s: %s", renderer, exc)
     print(f"      AA               : MSAA×{msaa}"
           + f"  + FXAA(rel={fxaa_contrast}, hard={fxaa_hard_contrast})")
+
+
+def _load_image_texture(path: "Path") -> "tuple[vtk.vtkTexture, int, int] | None":
+    """Load an image file and return ``(vtkTexture, width_px, height_px)``.
+
+    Tries PIL first (supports JPEG, PNG, …), falls back to vtkJPEGReader.
+    Returns ``None`` on failure.
+    """
+    import vtk as _vtk
+    try:
+        from PIL import Image as _PIL_Image  # noqa: PLC0415
+        _pil = _PIL_Image.open(str(path)).convert("RGB")
+        iw, ih = _pil.size
+        arr = np.ascontiguousarray(np.array(_pil, dtype=np.uint8)[::-1, :, :])
+        imp = _vtk.vtkImageImport()
+        imp.SetDataScalarTypeToUnsignedChar()
+        imp.SetNumberOfScalarComponents(3)
+        imp.SetWholeExtent(0, iw - 1, 0, ih - 1, 0, 0)
+        imp.SetDataExtent(0, iw - 1, 0, ih - 1, 0, 0)
+        imp.SetDataSpacing(1.0, 1.0, 1.0)
+        imp.SetDataOrigin(0.0, 0.0, 0.0)
+        _raw = arr.tobytes()
+        imp.CopyImportVoidPointer(_raw, len(_raw))
+        imp.Update()
+        tex = _vtk.vtkTexture()
+        tex.SetInputConnection(imp.GetOutputPort())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PIL load failed for %s: %s – trying vtkJPEGReader", path, exc)
+        try:
+            rdr = _vtk.vtkJPEGReader()
+            rdr.SetFileName(str(path))
+            rdr.Update()
+            dims = rdr.GetOutput().GetDimensions()
+            iw, ih = dims[0], dims[1]
+            tex = _vtk.vtkTexture()
+            tex.SetInputConnection(rdr.GetOutputPort())
+        except Exception as exc2:  # noqa: BLE001
+            logger.warning("Could not load image %s: %s", path, exc2)
+            return None
+    tex.InterpolateOn()
+    tex.RepeatOff()
+    try:
+        tex.EdgeClampOn()
+    except AttributeError:
+        pass
+    return tex, iw, ih
+
+
+def _make_image_panel_actor(
+    center: "np.ndarray",
+    panel_up: "np.ndarray",
+    panel_right: "np.ndarray",
+    half_w: float,
+    half_h: float,
+    texture: "vtk.vtkTexture",
+) -> "vtk.vtkActor":
+    """Return a texture-mapped ``vtkActor`` for a rectangular panel.
+
+    ``panel_up`` and ``panel_right`` must be unit vectors orthogonal to each
+    other and to the panel normal.  ``half_w`` / ``half_h`` are in voxel units.
+    """
+    import vtk as _vtk
+    c = np.asarray(center, dtype=float)
+    origin = c - panel_right * half_w - panel_up * half_h
+    point1 = c + panel_right * half_w - panel_up * half_h
+    point2 = c - panel_right * half_w + panel_up * half_h
+
+    plane = _vtk.vtkPlaneSource()
+    plane.SetResolution(1, 1)
+    plane.SetOrigin(*origin.tolist())
+    plane.SetPoint1(*point1.tolist())
+    plane.SetPoint2(*point2.tolist())
+    plane.Modified()
+
+    mapper = _vtk.vtkPolyDataMapper()
+    mapper.SetInputConnection(plane.GetOutputPort())
+    mapper.RemoveAllClippingPlanes()
+
+    actor = _vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.SetTexture(texture)
+    actor.GetProperty().SetOpacity(1.0)   # must be opaque for VR panoramic pass
+    try:
+        actor.GetProperty().LightingOff()
+    except AttributeError:
+        pass
+    actor.GetProperty().BackfaceCullingOff()
+    return actor
+
+
+def _build_sponsors_panel(
+    mesh,
+    sponsors_path: str | None,
+    *,
+    panel_width_voxels: float = 35.0,
+    center_offset: tuple[float, float, float] = (1.0, 0.0, -3.0),
+    panel_gap_voxels: float = 5.0,
+) -> "list[vtk.vtkActor]":
+    """Build static textured 3-D panels for the sponsors and entrance images.
+
+    Both panels share the same orientation and width.  The *entrance* panel
+    (``entrance.jpg``, expected in the same directory as *sponsors_path*) is
+    stacked directly above the sponsors panel along the panel's vertical axis,
+    with a ``panel_gap_voxels`` gap between the two.
+
+    Returns a (possibly empty) list of ``vtkActor`` objects ready to be added
+    to the main renderer.
+    """
+    from pathlib import Path as _Path
+    import math as _math
+
+    if sponsors_path is None:
+        return []
+    sp = _Path(sponsors_path)
+    if not sp.exists():
+        logger.warning("Sponsors image not found: %s — panels skipped.", sponsors_path)
+        return []
+
+    # ── Mesh bounds → sponsors panel centre ──────────────────────────────
+    try:
+        bnd = mesh.bounds()   # [xmin, xmax, ymin, ymax, zmin, zmax]
+    except Exception:  # noqa: BLE001
+        bnd = [0.0, 100.0, 0.0, 100.0, 0.0, 100.0]
+    xmin, xmax, ymin, ymax, zmin, zmax = (float(b) for b in bnd)
+    dx, dy, dz = center_offset
+    sponsors_center = np.array([
+        xmax + dx,
+        ymax * 0.28 + dy,
+        zmax + dz,
+    ], dtype=float)
+
+    # ── Panel orientation (shared by both panels) ─────────────────────────
+    # Base axes: vertical=(0,0.866,0.5), left=(0,-0.5,0.866), normal=(-1,0,0).
+    # Rotated 10° clockwise as seen face-on (up → right direction).
+    _theta  = _math.radians(10.0)
+    _c, _s  = _math.cos(_theta), _math.sin(_theta)
+    _up0    = np.array([0.0,  0.866,  0.5  ], dtype=float)
+    _right0 = np.array([0.0,  0.5,   -0.866], dtype=float)
+    panel_up    = _c * _up0    + _s * _right0
+    panel_right = -_s * _up0   + _c * _right0
+
+    # Apply global offset: 4 voxels up (panel vertical) + 5 voxels left (−panel_right, i.e. 10−3−2).
+    sponsors_center = (
+        sponsors_center
+        + 4.0  * panel_up
+        - 5.0 * panel_right
+    )
+
+    half_w = panel_width_voxels / 2.0
+
+    actors: list = []
+
+    # ── Sponsors panel ────────────────────────────────────────────────────
+    sp_tex_result = _load_image_texture(sp)
+    if sp_tex_result is not None:
+        sp_tex, sp_iw, sp_ih = sp_tex_result
+        sp_half_h = half_w * (float(sp_ih) / float(sp_iw))
+        sp_actor = _make_image_panel_actor(
+            sponsors_center, panel_up, panel_right, half_w, sp_half_h, sp_tex,
+        )
+        actors.append(sp_actor)
+        logger.info(
+            "Sponsors panel: center=(%.1f,%.1f,%.1f)  %.1f×%.1f vox  img=%dx%d",
+            *sponsors_center, half_w * 2, sp_half_h * 2, sp_iw, sp_ih,
+        )
+    else:
+        sp_half_h = half_w   # fallback size so entrance can still be placed
+
+    # ── Entrance panel (entrance.jpg in same directory) ───────────────────
+    ep = sp.parent / "entrance.jpg"
+    if not ep.exists():
+        ep = sp.parent / "entrance.png"   # also try PNG
+    if ep.exists():
+        ep_tex_result = _load_image_texture(ep)
+        if ep_tex_result is not None:
+            ep_tex, ep_iw, ep_ih = ep_tex_result
+            ep_half_h = half_w * (float(ep_ih) / float(ep_iw))
+            # Centre = top edge of sponsors + gap + half-height of entrance.
+            entrance_center = (
+                sponsors_center
+                + panel_up * (sp_half_h + panel_gap_voxels + ep_half_h)
+            )
+            ep_actor = _make_image_panel_actor(
+                entrance_center, panel_up, panel_right, half_w, ep_half_h, ep_tex,
+            )
+            actors.append(ep_actor)
+            logger.info(
+                "Entrance panel: center=(%.1f,%.1f,%.1f)  %.1f×%.1f vox  img=%dx%d",
+                *entrance_center, half_w * 2, ep_half_h * 2, ep_iw, ep_ih,
+            )
+    else:
+        logger.info("No entrance.jpg found in %s — single sponsors panel only.", sp.parent)
+
+    return actors
 
 
 def _force_phong(*meshes) -> None:
@@ -3170,7 +3409,15 @@ def main(argv: list[str] | None = None) -> int:
                 lames_fps = int(_lames_meta.get("fps", DEFAULT_LAME2_SOURCE_FPS))
                 if args.lames_fps is not None and int(args.lames_fps) > 0:
                     lames_fps = int(args.lames_fps)
-                _normals_dir = DEFAULT_LAME2_NORMALS_CACHE_DIR
+                # Use a per-fps normals cache dir so 25 / 60 / 90 fps builds
+                # don't overwrite each other (n_steps differs across fps variants).
+                if lames_fps == DEFAULT_LAME2_SOURCE_FPS:
+                    _normals_dir = DEFAULT_LAME2_NORMALS_CACHE_DIR
+                else:
+                    _normals_dir = (
+                        DEFAULT_LAME2_NORMALS_CACHE_DIR.parent
+                        / f"{DEFAULT_LAME2_NORMALS_CACHE_DIR.name}_{lames_fps}fps"
+                    )
                 _step_pds, _actor = load_lame2_normals_cache(
                     _normals_dir, lames_n_steps)
                 if _step_pds is None:
@@ -3879,14 +4126,14 @@ def main(argv: list[str] | None = None) -> int:
         _rfrac = PATH_TUBE_RADIUS_FRAC_VR if vr_mode != "off" else PATH_TUBE_RADIUS_FRAC
         path_line, _tube_r = _build_path_line(
             full_track, PATH_VERTICAL_OFFSET,
-            as_tube=(vr_mode != "off"),
+            as_tube=True,   # always tube (flat was Line → too thin at 4K; rings used tube_r anyway)
             radius_frac=_rfrac,
             vr_mode=vr_mode,
         )
         path_extras = _build_path_rings(
             full_track, PATH_VERTICAL_OFFSET, _tube_r, vr_mode=vr_mode
         )
-        kind = "tube" if vr_mode != "off" else "line"
+        kind = "tube"
         print(f"      built cable-car path {kind} over {len(full_track)} samples"
               f", {len(path_extras)} decoration actors")
 
@@ -4109,8 +4356,8 @@ def main(argv: list[str] | None = None) -> int:
                         meters_per_voxel=args.meters_per_voxel,
                         angular_size_deg=14.28,   # 16.8 × 0.85
                         forward_metres=_pfm,
-                        left_metres=_pfm * 0.4663,   # tan(25°) → 25° to the left
-                        vert_metres=_pfm * -0.0875,  # tan(−5°) → 5° lower
+                        left_metres=_pfm * 0.5774,   # tan(30°) → 30° to the left (was 25°)
+                        vert_metres=_pfm * 0.2765 - 1.0,  # aligned with info billboard
                     )
                     print(f"      ortho billboard attached  (Raw={raw_path.name}, "
                           f"shape={raw_volume.shape}, focal_dist={_focal_dist:.1f})")
@@ -4118,9 +4365,9 @@ def main(argv: list[str] | None = None) -> int:
                     # ── Flat mode: 2-D HUD anchored vertically centered ─────────
                     ortho_overlay = OrthoPanelOverlay(
                         plt, raw_volume,
-                        viewport=(0.02, 0.15, 0.34, 0.69),
-                        cell_pixels=round(92 * eye_h / 540),
-                        center_vertically=True,
+                        viewport=(0.02, 0.50, 0.34, 1.0),   # top-left corner
+                        cell_pixels=round(90 * eye_h / 540),   # ×0.7²  of full size
+                        center_vertically=False,
                     )
                     print(f"      ortho panel attached  (Raw={raw_path.name}, "
                           f"shape={raw_volume.shape})")
@@ -4162,8 +4409,8 @@ def main(argv: list[str] | None = None) -> int:
                 plt, "", _init_sub,         # title="" → subtitle-only display
                 opacity=0.72,
                 width_frac=0.38 * 1.05,    # +5 % wider  ≈ 0.399
-                height_frac=0.064 / 2,     # height ÷ 2  = 0.032
-                subtitle_font_scale=1.15,  # subtitle font +15 %
+                height_frac=0.064,         # ×2 taller (was 0.032) to fit bigger font
+                subtitle_font_scale=1.61,  # ×2×0.7 font (was 1.15)
             )
             print("      info overlay attached")
     except Exception as exc:  # noqa: BLE001
@@ -4222,27 +4469,39 @@ def main(argv: list[str] | None = None) -> int:
             print("      colormap billboards attached")
         else:
             from marvel_view.visualization.colormap_bar import ColormapBar2D as _CB2D  # noqa: PLC0415
+            # Scale all pixel dimensions with the render resolution so bars
+            # appear the same visual fraction of the screen at any output size.
+            # Reference height: 540 px → eye_h/540 = 2 at 1080p, 4 at 4K.
+            _cbar_s = max(1.0, eye_h / 540.0)
+            _cb_kw = dict(
+                bar_w   = round(28  * _cbar_s),
+                bar_h   = round(200 * _cbar_s),
+                label_w = round(58  * _cbar_s),
+                title_h = round(28  * _cbar_s),
+                pad     = round(6   * _cbar_s),
+                font_size = round(11 * _cbar_s),
+            )
             _cbar_mv_density = _CB2D(
                 plt, cmap="viridis",  vmin=0.0, vmax=1.0, title="Density",
-                pos=(0.87, 0.30),
+                pos=(0.87, 0.30), **_cb_kw,
             )
             _cbar_mv_radial = _CB2D(
                 plt, cmap="coolwarm", vmin=-1.0, vmax=1.0, title="Slope of radial density",
-                pos=(0.87, 0.30),
+                pos=(0.87, 0.30), **_cb_kw,
             )
             _cbar_mv_water = _CB2D(
                 plt, cmap=_WATER_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Water bridge orientation",
-                pos=(0.87, 0.52),
+                pos=(0.87, 0.52), **_cb_kw,
             )
             _cbar_mv_air = _CB2D(
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Gas diffusion",
-                pos=(0.87, 0.12),
+                pos=(0.87, 0.12), **_cb_kw,
             )
             _cbar_mv_tortuosity = _CB2D(
                 plt, cmap=TORTUOSITY_CMAP_STOPS,
                 vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
                 title="Tortuosity",
-                pos=(0.87, 0.30),
+                pos=(0.87, 0.30), **_cb_kw,
             )
             print("      colormap overlays attached")
         # Start all hidden; per-frame loop shows/hides as needed.
@@ -4252,6 +4511,29 @@ def main(argv: list[str] | None = None) -> int:
                 _b.set_visible(False)
     except Exception as _cbar_mv_exc:  # noqa: BLE001
         logger.warning("Failed to attach colormap bars: %s", _cbar_mv_exc)
+
+    # ── Sponsors + entrance image panels (static 3-D textured planes) ────────
+    # Visible in both flat and VR renders.  No per-frame update needed.
+    _sponsors_path = getattr(args, "sponsors", None)
+    if getattr(args, "no_sponsors", False):
+        _sponsors_path = None
+    elif _sponsors_path and _sponsors_path.lower() in ("", "none", "no", "off"):
+        _sponsors_path = None
+    if _sponsors_path:
+        try:
+            _panel_actors = _build_sponsors_panel(mesh, _sponsors_path)
+            if _panel_actors:
+                main_ren_sp = (
+                    plt.renderers[0]
+                    if hasattr(plt, "renderers") and plt.renderers
+                    else plt.renderer
+                )
+                for _pa in _panel_actors:
+                    main_ren_sp.AddActor(_pa)
+                print(f"      {len(_panel_actors)} image panel(s) attached  "
+                      f"(sponsors + entrance from {_sponsors_path})")
+        except Exception as _sp_exc:  # noqa: BLE001
+            logger.warning("Failed to attach image panels: %s", _sp_exc)
 
     actor = getattr(mesh, "actor", None) or mesh
 
@@ -4308,7 +4590,7 @@ def main(argv: list[str] | None = None) -> int:
     _track_speeds_um_s: np.ndarray = np.zeros(len(track))
     if len(track) > 1 and (
         info_billboard is not None or info_overlay is not None
-        or ortho_billboard is not None
+        or ortho_billboard is not None or ortho_overlay is not None
     ):
         try:
             from marvel_view.scripts.water_conductance.constants import (
@@ -4378,6 +4660,7 @@ def main(argv: list[str] | None = None) -> int:
                 ortho_billboard.set_speed_text(f"{_track_speeds_um_s[i]:.1f} um/s")
                 ortho_billboard.update(mono_pos, mono_dir, vr_travel_dirs[i], vr_world_up)
             else:
+                ortho_overlay.set_speed_text(f"{_track_speeds_um_s[i]:.1f} um/s")
                 ortho_overlay.update(mono_pos, mono_dir)
 
         # ── Colormap bars: show/hide + pose ──────────────────────────────────

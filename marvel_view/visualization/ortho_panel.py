@@ -146,6 +146,7 @@ class OrthoPanelOverlay:
         # Bottom-right: compact text label — no full cell border.
         # A small near-black rectangle placed at the top of the 4th quadrant
         # so it sits close to the three slice tiles.
+        self._br_speed_text: str = ""
         self._br_label_tile: np.ndarray = np.zeros(
             (self.cell, self.cell, 3), dtype=np.uint8
         )
@@ -277,6 +278,8 @@ class OrthoPanelOverlay:
 
         # Initial paint with cam at volume center.
         Z, Y, X = self.volume.shape
+        # Build the initial label tile now that the object is fully initialised.
+        self._br_label_tile = self._make_br_label_tile("")
         self.update((Z * 0.5, Y * 0.5, X * 0.5), (0.0, 0.0, -1.0))
         logger.info(
             "OrthoPanelOverlay READY.  volume shape=(Z=%d, Y=%d, X=%d).  "
@@ -572,6 +575,73 @@ class OrthoPanelOverlay:
         self._last_cam_dir   = tuple(cam_dir)
         rgb = self.compose(cam_world, cam_dir)
         self._push_pixels(rgb)
+
+    # ── bottom-right label tile ──────────────────────────────────────────
+
+    def _make_br_label_tile(self, speed_text: str) -> np.ndarray:
+        """Render a ``(cell, cell, 3)`` tile: 'Map' header + speed lines.
+
+        Layout (top → bottom):
+          • "Map"   — header
+          • blank line gap
+          • "Speed" — label
+          • speed value
+        Font sizes are ×2 of the former static text (was ``cell / 16``).
+        """
+        tile = np.zeros((self.cell, self.cell, 3), dtype=np.uint8)
+        try:
+            from PIL import Image as _PIL_Image, ImageDraw as _PIL_Draw, ImageFont as _PIL_Font  # noqa: PLC0415
+            _fg_header = (200, 200, 200)
+            _fg_speed  = (160, 220, 255)
+            _lm        = max(3, self.cell // 32)
+            _fsize_title = max(8, round(self.cell / 8))   # ×2 of former cell/16
+            _fsize_spd   = max(7, round(self.cell / 10))
+            try:
+                _font_title = _PIL_Font.load_default(size=_fsize_title)
+                _font_spd   = _PIL_Font.load_default(size=_fsize_spd)
+            except TypeError:
+                _font_title = _font_spd = _PIL_Font.load_default()
+            _pil = _PIL_Image.new("RGB", (self.cell, self.cell), (0, 0, 0))
+            _d   = _PIL_Draw.Draw(_pil)
+            _gap  = max(2, self.cell // 32)
+            _bw   = self.cell - 2 * _lm
+
+            def _tw(text, font):
+                try:
+                    bb = _d.textbbox((0, 0), text, font=font)
+                    return bb[2] - bb[0], bb[3] - bb[1]
+                except AttributeError:
+                    return self.cell - 2 * _lm, _fsize_title
+
+            _w_map, _h_map = _tw("Map",   _font_title)
+            _w_spd, _h_spd = _tw("Speed", _font_spd)
+            _val_text = speed_text if speed_text else "\u2014"
+            _w_val, _h_val = _tw(_val_text, _font_spd)
+
+            _blank = _h_spd   # blank gap = one speed-font height
+            _total = _h_map + _gap + _blank + _gap + _h_spd + _gap + _h_val
+            _vy    = max(_gap, (self.cell - _total) // 2)
+
+            _d.text((_lm + (_bw - _w_map) // 2, _vy),
+                    "Map", font=_font_title, fill=_fg_header)
+            _y_spd = _vy + _h_map + _gap + _blank + _gap
+            _d.text((_lm + (_bw - _w_spd) // 2, _y_spd),
+                    "Speed", font=_font_spd, fill=_fg_speed)
+            _y_val = _y_spd + _h_spd + _gap
+            _d.text((_lm + (_bw - _w_val) // 2, _y_val),
+                    _val_text, font=_font_spd, fill=_fg_speed)
+
+            tile = np.array(_pil, dtype=np.uint8)
+        except Exception:  # noqa: BLE001
+            pass
+        return tile
+
+    def set_speed_text(self, speed_text: str) -> None:
+        """Update the bottom-right speed tile; called before each frame."""
+        if speed_text == self._br_speed_text:
+            return
+        self._br_speed_text = speed_text
+        self._br_label_tile = self._make_br_label_tile(speed_text)
 
     def set_visible(self, visible: bool) -> None:
         """Show or hide the ortho-panel overlay."""

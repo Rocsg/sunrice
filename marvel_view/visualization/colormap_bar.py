@@ -307,6 +307,7 @@ class ColormapBar2D:
         label_w: int = _DEFAULT_LABEL_W,
         title_h: int = _DEFAULT_TITLE_H,
         pad: int = _DEFAULT_PAD,
+        font_size: int = 11,
         horizontal: bool = False,
     ) -> None:
         self._plotter = plotter
@@ -328,12 +329,14 @@ class ColormapBar2D:
                 cmap, vmin, vmax, title,
                 bar_w=bar_w, bar_h=bar_h,
                 label_w=label_w, title_h=title_h, pad=pad,
+                font_size=font_size,
             )
         else:
             self._img = _render_bar_image(
                 cmap, vmin, vmax, title,
                 bar_w=bar_w, bar_h=bar_h,
                 label_w=label_w, title_h=title_h, pad=pad,
+                font_size=font_size,
             )
         total_h, total_w = self._img.shape[:2]
 

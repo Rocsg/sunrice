@@ -4770,7 +4770,7 @@ def main(argv: list[str] | None = None) -> int:
     if _sp_actors or _ep_actor is not None:
         _pnl_fps    = max(1.0, float(args.fps))
         _pnl_offset = int(getattr(args, "_frame_offset", 0) or 0)
-        _SP_DELAY = 18.5 if vr_mode != "off" else 8.0  # VR: +1 s later; flat: −2 s earlier
+        _SP_DELAY = 20.5 if vr_mode != "off" else 8.0  # VR: +1 s later; flat: −2 s earlier
         _SP_SHOW  = 3.9   # seconds each sponsors image is shown (was 4.4, −0.5 s)
         _SP_FLASH = 0.6   # seconds of white flash between images
         _SP_CYCLE = 3.0 * (_SP_SHOW + _SP_FLASH)   # = 13.5 s

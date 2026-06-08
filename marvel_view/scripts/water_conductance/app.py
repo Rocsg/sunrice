@@ -4832,21 +4832,24 @@ def _attach_controls(
     # ─── Keyboard layout detection (AZERTY / QWERTY) ─────────────────────
     def _detect_kb_layout() -> str:
         """Return 'azerty' or 'qwerty' by querying the X11 keyboard layout."""
+        import os  # noqa: PLC0415
         import subprocess  # noqa: PLC0415
-        # 1) setxkbmap -query  (most reliable on X11/Wayland-XWayland)
-        try:
-            out = subprocess.check_output(
-                ["setxkbmap", "-query"], text=True, timeout=2,
-                stderr=subprocess.DEVNULL,
-            )
-            for line in out.splitlines():
-                if line.startswith("layout:"):
-                    layout = line.split(":", 1)[1].strip().split(",")[0]
-                    if layout in ("fr", "be"):
-                        return "azerty"
-                    return "qwerty"
-        except Exception:  # noqa: BLE001
-            pass
+        # 1) setxkbmap -query  (only meaningful when an X/Wayland display is present)
+        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        if has_display:
+            try:
+                out = subprocess.check_output(
+                    ["setxkbmap", "-query"], text=True, timeout=2,
+                    stderr=subprocess.DEVNULL,
+                )
+                for line in out.splitlines():
+                    if line.startswith("layout:"):
+                        layout = line.split(":", 1)[1].strip().split(",")[0]
+                        if layout in ("fr", "be"):
+                            return "azerty"
+                        return "qwerty"
+            except Exception:  # noqa: BLE001
+                pass
         # 2) /etc/default/keyboard  (Debian/Ubuntu headless)
         try:
             kbd_conf = open("/etc/default/keyboard").read()
@@ -4858,17 +4861,20 @@ def _attach_controls(
                     return "qwerty"
         except Exception:  # noqa: BLE001
             pass
-        # 3) localectl  (systemd)
+        # 3) localectl  (systemd) — collect ALL layout lines before deciding
         try:
             out = subprocess.check_output(
                 ["localectl", "status"], text=True, timeout=2,
                 stderr=subprocess.DEVNULL,
             )
-            for line in out.splitlines():
-                if "X11 Layout" in line or "VC Keymap" in line:
-                    if "fr" in line or "be" in line:
-                        return "azerty"
-                    return "qwerty"
+            layout_lines = [
+                ln for ln in out.splitlines()
+                if "X11 Layout" in ln or "VC Keymap" in ln
+            ]
+            if layout_lines:
+                if any("fr" in ln or "be" in ln for ln in layout_lines):
+                    return "azerty"
+                return "qwerty"
         except Exception:  # noqa: BLE001
             pass
         logger.warning("Could not detect keyboard layout; defaulting to AZERTY.")

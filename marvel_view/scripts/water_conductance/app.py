@@ -111,6 +111,7 @@ def _attach_controls(
     wind_data=None,
     dual_arrows_data=None,
     lame2_normals_dir=None,
+    keyboard_override: str | None = None,
 ) -> None:
     """Add shading button + opacity / lighting / hue sliders.
 
@@ -4836,52 +4837,64 @@ def _attach_controls(
         import subprocess  # noqa: PLC0415
         # 1) setxkbmap -query  (only meaningful when an X/Wayland display is present)
         has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        logger.debug("KB detect: DISPLAY=%r WAYLAND_DISPLAY=%r",
+                     os.environ.get("DISPLAY"), os.environ.get("WAYLAND_DISPLAY"))
         if has_display:
             try:
                 out = subprocess.check_output(
                     ["setxkbmap", "-query"], text=True, timeout=2,
                     stderr=subprocess.DEVNULL,
                 )
+                logger.debug("KB detect [setxkbmap]: %r", out.strip())
                 for line in out.splitlines():
                     if line.startswith("layout:"):
                         layout = line.split(":", 1)[1].strip().split(",")[0]
+                        logger.debug("KB detect [setxkbmap] → layout=%r", layout)
                         if layout in ("fr", "be"):
                             return "azerty"
                         return "qwerty"
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("KB detect [setxkbmap] failed: %s", exc)
         # 2) /etc/default/keyboard  (Debian/Ubuntu headless)
         try:
             kbd_conf = open("/etc/default/keyboard").read()
+            logger.debug("KB detect [/etc/default/keyboard]: %r", kbd_conf.strip())
             for ln in kbd_conf.splitlines():
                 if ln.startswith("XKBLAYOUT="):
                     layout = ln.split("=", 1)[1].strip().strip('"').split(",")[0]
+                    logger.debug("KB detect [/etc/default/keyboard] → layout=%r", layout)
                     if layout in ("fr", "be"):
                         return "azerty"
                     return "qwerty"
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("KB detect [/etc/default/keyboard] failed: %s", exc)
         # 3) localectl  (systemd) — collect ALL layout lines before deciding
         try:
             out = subprocess.check_output(
                 ["localectl", "status"], text=True, timeout=2,
                 stderr=subprocess.DEVNULL,
             )
+            logger.debug("KB detect [localectl]: %r", out.strip())
             layout_lines = [
                 ln for ln in out.splitlines()
                 if "X11 Layout" in ln or "VC Keymap" in ln
             ]
+            logger.debug("KB detect [localectl] layout lines: %r", layout_lines)
             if layout_lines:
                 if any("fr" in ln or "be" in ln for ln in layout_lines):
                     return "azerty"
                 return "qwerty"
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("KB detect [localectl] failed: %s", exc)
         logger.warning("Could not detect keyboard layout; defaulting to AZERTY.")
         return "azerty"
 
-    _kb_layout = _detect_kb_layout()
-    logger.info("Keyboard layout detected: %s", _kb_layout)
+    if keyboard_override:
+        _kb_layout = keyboard_override
+        logger.info("Keyboard layout forced by --keyboard flag: %s", _kb_layout)
+    else:
+        _kb_layout = _detect_kb_layout()
+        logger.info("Keyboard layout detected: %s", _kb_layout)
 
     # ─── Controls image (below nav mode buttons) ─────────────────────────
     # Place layout-specific images in:  <repo>/images/
@@ -6347,6 +6360,7 @@ def main(argv: list[str] | None = None) -> int:
         mask_overlay_meshes=mask_overlay_meshes,
         wind_data=wind_data,
         lame2_normals_dir=getattr(args, "lame2_normals_dir", None),
+        keyboard_override=getattr(args, "keyboard", None),
     )
     # ── Tear down the loading overlay ───────────────────────────────────
     if _loading_overlay_ren is not None:

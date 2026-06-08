@@ -258,4 +258,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "the default movie aspect).")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Enable DEBUG-level logging.")
+    p.add_argument("--keyboard", choices=["azerty", "qwerty"], default=None,
+                   help="Force keyboard layout (overrides auto-detection). "
+                        "Useful on headless servers where detection may be wrong.")
     return p.parse_args(argv)

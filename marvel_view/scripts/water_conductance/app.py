@@ -4832,30 +4832,19 @@ def _attach_controls(
 
     # ─── Keyboard layout detection (AZERTY / QWERTY) ─────────────────────
     def _detect_kb_layout() -> str:
-        """Return 'azerty' or 'qwerty' by querying the X11 keyboard layout."""
+        """Return 'azerty' or 'qwerty' by querying the system keyboard layout.
+
+        Priority (most reliable first):
+          1. /etc/default/keyboard  — reflects the actual console/system layout
+          2. localectl              — systemd source of truth
+          3. setxkbmap              — last resort; virtual displays (Xvfb, VirtualGL)
+                                      often report 'us' regardless of the real keyboard
+        """
         import os  # noqa: PLC0415
         import subprocess  # noqa: PLC0415
-        # 1) setxkbmap -query  (only meaningful when an X/Wayland display is present)
-        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
         logger.debug("KB detect: DISPLAY=%r WAYLAND_DISPLAY=%r",
                      os.environ.get("DISPLAY"), os.environ.get("WAYLAND_DISPLAY"))
-        if has_display:
-            try:
-                out = subprocess.check_output(
-                    ["setxkbmap", "-query"], text=True, timeout=2,
-                    stderr=subprocess.DEVNULL,
-                )
-                logger.debug("KB detect [setxkbmap]: %r", out.strip())
-                for line in out.splitlines():
-                    if line.startswith("layout:"):
-                        layout = line.split(":", 1)[1].strip().split(",")[0]
-                        logger.debug("KB detect [setxkbmap] → layout=%r", layout)
-                        if layout in ("fr", "be"):
-                            return "azerty"
-                        return "qwerty"
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("KB detect [setxkbmap] failed: %s", exc)
-        # 2) /etc/default/keyboard  (Debian/Ubuntu headless)
+        # 1) /etc/default/keyboard  (Debian/Ubuntu – most reliable on servers)
         try:
             kbd_conf = open("/etc/default/keyboard").read()
             logger.debug("KB detect [/etc/default/keyboard]: %r", kbd_conf.strip())
@@ -4868,7 +4857,7 @@ def _attach_controls(
                     return "qwerty"
         except Exception as exc:  # noqa: BLE001
             logger.debug("KB detect [/etc/default/keyboard] failed: %s", exc)
-        # 3) localectl  (systemd) — collect ALL layout lines before deciding
+        # 2) localectl  (systemd) — collect ALL layout lines before deciding
         try:
             out = subprocess.check_output(
                 ["localectl", "status"], text=True, timeout=2,
@@ -4886,6 +4875,24 @@ def _attach_controls(
                 return "qwerty"
         except Exception as exc:  # noqa: BLE001
             logger.debug("KB detect [localectl] failed: %s", exc)
+        # 3) setxkbmap -query  (last resort — virtual displays may report 'us')
+        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        if has_display:
+            try:
+                out = subprocess.check_output(
+                    ["setxkbmap", "-query"], text=True, timeout=2,
+                    stderr=subprocess.DEVNULL,
+                )
+                logger.debug("KB detect [setxkbmap]: %r", out.strip())
+                for line in out.splitlines():
+                    if line.startswith("layout:"):
+                        layout = line.split(":", 1)[1].strip().split(",")[0]
+                        logger.debug("KB detect [setxkbmap] → layout=%r", layout)
+                        if layout in ("fr", "be"):
+                            return "azerty"
+                        return "qwerty"
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("KB detect [setxkbmap] failed: %s", exc)
         logger.warning("Could not detect keyboard layout; defaulting to AZERTY.")
         return "azerty"
 

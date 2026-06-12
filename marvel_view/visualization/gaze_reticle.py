@@ -60,12 +60,14 @@ class GazeReticle:
         line_width: float = 2.0,
         vr_mode: bool = False,
         n_circle_pts: int = 64,
+        tri_gap_factor: float = 1.7,
     ) -> None:
         self._renderer = renderer
         self._circle_deg = float(circle_deg)
         self._line_width = float(line_width)
         self._vr_mode = bool(vr_mode)
         self._n_circle_pts = int(n_circle_pts)
+        self._tri_gap_factor = float(tri_gap_factor)
 
         # ── Circle (line-loop polydata) ────────────────────────────────────
         self._circle_pts_vtk = vtk.vtkPoints()
@@ -222,17 +224,18 @@ class GazeReticle:
         theta: float,
         tri_size: float,
     ) -> None:
-        """Place an equilateral triangle on the circle at angle *theta*,
+        """Place an equilateral triangle outside the circle at angle *theta*,
         pointing outward (away from center).
 
-        *tri_size* is the "radius" of the inscribed circle of the triangle
-        (i.e., the distance from centroid to each side midpoint).
+        The centroid is placed at ``circle_radius * tri_gap_factor`` from
+        *center*, so there is a visible gap between the circle and the triangle.
+        *tri_size* is the circumradius (vertex distance from centroid).
         """
         outward = math.cos(theta) * right + math.sin(theta) * up   # unit
         perp    = -math.sin(theta) * right + math.cos(theta) * up  # unit, tangent
 
-        # Centroid of the triangle sits exactly on the circle rim.
-        centroid = center + circle_radius * outward
+        # Centroid sits outside the circle, separated by a gap.
+        centroid = center + circle_radius * self._tri_gap_factor * outward
 
         # For an equilateral triangle with inscribed-circle radius r:
         #   side length  = r * 2 * sqrt(3)

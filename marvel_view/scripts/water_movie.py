@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -475,7 +476,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "etc.).  Set to 0 for instant step changes.  "
                         "Discrete fields (view_mode, fog_on, ssao_on) "
                         "always snap at the midpoint of the ramp.")
-    p.add_argument("--mode-fade-seconds", type=float, default=1.0,
+    p.add_argument("--mode-fade-seconds", type=float, default=2.0,
                    help="Duration (seconds) of the cross-fade when switching "
                         "view_mode between keyframes.  Both the outgoing and "
                         "incoming actors are shown simultaneously with "
@@ -1510,6 +1511,16 @@ def _smoothstep(x: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
+def _smootherstep(x: float) -> float:
+    """Ken Perlin's smoother step (C\u00b9\u00b2) — 6x\u2075-15x\u2074+10x\u00b3.
+
+    Flatter shoulders and steeper midpoint than the classic smoothstep,
+    giving a more natural-looking cross-fade between view modes.
+    """
+    x = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+    return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+
+
 def _build_ui_track(
     control_points: List[dict],
     t_out: np.ndarray,
@@ -1615,7 +1626,7 @@ def _build_ui_track(
                 if out[j] is None:
                     out[j] = {}
                 t = (j - fade_start) / span
-                out[j]["mode_crossfade"]      = _smoothstep(t)
+                out[j]["mode_crossfade"]      = _smootherstep(t)
                 out[j]["mode_crossfade_from"] = from_vm
                 out[j]["mode_crossfade_to"]   = to_vm
     return out
@@ -2022,26 +2033,13 @@ class _UiReplayBundle:
             "view_mode",
             _old_vm if _old_vm is not None else "mesh_bridges",
         )
-        # ── Cross-fade between view_mode actors (flat only) ───────────
-        _crossfade    = ui_state.get("mode_crossfade")
-        _crossfade_from = ui_state.get("mode_crossfade_from")
-        _crossfade_to   = ui_state.get("mode_crossfade_to")
-        if (
-            _crossfade is not None
-            and _crossfade_from is not None
-            and _crossfade_to is not None
-            and self._vr_mode == "off"
-        ):
-            self._apply_mode_crossfade(
-                _crossfade_from, _crossfade_to, float(_crossfade)
-            )
-            # Ensure _last knows the active mode (for pillars / track logic).
-            self._last["view_mode"] = vm
-        elif vm != _old_vm:
+        # ── Cross-fade between view_mode actors ─────────────────────────
+        # The actual pixel blend is handled in the render loop (double-render
+        # for both flat and VR).  apply() just does a normal mode switch so
+        # the scene is in a consistent state; the render loop overrides it.
+        if vm != _old_vm:
             self._set_view_mode(vm)
-            self._last["view_mode"] = vm
-        else:
-            self._last["view_mode"] = vm
+        self._last["view_mode"] = vm
         # Pillars: re-apply on pillars state change, or in VR when view_mode
         # changes (because visibility depends on the current view_mode in VR).
         _vr_vm_changed = (
@@ -4863,6 +4861,41 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to attach info panel: %s", exc)
 
+    # ── Embed tortuosity colormap bar inside the info panel ──────────────────
+    try:
+        from marvel_view.visualization.colormap_bar import _render_bar_image_h as _rbih  # noqa: PLC0415
+        _info_panel_w = (
+            info_billboard.panel_w if info_billboard is not None
+            else max(100, int(eye_w * 0.38 * 1.05))
+        )
+        _tort_is_vr  = vr_mode != "off"
+        # VR: text 2× bigger; overall bar 10% smaller (scale=0.9).
+        _tort_vr_scale = 0.9 if _tort_is_vr else 1.0
+        _tort_font   = round(11 * 1.8 * 2) if _tort_is_vr else 11
+        _tort_pad    = round(8  * _tort_vr_scale) if _tort_is_vr else 6
+        _tort_bar_w  = round(22 * 1.8 * _tort_vr_scale) if _tort_is_vr else 22
+        _tort_bar_h  = round((_info_panel_w - 2 * _tort_pad) * _tort_vr_scale)
+        _tort_cmap_img = _rbih(
+            TORTUOSITY_CMAP_STOPS,
+            TORTUOSITY_VMIN, TORTUOSITY_VMAX,
+            "Tortuosity",
+            bar_w=_tort_bar_w,
+            bar_h=_tort_bar_h,
+            title_h=round(20 * (1.8 * _tort_vr_scale if _tort_is_vr else 1.0)),
+            pad=_tort_pad,
+            font_size=_tort_font,
+            reverse=True,
+            left_label="tortuous path",
+            right_label="short path",
+        )
+        if info_billboard is not None:
+            info_billboard.set_cmap_img(_tort_cmap_img)
+        if info_overlay is not None:
+            info_overlay.set_cmap_img(_tort_cmap_img)
+        print("      tortuosity colormap embedded in info panel")
+    except Exception as _tort_exc:  # noqa: BLE001
+        logger.warning("Failed to embed tortuosity cmap in info panel: %s", _tort_exc)
+
     # ── Colormap legend bars ─────────────────────────────────────────────────
     # Static legend overlays that match the per-face scalar colormaps applied
     # by the interactive viewer.  Visibility is toggled per frame based on the
@@ -4908,21 +4941,6 @@ def main(argv: list[str] | None = None) -> int:
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Air",
                 vert_frac=-0.226, **_cbar_kwargs,
             )
-            _cbar_mv_tortuosity = _CB3D(
-                plt, cmap=TORTUOSITY_CMAP_STOPS,
-                vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
-                title="Tortuosity",
-                horizontal=True, reverse=True,
-                left_label="tortuous path", right_label="short path",
-                bar_w=round(16 * 1.8), bar_h=round(300 * 1.8),
-                title_h=round(22 * 1.8), pad=round(5 * 1.8),
-                font_size=_cbar_vr_font,
-                focal_dist=_focal_dist,
-                meters_per_voxel=args.meters_per_voxel,
-                forward_metres=_pfm,
-                left_frac=0.0,      # centred horizontally (below info panel)
-                vert_frac=-0.226,   # same vertical band as air cbar (reused slot)
-            )
             print("      colormap billboards attached")
         else:
             from marvel_view.visualization.colormap_bar import ColormapBar2D as _CB2D  # noqa: PLC0415
@@ -4957,30 +4975,10 @@ def main(argv: list[str] | None = None) -> int:
             # Horizontal tortuosity bar: centred below the info panel.
             # Info panel top ≈ 0.992, bottom ≈ 0.928, same width (≈39.9 %).
             # We use rect mode (resize-robust) to pin it there.
-            _tort_info_gap = 0.006   # small gap below info panel bottom
-            _tort_bar_h_frac = 0.040 * _cbar_s   # proportional height
-            _tort_w_frac     = 0.38 * 1.05        # match info panel width
-            _tort_x0 = 0.5 - _tort_w_frac / 2.0
-            _tort_x1 = 0.5 + _tort_w_frac / 2.0
-            _tort_y1 = 1.0 - (0.064 + 0.008) - _tort_info_gap   # just below info bottom
-            _tort_y0 = _tort_y1 - _tort_bar_h_frac
-            _cbar_mv_tortuosity = _CB2D(
-                plt, cmap=TORTUOSITY_CMAP_STOPS,
-                vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
-                title="Tortuosity",
-                rect=(_tort_x0, _tort_y0, _tort_x1, _tort_y1),
-                horizontal=True, reverse=True,
-                left_label="tortuous path", right_label="short path",
-                bar_w=round(14  * _cbar_s),
-                bar_h=round(200 * _cbar_s),
-                title_h=round(18 * _cbar_s),
-                pad=round(4  * _cbar_s),
-                font_size=round(10 * _cbar_s),
-            )
             print("      colormap overlays attached")
         # Start all hidden; per-frame loop shows/hides as needed.
         for _b in (_cbar_mv_density, _cbar_mv_radial, _cbar_mv_water,
-                   _cbar_mv_air, _cbar_mv_tortuosity):
+                   _cbar_mv_air):
             if _b is not None:
                 _b.set_visible(False)
     except Exception as _cbar_mv_exc:  # noqa: BLE001
@@ -5111,38 +5109,43 @@ def main(argv: list[str] | None = None) -> int:
     left_eye_from_png  = frames_dir / f"_eye_left_from{_eye_suffix}.png"
     right_eye_from_png = frames_dir / f"_eye_right_from{_eye_suffix}.png"
 
-    # ── Gaze reticle (hollow circle + VR direction triangle) ────────────────
+    # ── Gaze reticle (hollow circle + direction triangle) — VR only ─────────
+    # Not displayed in flat mode (useless in a pre-rendered video file).
     _gaze_reticle = None
-    try:
-        from marvel_view.visualization.gaze_reticle import (
-            GazeReticle as _GazeReticle,
-            angular_velocity_2d as _ang_vel_2d,
-        )
-        _gr_ren = (
-            plt.renderers[0]
-            if hasattr(plt, "renderers") and plt.renderers
-            else plt.renderer
-        )
-        _gaze_reticle = _GazeReticle(
-            _gr_ren,
-            circle_deg=2.0,
-            line_width=2.0,
-            vr_mode=(vr_mode != "off"),
-        )
-        # Estimate focal distance from track for initial placement.
-        _gr_foc_dists = np.linalg.norm(
-            np.array([s["camera"]["focal_point"] for s in track], dtype=float)
-            - np.array([s["camera"]["position"]  for s in track], dtype=float),
-            axis=1,
-        )
-        _gr_focal_dist = float(np.median(_gr_foc_dists)) if _gr_foc_dists.size else 100.0
-        print(f"      gaze reticle attached  "
-              f"({'VR+triangle' if vr_mode != 'off' else 'flat/circle'})")
-    except Exception as _gr_exc:
-        logger.warning("Could not create GazeReticle: %s", _gr_exc)
+    if vr_mode != "off":
+        try:
+            from marvel_view.visualization.gaze_reticle import (
+                GazeReticle as _GazeReticle,
+                angular_velocity_2d as _ang_vel_2d,
+            )
+            _gr_ren = (
+                plt.renderers[0]
+                if hasattr(plt, "renderers") and plt.renderers
+                else plt.renderer
+            )
+            _gaze_reticle = _GazeReticle(
+                _gr_ren,
+                circle_deg=2.0,
+                line_width=2.0,
+                vr_mode=True,
+                tri_gap_factor=1.7,
+            )
+            # Estimate focal distance from track for initial placement.
+            _gr_foc_dists = np.linalg.norm(
+                np.array([s["camera"]["focal_point"] for s in track], dtype=float)
+                - np.array([s["camera"]["position"]  for s in track], dtype=float),
+                axis=1,
+            )
+            _gr_focal_dist = float(np.median(_gr_foc_dists)) if _gr_foc_dists.size else 100.0
+            print("      gaze reticle attached  (VR+triangle)")
+        except Exception as _gr_exc:
+            logger.warning("Could not create GazeReticle: %s", _gr_exc)
+            _gr_focal_dist = 100.0
+    else:
         _gr_focal_dist = 100.0
-    # Track previous cam_dir for angular-velocity computation (VR triangle).
-    _gr_prev_dir: np.ndarray | None = None
+    # State for VR yaw-turn accumulator and prev travel direction.
+    _gr_prev_travel: np.ndarray | None = None
+    _gr_yaw_accum: float = 0.0   # accumulated horizontal turn in degrees
 
     t_start = time.time()
     # Compute physical IPD once — used in the VR stereo offset per frame.
@@ -5265,59 +5268,73 @@ def main(argv: list[str] | None = None) -> int:
                 ortho_overlay.set_speed_text(f"{_track_speeds_um_s[i]:.1f} um/s")
                 ortho_overlay.update(mono_pos, mono_dir)
 
-        # ── Gaze reticle update ───────────────────────────────────────────────
+        # ── Gaze reticle update (VR only) ────────────────────────────────────
         if _gaze_reticle is not None:
             try:
                 _gr_cam = state["camera"]
                 _gr_pos = np.asarray(_gr_cam["position"], dtype=float)
-                if vr_mode != "off" and vr_travel_dirs is not None:
-                    # VR: use travel direction (same reference as ortho panels)
-                    # so the reticle is centred on the cable path.
-                    _gr_fwd = np.asarray(vr_travel_dirs[i], dtype=float)
-                    _gr_fn  = float(np.linalg.norm(_gr_fwd))
-                    _gr_fwd = (_gr_fwd / _gr_fn) if _gr_fn > 1e-9 else np.array([0.0, 0.0, -1.0])
-                    # Derive orthonormal right/up from travel dir + world_up.
-                    _gr_up_proj = np.asarray(vr_world_up, dtype=float)
-                    _gr_up_proj = _gr_up_proj - np.dot(_gr_up_proj, _gr_fwd) * _gr_fwd
-                    _gr_upn = float(np.linalg.norm(_gr_up_proj))
-                    _gr_up_proj = (_gr_up_proj / _gr_upn) if _gr_upn > 1e-9 else np.array([0.0, 1.0, 0.0])
-                    _gr_right = np.cross(_gr_up_proj, _gr_fwd)
-                    _gr_rn = float(np.linalg.norm(_gr_right))
-                    _gr_right = (_gr_right / _gr_rn) if _gr_rn > 1e-9 else np.array([1.0, 0.0, 0.0])
-                    _gr_up = np.cross(_gr_right, _gr_fwd)
-                    _gr_un = float(np.linalg.norm(_gr_up))
-                    _gr_up = (_gr_up / _gr_un) if _gr_un > 1e-9 else _gr_up_proj
-                    _gr_dist = _gr_focal_dist
-                else:
-                    # Flat: use focal direction (camera always looks at focal point).
-                    _gr_foc = np.asarray(_gr_cam["focal_point"], dtype=float)
-                    _gr_vu  = np.asarray(_gr_cam["view_up"],     dtype=float)
-                    _gr_d   = _gr_foc - _gr_pos
-                    _gr_dn  = float(np.linalg.norm(_gr_d))
-                    _gr_fwd = (_gr_d / _gr_dn) if _gr_dn > 1e-9 else np.array([0.0, 0.0, -1.0])
-                    _gr_right = np.cross(_gr_fwd, _gr_vu)
-                    _gr_rn = float(np.linalg.norm(_gr_right))
-                    _gr_right = (_gr_right / _gr_rn) if _gr_rn > 1e-9 else np.array([1.0, 0.0, 0.0])
-                    _gr_up = np.cross(_gr_right, _gr_fwd)
-                    _gr_un = float(np.linalg.norm(_gr_up))
-                    _gr_up = (_gr_up / _gr_un) if _gr_un > 1e-9 else _gr_vu / max(float(np.linalg.norm(_gr_vu)), 1e-9)
-                    _gr_dist = _gr_dn if _gr_dn > 1e-9 else _gr_focal_dist
-                # Angular velocity (VR only): change in travel direction.
-                _gr_av2d = None
-                if vr_mode != "off" and _gr_prev_dir is not None:
-                    _gr_av2d = _ang_vel_2d(_gr_prev_dir, _gr_fwd, _gr_right, _gr_up)
-                _gr_prev_dir = _gr_fwd.copy()
+                # Use travel direction — same reference as ortho panels.
+                _gr_fwd = np.asarray(vr_travel_dirs[i], dtype=float)
+                _gr_fn  = float(np.linalg.norm(_gr_fwd))
+                _gr_fwd = (_gr_fwd / _gr_fn) if _gr_fn > 1e-9 else np.array([0.0, 0.0, -1.0])
+                # Orthonormal right/up from travel dir + world_up.
+                _gr_up_proj = np.asarray(vr_world_up, dtype=float)
+                _gr_up_proj = _gr_up_proj - np.dot(_gr_up_proj, _gr_fwd) * _gr_fwd
+                _gr_upn = float(np.linalg.norm(_gr_up_proj))
+                _gr_up_proj = (_gr_up_proj / _gr_upn) if _gr_upn > 1e-9 else np.array([0.0, 1.0, 0.0])
+                _gr_right = np.cross(_gr_up_proj, _gr_fwd)
+                _gr_rn = float(np.linalg.norm(_gr_right))
+                _gr_right = (_gr_right / _gr_rn) if _gr_rn > 1e-9 else np.array([1.0, 0.0, 0.0])
+                _gr_up = np.cross(_gr_right, _gr_fwd)
+                _gr_un = float(np.linalg.norm(_gr_up))
+                _gr_up = (_gr_up / _gr_un) if _gr_un > 1e-9 else _gr_up_proj
+
+                # ── Yaw accumulator (horizontal turn only) ────────────────
+                # Compute horizontal angular velocity from travel-dir change.
+                _gr_av2d_raw = None
+                if _gr_prev_travel is not None:
+                    _gr_av2d_raw = _ang_vel_2d(_gr_prev_travel, _gr_fwd, _gr_right, _gr_up)
+                _gr_prev_travel = _gr_fwd.copy()
+
+                if _gr_av2d_raw is not None:
+                    _dright_deg = _gr_av2d_raw[0] * (180.0 / math.pi)  # horizontal
+                    _dup_deg    = _gr_av2d_raw[1] * (180.0 / math.pi)  # vertical
+                    # Accumulate only horizontal component.  Fast decay when
+                    # the path straightens (disappears within ~5 frames).
+                    _TURN_ACTIVE_THRESHOLD = 0.25  # °/frame to be "actively turning"
+                    if abs(_dright_deg) > _TURN_ACTIVE_THRESHOLD:
+                        _gr_yaw_accum += _dright_deg
+                        _gr_yaw_accum = max(-90.0, min(90.0, _gr_yaw_accum))
+                    else:
+                        _gr_yaw_accum *= 0.72   # fast decay when straight
+                        if abs(_gr_yaw_accum) < 0.5:
+                            _gr_yaw_accum = 0.0
+
+                # Show triangle when accumulated yaw > 30° (horizontal turn only).
+                _gr_ang_vel_out = None
+                _YAW_SHOW_DEG  = 30.0
+                _YAW_MAX_DEG   = 80.0
+                if abs(_gr_yaw_accum) >= _YAW_SHOW_DEG:
+                    # Map [30°, 80°] → size [threshold, fast] in the reticle.
+                    from marvel_view.visualization.gaze_reticle import (
+                        _TRI_SHOW_THRESHOLD as _GR_TMIN,
+                        _TRI_FAST_SPEED     as _GR_TMAX,
+                    )
+                    _t = min(1.0, (abs(_gr_yaw_accum) - _YAW_SHOW_DEG) / (_YAW_MAX_DEG - _YAW_SHOW_DEG))
+                    _eff_spd = _GR_TMIN + (_GR_TMAX - _GR_TMIN) * _t
+                    # Purely horizontal direction (no pitch component).
+                    _gr_ang_vel_out = (math.copysign(_eff_spd, _gr_yaw_accum), 0.0)
+
                 _gaze_reticle.update(
-                    _gr_pos, _gr_fwd, _gr_right, _gr_up, _gr_dist,
-                    ang_vel_2d=_gr_av2d,
+                    _gr_pos, _gr_fwd, _gr_right, _gr_up, _gr_focal_dist,
+                    ang_vel_2d=_gr_ang_vel_out,
                 )
             except Exception:  # noqa: BLE001
                 pass
 
 
         if any(b is not None for b in (_cbar_mv_density, _cbar_mv_radial,
-                                        _cbar_mv_water, _cbar_mv_air,
-                                        _cbar_mv_tortuosity)):
+                                        _cbar_mv_water, _cbar_mv_air)):
             _ui_st_cb  = state.get("ui_state") or {}
             _vm_cb     = _ui_st_cb.get("view_mode", "")
             _cm_mode   = _ui_st_cb.get("cmap_mesh_mode", 0)
@@ -5331,7 +5348,6 @@ def main(argv: list[str] | None = None) -> int:
                 (_cbar_mv_radial,     _show_rad),
                 (_cbar_mv_water,      _is_dual),
                 (_cbar_mv_air,        _is_dual),
-                (_cbar_mv_tortuosity, _is_tracks and bool(_info_visible_frames[i])),
             ):
                 if _b is not None:
                     _b.set_visible(_vis)
@@ -5343,7 +5359,6 @@ def main(argv: list[str] | None = None) -> int:
                     (_cbar_mv_radial,     _show_rad),
                     (_cbar_mv_water,      _is_dual),
                     (_cbar_mv_air,        _is_dual),
-                    (_cbar_mv_tortuosity, _is_tracks and bool(_info_visible_frames[i])),
                 ):
                     if _b is not None and _vis:
                         _b.update_pose(_cb_pos, vr_travel_dirs[i], vr_world_up)
@@ -5351,17 +5366,19 @@ def main(argv: list[str] | None = None) -> int:
         # ── Info panel update (pose + subtitle + auto-hide) ──────────────────
         if info_billboard is not None or info_overlay is not None:
             _ui_st    = state.get("ui_state") or {}
-            _sub_text = _VIEW_MODE_SUBTITLES.get(_ui_st.get("view_mode", ""), "")
+            _vm_info  = _ui_st.get("view_mode", "")
+            _is_tracks = (_vm_info == "arrows_tracks")
+            _sub_text = _VIEW_MODE_SUBTITLES.get(_vm_info, "")
             _panel_vis = bool(_info_visible_frames[i])
             if info_billboard is not None:
                 info_billboard.set_visible(_panel_vis)
                 if _panel_vis:
                     _ipos = np.asarray(state["camera"]["position"], dtype=float)
-                    info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text)
+                    info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text, show_cmap=_is_tracks)
             elif info_overlay is not None:
                 info_overlay.set_visible(_panel_vis)
                 if _panel_vis:
-                    info_overlay.update(_sub_text)
+                    info_overlay.update(_sub_text, show_cmap=_is_tracks)
 
         # ── Animated panels: sponsors cycle + entrance blink ─────────────
         if _sp_actors:
@@ -5387,14 +5404,54 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 except Exception:  # noqa: BLE001
                     pass
-            for renderer in plt.renderers:
-                cam = renderer.GetActiveCamera()
-                _apply_camera_state(cam, state["camera"])
-                renderer.ResetCameraClippingRange()
-                _nr, _fr = cam.GetClippingRange()
-                cam.SetClippingRange(min(_nr, 2.0), _fr)
-            plt.render()
-            plt.screenshot(str(frames_dir / f"frame_{i + args._frame_offset:05d}.png"))
+
+            def _apply_flat_cam():
+                for renderer in plt.renderers:
+                    cam = renderer.GetActiveCamera()
+                    _apply_camera_state(cam, state["camera"])
+                    renderer.ResetCameraClippingRange()
+                    _nr, _fr = cam.GetClippingRange()
+                    cam.SetClippingRange(min(_nr, 2.0), _fr)
+
+            _frame_out = str(frames_dir / f"frame_{i + args._frame_offset:05d}.png")
+            _ui_st_fl   = state.get("ui_state") or {}
+            _cf_t_fl    = _ui_st_fl.get("mode_crossfade")
+            _cf_from_fl = _ui_st_fl.get("mode_crossfade_from")
+            _cf_to_fl   = _ui_st_fl.get("mode_crossfade_to")
+            _do_flat_fade = (
+                _cf_t_fl is not None
+                and _cf_from_fl is not None
+                and _cf_to_fl   is not None
+            )
+            if _do_flat_fade:
+                # Render from-mode.
+                ui_bundle._set_view_mode(_cf_from_fl)
+                _apply_flat_cam()
+                plt.render()
+                plt.screenshot(str(left_eye_from_png))
+                # Render to-mode.
+                ui_bundle._set_view_mode(_cf_to_fl)
+                _apply_flat_cam()
+                plt.render()
+                plt.screenshot(str(left_eye_png))
+                # Read, blend, write.
+                _from_arr = imageio.imread(str(left_eye_from_png))
+                _to_arr   = imageio.imread(str(left_eye_png))
+                if _from_arr.ndim == 3 and _from_arr.shape[2] == 4:
+                    _from_arr = _from_arr[..., :3]
+                if _to_arr.ndim == 3 and _to_arr.shape[2] == 4:
+                    _to_arr = _to_arr[..., :3]
+                _t_fl = float(_cf_t_fl)
+                _blended = np.clip(
+                    _from_arr.astype(np.float32) * (1.0 - _t_fl)
+                    + _to_arr.astype(np.float32)  * _t_fl,
+                    0, 255,
+                ).astype(np.uint8)
+                imageio.imwrite(_frame_out, _blended)
+            else:
+                _apply_flat_cam()
+                plt.render()
+                plt.screenshot(_frame_out)
         else:
             offset = _eye_offset(state, args.ipd_frac, _ipd_abs)
             left_state  = _shift_camera_state(state, -offset)

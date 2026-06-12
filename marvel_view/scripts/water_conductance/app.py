@@ -6364,7 +6364,6 @@ def main(argv: list[str] | None = None) -> int:
         import vedo as _vedo_masks
         for _cache_arg, _label in (
             (args.stele_mask_cache,   "stele"),
-            (args.outside_mask_cache, "outside"),
         ):
             _cpath = Path(_cache_arg).expanduser().resolve()
             if _cpath.exists():

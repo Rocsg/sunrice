@@ -1382,8 +1382,11 @@ class InfoPanelOverlay:
         self._subtitle    = initial_subtitle
         self._speed_text  = ""
         self._width_frac  = width_frac
-        self._height_frac = height_frac
+        self._height_frac_text = height_frac   # text-only portion
+        self._height_frac = height_frac        # total (text + cmap); updated by set_cmap_img
         self._subtitle_font_scale = subtitle_font_scale
+        self._cmap_img_src: "np.ndarray | None" = None
+        self._show_cmap: bool = False
         self._cached_bytes: bytes = b""
 
         # ── VTK pipeline ──────────────────────────────────────────────────
@@ -1393,6 +1396,7 @@ class InfoPanelOverlay:
             win_w = 1920
         if win_h < 1:
             win_h = 1080
+        self._renwin_ref = renwin
         self.panel_w = max(100, int(win_w * width_frac))
         self.panel_h = max(20,  int(win_h * height_frac))
         canvas = _render_info_tile(title, initial_subtitle,
@@ -1454,6 +1458,73 @@ class InfoPanelOverlay:
         except Exception:  # noqa: BLE001
             pass
 
+    # ------------------------------------------------------------------
+
+    def _cmap_h_px(self, panel_w: int, panel_h_total: int) -> int:
+        """Return the pixel height of the colormap strip given total panel height."""
+        if self._cmap_img_src is None:
+            return 0
+        # Cmap strip height = total - text portion.
+        # text portion = total * (height_frac_text / height_frac_total).
+        frac = self._height_frac_text / max(1e-9, self._height_frac)
+        return max(0, panel_h_total - round(panel_h_total * frac))
+
+    def _make_tile(self, subtitle: str, speed_text: str, show_cmap: bool) -> np.ndarray:
+        """Render combined text + (optional) colormap strip tile."""
+        text_h = self.panel_h - self._cmap_h_px(self.panel_w, self.panel_h)
+        text_h = max(10, text_h)
+        text_tile = _render_info_tile(
+            self._title, subtitle, speed_text,
+            subtitle_font_scale=self._subtitle_font_scale,
+            w=self.panel_w, h=text_h,
+        )
+        cmap_h = self.panel_h - text_h
+        if self._cmap_img_src is not None and cmap_h > 0:
+            if show_cmap:
+                try:
+                    from PIL import Image as _PIR  # noqa: PLC0415
+                    cmap_strip = np.array(
+                        _PIR.fromarray(self._cmap_img_src, "RGB").resize(
+                            (self.panel_w, cmap_h),
+                            resample=_PIR.Resampling.BILINEAR,
+                        ), dtype=np.uint8)
+                except Exception:  # noqa: BLE001
+                    cmap_strip = np.full((cmap_h, self.panel_w, 3), 10, dtype=np.uint8)
+            else:
+                cmap_strip = np.full((cmap_h, self.panel_w, 3), 10, dtype=np.uint8)
+            return np.vstack([text_tile, cmap_strip])
+        return text_tile
+
+    def set_cmap_img(self, cmap_img: "np.ndarray | None") -> None:
+        """Attach a colormap strip below the text area.
+
+        Updates ``_height_frac`` to include space for the cmap and
+        refreshes the VTK pipeline extent.  The cmap height is
+        proportional to its source image aspect ratio scaled to panel_w.
+
+        Call once after construction.
+        """
+        self._cmap_img_src = cmap_img
+        if cmap_img is None:
+            self._height_frac = self._height_frac_text
+        else:
+            # Estimate cmap height at the reference resolution (1920×1080).
+            ref_w = max(100, int(1920 * self._width_frac))
+            cmap_h_ref = round(cmap_img.shape[0] * ref_w / max(1, cmap_img.shape[1]))
+            cmap_h_frac = cmap_h_ref / 1080.0
+            self._height_frac = self._height_frac_text + cmap_h_frac
+        # Rebuild with updated dimensions.
+        renwin = self._renwin_ref
+        win_w, win_h = renwin.GetSize()
+        pw = max(100, int(win_w * self._width_frac))
+        ph = max(20, int(win_h * self._height_frac))
+        self.panel_w = pw
+        self.panel_h = ph
+        self._importer.SetWholeExtent(0, pw - 1, 0, ph - 1, 0, 0)
+        self._importer.SetDataExtent(0, pw - 1, 0, ph - 1, 0, 0)
+        self._push_pixels(self._make_tile(self._subtitle, self._speed_text, show_cmap=False))
+        self._reposition(renwin)
+
     def _reposition(self, renwin) -> None:
         win_w, win_h = renwin.GetSize()
         if win_w < 1 or win_h < 1:
@@ -1465,25 +1536,24 @@ class InfoPanelOverlay:
             self.panel_h = ph
             self._importer.SetWholeExtent(0, pw - 1, 0, ph - 1, 0, 0)
             self._importer.SetDataExtent(0, pw - 1, 0, ph - 1, 0, 0)
-            self._push_pixels(_render_info_tile(
-                self._title, self._subtitle, self._speed_text,
-                subtitle_font_scale=self._subtitle_font_scale,
-                w=pw, h=ph))
+            self._push_pixels(self._make_tile(
+                self._subtitle, self._speed_text, self._show_cmap))
         # Bottom-left of the actor in normalised display coords — actor is
         # rendered upward from this point (VTK convention).
         nx = 0.5 - self.panel_w / (2.0 * win_w)
         ny = 1.0 - self.panel_h / float(win_h) - 0.008
         self.image_actor.GetPositionCoordinate().SetValue(nx, ny)
 
-    def update(self, subtitle: str, speed_text: str = "") -> None:
+    def update(self, subtitle: str, speed_text: str = "",
+               show_cmap: bool = False) -> None:
         """Re-render the panel only when content has changed."""
-        if subtitle == self._subtitle and speed_text == self._speed_text:
+        if (subtitle == self._subtitle and speed_text == self._speed_text
+                and show_cmap == self._show_cmap):
             return
         self._subtitle   = subtitle
         self._speed_text = speed_text
-        self._push_pixels(_render_info_tile(self._title, subtitle, speed_text,
-                                            subtitle_font_scale=self._subtitle_font_scale,
-                                            w=self.panel_w, h=self.panel_h))
+        self._show_cmap  = show_cmap
+        self._push_pixels(self._make_tile(subtitle, speed_text, show_cmap))
 
     def set_visible(self, visible: bool) -> None:
         """Show or hide the info-panel overlay."""
@@ -1557,13 +1627,18 @@ class InfoBillboard3D:
         self._initial_travel: "np.ndarray | None" = None
         self._subtitle_font_scale: float = float(subtitle_font_scale)
         self._tan_x = math.tan(math.radians(float(angular_width_deg) / 2.0))
-        self._tan_y = self._tan_x / float(aspect)
         self.panel_w = max(1, round(_INFO_W * tile_scale))
-        self.panel_h = max(1, round(_INFO_H * tile_scale))
+        self._panel_h_text = max(1, round(_INFO_H * tile_scale))
+        self._cmap_img_src: "np.ndarray | None" = None
+        self._panel_h_cmap: int = 0
+        self._show_cmap: bool = False
+        self.panel_h = self._panel_h_text          # updated below if cmap provided
 
         canvas = _render_info_tile(title, initial_subtitle,
                                    subtitle_font_scale=self._subtitle_font_scale,
-                                   w=self.panel_w, h=self.panel_h)
+                                   w=self.panel_w, h=self._panel_h_text)
+        # aspect is derived from the actual tile, overriding the 'aspect' param.
+        self._tan_y = self._tan_x / float(aspect)  # temporary; overridden once cmap is set
         _premultiply_tile(canvas)
         self._cached_bytes: bytes = b""
 
@@ -1624,6 +1699,72 @@ class InfoBillboard3D:
             self.vert_frac,
             hide_when_reversed,
         )
+
+    # ------------------------------------------------------------------
+
+    def _make_tile(self, subtitle: str, speed_text: str, show_cmap: bool) -> np.ndarray:
+        """Render text tile and optionally append the colormap strip below.
+
+        When *show_cmap* is False the cmap strip is **omitted entirely** so
+        that the billboard is slim in non-tortuosity modes.
+        """
+        text_tile = _render_info_tile(
+            self._title, subtitle, speed_text,
+            subtitle_font_scale=self._subtitle_font_scale,
+            w=self.panel_w, h=self._panel_h_text,
+        )
+        if self._cmap_img_src is not None and self._panel_h_cmap > 0 and show_cmap:
+            try:
+                from PIL import Image as _PIR  # noqa: PLC0415
+                cmap_strip = np.array(
+                    _PIR.fromarray(self._cmap_img_src, "RGB").resize(
+                        (self.panel_w, self._panel_h_cmap),
+                        resample=_PIR.Resampling.BILINEAR,
+                    ), dtype=np.uint8)
+            except Exception:  # noqa: BLE001
+                cmap_strip = np.full((self._panel_h_cmap, self.panel_w, 3), 10, dtype=np.uint8)
+            canvas = np.vstack([text_tile, cmap_strip])
+        else:
+            canvas = text_tile
+        return canvas
+
+    def set_cmap_img(self, cmap_img: "np.ndarray | None", cmap_h_panel: int = 0) -> None:
+        """Attach a pre-rendered colormap strip to the billboard (call once after init).
+
+        The billboard height and VTK image extent are updated to include the
+        cmap strip below the text area.  The billboard aspect ratio is
+        recomputed from the actual pixel dimensions.
+
+        Parameters
+        ----------
+        cmap_img:
+            Source image ``(h_src, w_src, 3)`` uint8.  Scaled to
+            ``(cmap_h_panel, panel_w)`` each frame.
+        cmap_h_panel:
+            Height of the embedded strip in billboard pixel space.  0 → auto.
+        """
+        self._cmap_img_src  = cmap_img
+        if cmap_img is None:
+            self._panel_h_cmap = 0
+        else:
+            if cmap_h_panel > 0:
+                self._panel_h_cmap = cmap_h_panel
+            else:
+                self._panel_h_cmap = max(4, round(
+                    cmap_img.shape[0] * self.panel_w / max(1, cmap_img.shape[1])
+                ))
+        self.panel_h = self._panel_h_text + self._panel_h_cmap
+        # Render with current show_cmap state (False at init time → slim panel).
+        canvas = self._make_tile(self._subtitle, self._speed_text,
+                                 show_cmap=self._show_cmap)
+        _premultiply_tile(canvas)
+        actual_h = canvas.shape[0]
+        self._importer.SetWholeExtent(0, self.panel_w - 1, 0, actual_h - 1, 0, 0)
+        self._importer.SetDataExtent(0, self.panel_w - 1, 0, actual_h - 1, 0, 0)
+        # Recompute _tan_y from actual displayed height.
+        if self.panel_w > 0:
+            self._tan_y = self._tan_x * actual_h / self.panel_w
+        self._push_pixels(canvas)
 
     # ------------------------------------------------------------------
 
@@ -1756,16 +1897,25 @@ class InfoBillboard3D:
         else:
             self._actor.VisibilityOff()
 
-    def update_image(self, subtitle: str, speed_text: str = "") -> None:
+    def update_image(self, subtitle: str, speed_text: str = "",
+                     show_cmap: bool = False) -> None:
         """Re-render the PIL tile only when content has changed."""
-        if subtitle == self._subtitle and speed_text == self._speed_text:
+        if (subtitle == self._subtitle and speed_text == self._speed_text
+                and show_cmap == self._show_cmap):
             return
         self._subtitle   = subtitle
         self._speed_text = speed_text
-        canvas = _render_info_tile(self._title, subtitle, speed_text,
-                                   subtitle_font_scale=self._subtitle_font_scale,
-                                   w=self.panel_w, h=self.panel_h)
+        self._show_cmap  = show_cmap
+        canvas = self._make_tile(subtitle, speed_text, show_cmap)
         _premultiply_tile(canvas)
+        actual_h = canvas.shape[0]
+        # Resize VTK extent when show_cmap toggles (cmap strip appears/disappears).
+        cur_vtk_h = self._importer.GetDataExtent()[3] + 1
+        if actual_h != cur_vtk_h:
+            self._importer.SetWholeExtent(0, self.panel_w - 1, 0, actual_h - 1, 0, 0)
+            self._importer.SetDataExtent(0, self.panel_w - 1, 0, actual_h - 1, 0, 0)
+            if self.panel_w > 0:
+                self._tan_y = self._tan_x * actual_h / self.panel_w
         self._push_pixels(canvas)
 
     def update(
@@ -1775,7 +1925,8 @@ class InfoBillboard3D:
         world_up: np.ndarray,
         subtitle: str,
         speed_text: str = "",
+        show_cmap: bool = False,
     ) -> None:
         """Combined per-frame update: reposition + refresh image if needed."""
         self.update_pose(cam_pos, travel_dir, world_up)
-        self.update_image(subtitle, speed_text)
+        self.update_image(subtitle, speed_text, show_cmap)

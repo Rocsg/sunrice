@@ -649,6 +649,27 @@ class OrthoPanelOverlay:
         """Show or hide the ortho-panel overlay."""
         self.image_actor.SetVisibility(1 if visible else 0)
 
+    def set_volume(self, new_volume: np.ndarray) -> None:
+        """Swap the displayed volume and redraw immediately.
+
+        The new volume must be a ``(Z, Y, X)`` uint8 array with the same
+        shape as the one supplied at construction time.  If the shapes
+        differ, the call is silently ignored to avoid crashing the renderer.
+        """
+        if new_volume is None or new_volume.ndim != 3:
+            return
+        if new_volume.shape != self.volume.shape:
+            logger.warning(
+                "set_volume: shape mismatch (current=%s, new=%s) — ignored.",
+                self.volume.shape, new_volume.shape,
+            )
+            return
+        if new_volume is self.volume:
+            return
+        self.volume = new_volume
+        rgb = self.compose(self._last_cam_world, self._last_cam_dir)
+        self._push_pixels(rgb)
+
 
 # ─── helper ─────────────────────────────────────────────────────────────────
 
@@ -952,8 +973,20 @@ class OrthoPanel3DBillboard:
         self._br_speed_text = speed_text
         self._br_label_tile = self._make_br_label_tile(speed_text)
 
-
-    # ── geometry ─────────────────────────────────────────────────────────
+    def set_volume(self, new_volume: np.ndarray) -> None:
+        """Swap the displayed volume (same shape required)."""
+        if new_volume is None or new_volume.ndim != 3:
+            return
+        if new_volume.shape != self.volume.shape:
+            logger.warning(
+                "OrthoPanel3DBillboard.set_volume: shape mismatch "
+                "(current=%s, new=%s) — ignored.",
+                self.volume.shape, new_volume.shape,
+            )
+            return
+        if new_volume is self.volume:
+            return
+        self.volume = new_volume
 
     def _place_plane(
         self,

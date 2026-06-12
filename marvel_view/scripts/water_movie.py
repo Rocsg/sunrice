@@ -50,10 +50,10 @@ from marvel_view.scripts.water_conductance import (
     DEFAULT_ARROW_THICKNESS,
     DEFAULT_AIR_DUAL_ARROWS_CACHE,
     DEFAULT_ARROWS_CACHE_PATH,
-    DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
-    DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE,
-    DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE,
-    DEFAULT_CROWN_TRACKS_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_ARROWS_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_VTP_CACHE,
     DEFAULT_WATER_DUAL_ARROWS_CACHE,
     _load_or_build_dual_arrows,
     DEFAULT_INPUT_PATH,
@@ -101,7 +101,7 @@ logger = logging.getLogger("marvel_view.water_movie")
 
 WIDTH, HEIGHT = 1920, 1080
 FPS = 90
-SECONDS_PER_SEGMENT = 3.0
+SECONDS_PER_SEGMENT = 3.09   # ~3 % slower than the original 3.0 s/segment
 HOLD_SECONDS = 10.0
 EASE_SEGMENTS = 2     # number of trailing segments over which to ease-out
 EASE_STRENGTH = 3.0   # power of the ease-out curve on the very last segment
@@ -198,6 +198,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "decelerates (0 disables easing).")
     p.add_argument("--ease-strength", type=float, default=EASE_STRENGTH,
                    help="Strength of the ease-out (>1 = stronger braking).")
+    p.add_argument("--trim-start-seconds", type=float, default=5.0,
+                   help="Skip this many seconds from the start of the "
+                        "trajectory (camera is still in empty space at "
+                        "low speed).  Set to 0 to keep the full video.  "
+                        "Default: 5.0 s.")
+    p.add_argument("--speed-zone", metavar="KF_START:KF_END:FRAC",
+                   action="append", dest="speed_zones",
+                   default=["0:17:0.75"],
+                   help="Cap cruise speed to FRAC × v_cruise for control "
+                        "points KF_START to KF_END.  Keyframe indices are "
+                        "integer positions in the saved positions list "
+                        "(0 = first saved position).  The physics-based "
+                        "forward/backward planner naturally creates smooth "
+                        "transitions in/out of the zone.  Can be repeated "
+                        "for multiple zones.  Example: --speed-zone 0:17:0.75 "
+                        "slows the first 17 keyframes to 75%% of cruise speed.")
     p.add_argument("--width", type=int, default=WIDTH,
                    help="Output width (pixels).")
     p.add_argument("--height", type=int, default=HEIGHT,
@@ -430,23 +446,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "Used for the 'arrows_dual' view-mode.  "
                         f"(default: {DEFAULT_AIR_DUAL_ARROWS_CACHE})")
     p.add_argument("--crown-tracks-cache",
-                   default=str(DEFAULT_CROWN_TRACKS_VTP_CACHE),
+                   default=str(DEFAULT_CROWN_TRACKS_ALL_CROWN_VTP_CACHE),
                    help="Path to the cached crown Dijkstra tracks .vtp.  "
                         "When present, the 'Conduction shorter paths' mode "
                         "shows splined path lines.  "
-                        f"(default: {DEFAULT_CROWN_TRACKS_VTP_CACHE})")
+                        f"(default: {DEFAULT_CROWN_TRACKS_ALL_CROWN_VTP_CACHE})")
     p.add_argument("--crown-tracks-arrows-cache",
-                   default=str(DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE),
+                   default=str(DEFAULT_CROWN_TRACKS_ALL_CROWN_ARROWS_VTP_CACHE),
                    help="Path to the cached crown tracks glyph-arrow "
                         "centres .vtp (pre-built by "
                         "marvel-water-conductance-build-meshes).  "
-                        f"(default: {DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE})")
+                        f"(default: {DEFAULT_CROWN_TRACKS_ALL_CROWN_ARROWS_VTP_CACHE})")
     p.add_argument("--crown-tracks-splined-cache",
-                   default=str(DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE),
+                   default=str(DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_VTP_CACHE),
                    help="Path to the pre-splined crown tracks .vtp (64 "
                         "subdivisions, pre-built by build-meshes).  When "
                         "present, skips vtkSplineFilter at load time.  "
-                        f"(default: {DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE})")
+                        f"(default: {DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_VTP_CACHE})")
     p.add_argument("--no-tracks-small", action="store_true",
                    help="In VR mode, use the full splined tracks VTP instead "
                         "of the lighter half-density version "
@@ -459,6 +475,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "etc.).  Set to 0 for instant step changes.  "
                         "Discrete fields (view_mode, fog_on, ssao_on) "
                         "always snap at the midpoint of the ramp.")
+    p.add_argument("--mode-fade-seconds", type=float, default=1.0,
+                   help="Duration (seconds) of the cross-fade when switching "
+                        "view_mode between keyframes.  Both the outgoing and "
+                        "incoming actors are shown simultaneously with "
+                        "linearly cross-faded opacity.  Set to 0 to revert "
+                        "to the legacy instant snap.  Ignored in VR mode "
+                        "unless --vr-mode-fade is also set.")
+    p.add_argument("--vr-mode-fade", action="store_true", default=True,
+                   help="Enable view_mode cross-fade in VR by rendering the "
+                        "scene twice (from-mode + to-mode) per frame and "
+                        "blending the resulting pixel arrays.  Requires "
+                        "--mode-fade-seconds > 0.  WARNING: 4× the normal "
+                        "VR render cost during each transition window (2 eyes "
+                        "× 2 modes).  Enabled by default; use "
+                        "--no-vr-mode-fade to revert to an instant swap.")
+    p.add_argument("--no-vr-mode-fade", dest="vr_mode_fade",
+                   action="store_false",
+                   help="Disable VR cross-fade and revert to instant "
+                        "view_mode switch (faster, but visually abrupt).")
     p.add_argument("--ignore-ui-state", action="store_true",
                    help="Ignore any 'ui_state' block in the positions JSON "
                         "and render with a fixed configuration (legacy "
@@ -729,6 +764,7 @@ def _velocity_profile_plan(
     a_max: float,
     a_lat_max: float,
     n_dense: int = 2048,
+    v_max_extra: "np.ndarray | None" = None,
 ) -> np.ndarray:
     """Return a smooth velocity profile v[i] (arc-length / frame) at
     ``n_dense`` evenly-spaced arc-length positions.
@@ -768,6 +804,10 @@ def _velocity_profile_plan(
         v_lat = np.sqrt(a_lat_max / np.maximum(kappa, 1e-12))
         v_max = np.minimum(v_cruise, v_lat)
 
+    # Apply optional per-arc-length speed cap (speed_zones from CLI).
+    if v_max_extra is not None:
+        v_max = np.minimum(v_max, v_max_extra)
+
     # Force rest at endpoints → drives the ease-in / ease-out ramps.
     v_max[0]  = 0.0
     v_max[-1] = 0.0
@@ -782,6 +822,28 @@ def _velocity_profile_plan(
         v[i] = min(v[i], np.sqrt(max(0.0, v[i + 1] ** 2 + 2.0 * a_max * ds)))
 
     return v
+
+
+# ── Ease-in trim ─────────────────────────────────────────────────────────────
+
+def _trim_ease_in(
+    track: "List[dict]",
+    t_out_ui: "np.ndarray",
+    seconds: float,
+    fps: int,
+) -> "tuple[List[dict], np.ndarray]":
+    """Remove the first *seconds* of frames from the track.
+
+    Gives a predictable, time-based skip of the initial slow approach
+    (camera still in empty space before entering the root cavity).
+    Returns the original arrays unchanged if fewer than 3 frames would remain.
+    """
+    start_i = int(round(seconds * fps))
+    if start_i <= 0 or start_i >= len(track) - 2:
+        return track, t_out_ui
+    print(f"      [trim-start] cutting first {start_i} frame(s) "
+          f"({seconds:.1f} s at {fps} fps)")
+    return track[start_i:], t_out_ui[start_i:]
 
 
 # ── Stage C: zero-phase position smoothing ────────────────────────────────────
@@ -939,7 +1001,10 @@ def build_track(
     hold_frames: int = 0,
     ease_segments: int = 2,
     ease_strength: float = 3.0,
+    speed_zones: "list[tuple[float, float, float]] | None" = None,
 ) -> "tuple[List[dict], np.ndarray]":
+    # speed_zones: list of (kf_start, kf_end, speed_frac) where kf indices
+    # are fractional control-point indices (0 = first CP, n_ctrl-1 = last).
     """Return ``(track, t_out_ui)`` – one camera+actor state per frame plus a
     ``[0, 1]``-normalised fractional-control-point array for
     :func:`_build_ui_track`.
@@ -1032,12 +1097,27 @@ def build_track(
     a_max       = v_cruise / ease_frames       # arc-length / frame²
     a_lat_max   = 2.0 * a_max                  # lateral comfort margin (VR)
     _N_DENSE    = 2048
+    # Build per-dense-sample speed cap from speed_zones (if any).
+    _v_max_extra = None
+    if speed_zones:
+        _s_arr_dense = np.linspace(0.0, L_total, _N_DENSE)
+        _v_max_extra = np.full(_N_DENSE, v_cruise)
+        for _kf_start, _kf_end, _frac in speed_zones:
+            _kf_s = max(0.0, min(float(_kf_start), n_ctrl - 1))
+            _kf_e = max(0.0, min(float(_kf_end),   n_ctrl - 1))
+            _s_lo = float(np.interp(_kf_s, np.arange(n_ctrl), s_ctrl))
+            _s_hi = float(np.interp(_kf_e, np.arange(n_ctrl), s_ctrl))
+            _zmask = (_s_arr_dense >= _s_lo) & (_s_arr_dense <= _s_hi)
+            _v_max_extra[_zmask] = np.minimum(
+                _v_max_extra[_zmask], float(_frac) * v_cruise
+            )
     v_dense = _velocity_profile_plan(
         cs_pos, t_of_s, L_total,
         v_cruise=v_cruise,
         a_max=a_max,
         a_lat_max=a_lat_max,
         n_dense=_N_DENSE,
+        v_max_extra=_v_max_extra,
     )
 
     # Integrate v(s) → s(t): convert velocity profile to cumulative time,
@@ -1437,6 +1517,7 @@ def _build_ui_track(
     fps: int,
     frames_per_segment: int,
     transition_seconds: float,
+    mode_fade_frames: int = 0,
 ) -> List[dict | None]:
     """Per-frame ``ui_state`` list aligned with ``t_out``.
 
@@ -1510,6 +1591,33 @@ def _build_ui_track(
                 if k not in frame_state and k in prev:
                     frame_state[k] = prev[k]
         out.append(frame_state)
+    # ── Post-process: inject mode_crossfade fields around view_mode swaps ──
+    # Works with --parallel because the fade is baked into per-frame state;
+    # each worker slice is independent and still sees the correct fade values.
+    if mode_fade_frames > 0:
+        n = len(out)
+        transition_frames: list[tuple[int, str, str]] = []
+        prev_vm: str | None = None
+        for i, fs in enumerate(out):
+            if fs is None:
+                continue
+            vm_i = fs.get("view_mode")
+            if vm_i is not None and vm_i != prev_vm and prev_vm is not None:
+                transition_frames.append((i, prev_vm, vm_i))
+            if vm_i is not None:
+                prev_vm = vm_i
+        half = mode_fade_frames // 2
+        for switch_i, from_vm, to_vm in transition_frames:
+            fade_start = max(0, switch_i - half)
+            fade_end   = min(n, switch_i + half + (1 if mode_fade_frames % 2 else 0))
+            span = max(fade_end - fade_start - 1, 1)
+            for j in range(fade_start, fade_end):
+                if out[j] is None:
+                    out[j] = {}
+                t = (j - fade_start) / span
+                out[j]["mode_crossfade"]      = _smoothstep(t)
+                out[j]["mode_crossfade_from"] = from_vm
+                out[j]["mode_crossfade_to"]   = to_vm
     return out
 
 
@@ -1736,6 +1844,51 @@ class _UiReplayBundle:
             self._depth["ssao_keepalive"] = []
         self._depth["ssao_on"] = on
 
+    # --- view-mode cross-fade (flat only) ---------------------------
+    def _actors_for_mode(self, mode: str) -> list:
+        """Return the list of top-level actors active for a given view_mode."""
+        if mode == "mesh_bridges":
+            return [self.mesh] if self.mesh is not None else []
+        if mode == "mesh_all":
+            return [self.alt_mesh] if self.alt_mesh is not None else [self.mesh]
+        if mode == "arrows_grid":
+            return [self.arrows_actor] if self.arrows_actor is not None else []
+        if mode == "arrows_dual":
+            return [a for a in (self.water_dual_actor, self.air_dual_actor)
+                    if a is not None]
+        if mode == "arrows_tracks":
+            return list(self.tracks_bin_actors)
+        return []
+
+    def _apply_mode_crossfade(
+        self, from_vm: str, to_vm: str, t: float
+    ) -> None:
+        """Show both the outgoing and incoming view-mode actors simultaneously,
+        fading the outgoing out (opacity 1-t) and the incoming in (opacity t).
+        Only used in flat mode — VR translucency is unreliable."""
+        from_actors = self._actors_for_mode(from_vm)
+        to_actors   = self._actors_for_mode(to_vm)
+        # Make sure both sets are visible; the normal _set_view_mode will
+        # restore exclusive visibility once the fade window ends.
+        for actor in from_actors:
+            if actor is None:
+                continue
+            try:
+                raw = getattr(actor, "actor", actor)
+                raw.SetVisibility(1)
+                actor.alpha(max(0.0, 1.0 - t))
+            except Exception:  # noqa: BLE001
+                pass
+        for actor in to_actors:
+            if actor is None:
+                continue
+            try:
+                raw = getattr(actor, "actor", actor)
+                raw.SetVisibility(1)
+                actor.alpha(max(0.0, t))
+            except Exception:  # noqa: BLE001
+                pass
+
     # --- view-mode actor swap ---------------------------------------
     def _set_view_mode(self, mode: str):
         if self.alt_mesh is None and mode == "mesh_all":
@@ -1869,9 +2022,26 @@ class _UiReplayBundle:
             "view_mode",
             _old_vm if _old_vm is not None else "mesh_bridges",
         )
-        if vm != _old_vm:
+        # ── Cross-fade between view_mode actors (flat only) ───────────
+        _crossfade    = ui_state.get("mode_crossfade")
+        _crossfade_from = ui_state.get("mode_crossfade_from")
+        _crossfade_to   = ui_state.get("mode_crossfade_to")
+        if (
+            _crossfade is not None
+            and _crossfade_from is not None
+            and _crossfade_to is not None
+            and self._vr_mode == "off"
+        ):
+            self._apply_mode_crossfade(
+                _crossfade_from, _crossfade_to, float(_crossfade)
+            )
+            # Ensure _last knows the active mode (for pillars / track logic).
+            self._last["view_mode"] = vm
+        elif vm != _old_vm:
             self._set_view_mode(vm)
-        self._last["view_mode"] = vm
+            self._last["view_mode"] = vm
+        else:
+            self._last["view_mode"] = vm
         # Pillars: re-apply on pillars state change, or in VR when view_mode
         # changes (because visibility depends on the current view_mode in VR).
         _vr_vm_changed = (
@@ -3039,13 +3209,31 @@ def _run_parallel(
     N = args.parallel
 
     # ── Build track (numpy-only, no VTK) to learn total_frames ──────────
+    _par_speed_zones: list[tuple[float, float, float]] = []
+    for _sz in (getattr(args, "speed_zones", None) or []):
+        _parts = str(_sz).split(":")
+        if len(_parts) == 3:
+            try:
+                _par_speed_zones.append(
+                    (float(_parts[0]), float(_parts[1]), float(_parts[2]))
+                )
+            except ValueError:
+                pass
     track, _ = build_track(
         control_points,
         frames_per_segment,
         hold_frames=hold_frames,
         ease_segments=args.ease_segments,
         ease_strength=args.ease_strength,
+        speed_zones=_par_speed_zones or None,
     )
+    _par_trim_s = float(getattr(args, "trim_start_seconds", 5.0))
+    if _par_trim_s > 0.0:
+        track, _ = _trim_ease_in(
+            track, _,
+            seconds=_par_trim_s,
+            fps=args.fps,
+        )
     total_frames = len(track)
 
     # Apply the user's --stresstest slicing so chunk boundaries reflect
@@ -3815,11 +4003,11 @@ def main(argv: list[str] | None = None) -> int:
     # VR auto-select: when --vr is active and the half-density small VTP
     # exists, swap to it automatically (use --no-tracks-small to override).
     if args.vr and not getattr(args, "no_tracks_small", False):
-        _small_default = str(DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE)
+        _small_default = str(DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE)
         _small_candidate = Path(
             getattr(args, "crown_tracks_splined_cache", _small_default)
             or _small_default
-        ).parent / DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE.name
+        ).parent / DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE.name
         if _small_candidate.exists():
             logger.info(
                 "VR mode: auto-selecting small tracks VTP (%s).  "
@@ -3827,13 +4015,13 @@ def main(argv: list[str] | None = None) -> int:
                 _small_candidate,
             )
             args.crown_tracks_splined_cache = str(_small_candidate)
-        elif DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE.exists():
+        elif DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE.exists():
             logger.info(
                 "VR mode: auto-selecting small tracks VTP (%s).",
-                DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE,
+                DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE,
             )
             args.crown_tracks_splined_cache = str(
-                DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE
+                DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE
             )
     tracks_bin_actors: list = []
     tracks_axis_info         = None
@@ -4216,16 +4404,37 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── 2. Interpolate camera + actor track ───────────────────────────────
     print("[2/4] Interpolating camera + actor track …")
+    # Parse --speed-zone "KF_START:KF_END:FRAC" entries.
+    _speed_zones: list[tuple[float, float, float]] = []
+    for _sz in (args.speed_zones or []):
+        _parts = str(_sz).split(":")
+        if len(_parts) != 3:
+            logger.warning("Invalid --speed-zone %r (expected KF:KF:FRAC); ignored", _sz)
+            continue
+        try:
+            _speed_zones.append((float(_parts[0]), float(_parts[1]), float(_parts[2])))
+        except ValueError:
+            logger.warning("Invalid --speed-zone %r; ignored", _sz)
     track, t_out_ui = build_track(
         control_points,
         frames_per_segment,
         hold_frames=hold_frames,
         ease_segments=args.ease_segments,
         ease_strength=args.ease_strength,
+        speed_zones=_speed_zones or None,
     )
     total_frames = len(track)
     print(f"      {total_frames} frames "
           f"({total_frames / args.fps:.2f}s of footage)")
+    # Skip the first N seconds (camera still in empty space / ease-in).
+    _trim_s = float(getattr(args, "trim_start_seconds", 5.0))
+    if _trim_s > 0.0:
+        track, t_out_ui = _trim_ease_in(
+            track, t_out_ui,
+            seconds=_trim_s,
+            fps=args.fps,
+        )
+        total_frames = len(track)
 
     if args.stresstest:
         t_start_s = max(0.0, args.stresstest_start)
@@ -4291,11 +4500,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # t_out_ui comes directly from build_track and carries the
         # arc-length-aware fractional control-point position per frame.
+        _mode_fade_frames = int(getattr(args, "mode_fade_seconds", 1.0) * args.fps)
         ui_track = _build_ui_track(
             control_points, t_out_ui,
             fps=args.fps,
             frames_per_segment=frames_per_segment,
             transition_seconds=float(args.ui_transition_seconds),
+            mode_fade_frames=_mode_fade_frames,
         )
         # Truncate to match the stresstest-cropped track.
         if len(ui_track) > len(track):
@@ -4543,6 +4754,36 @@ def main(argv: list[str] | None = None) -> int:
                     OrthoPanel3DBillboard, OrthoPanelOverlay, load_raw_volume,
                 )
                 raw_volume = load_raw_volume(raw_path)
+                # Load optional mode-specific masked volumes.
+                _raw_cortex_path = (
+                    Path(args.raw_cortex).expanduser().resolve()
+                    if getattr(args, "raw_cortex", None)
+                    else raw_path.parent / "Raw_masked_with_only_cortex.tif"
+                )
+                _raw_crowns_path = (
+                    Path(args.raw_crowns).expanduser().resolve()
+                    if getattr(args, "raw_crowns", None)
+                    else raw_path.parent / "Raw_masked_with_only_crowns.tif"
+                )
+                raw_volume_cortex = raw_volume
+                raw_volume_crowns = raw_volume
+                for _rv_path, _rv_attr in (
+                    (_raw_cortex_path, "raw_volume_cortex"),
+                    (_raw_crowns_path, "raw_volume_crowns"),
+                ):
+                    if _rv_path.exists():
+                        try:
+                            _rv = load_raw_volume(_rv_path)
+                            if _rv.shape == raw_volume.shape:
+                                if _rv_attr == "raw_volume_cortex":
+                                    raw_volume_cortex = _rv
+                                else:
+                                    raw_volume_crowns = _rv
+                                print(f"      masked ortho volume loaded ({_rv_path.name})")
+                            else:
+                                print(f"      [warn] {_rv_path.name} shape mismatch — ignored")
+                        except Exception as _rve:  # noqa: BLE001
+                            print(f"      [warn] failed to load {_rv_path.name}: {_rve}")
                 if vr_mode != "off":
                     # ── VR mode: 3-D billboard in layer-0 renderer ──────────────
                     # Estimate a representative focal distance from the track.
@@ -4561,7 +4802,7 @@ def main(argv: list[str] | None = None) -> int:
                         angular_size_deg=14.28,   # 16.8 × 0.85
                         forward_metres=_pfm,
                         left_metres=-_pfm * 0.5774,  # tan(30°) → 30° to the right
-                        vert_metres=_pfm * 0.2765 - 1.0,  # aligned with info billboard
+                        vert_metres=_pfm * 0.053,            # aligned with info billboard (~3° up)
                         font_scale=1.12,            # +12 % font for VR headset
                     )
                     print(f"      ortho billboard attached  (Raw={raw_path.name}, "
@@ -4607,7 +4848,7 @@ def main(argv: list[str] | None = None) -> int:
                 subtitle_font_scale=1.15,          # subtitle font +15 %
                 forward_metres=_pfm,
                 left_metres=0.0,
-                vert_metres=_pfm * 0.2765 - 1.0,  # 5° lower (tan15° vs former tan20°)
+                vert_metres=_pfm * 0.053,          # slightly above gaze centre (≈3°)
             )
             print("      info billboard attached")
         else:
@@ -4671,7 +4912,16 @@ def main(argv: list[str] | None = None) -> int:
                 plt, cmap=TORTUOSITY_CMAP_STOPS,
                 vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
                 title="Tortuosity",
-                vert_frac=-0.126, **_cbar_kwargs,
+                horizontal=True, reverse=True,
+                left_label="tortuous path", right_label="short path",
+                bar_w=round(16 * 1.8), bar_h=round(300 * 1.8),
+                title_h=round(22 * 1.8), pad=round(5 * 1.8),
+                font_size=_cbar_vr_font,
+                focal_dist=_focal_dist,
+                meters_per_voxel=args.meters_per_voxel,
+                forward_metres=_pfm,
+                left_frac=0.0,      # centred horizontally (below info panel)
+                vert_frac=-0.226,   # same vertical band as air cbar (reused slot)
             )
             print("      colormap billboards attached")
         else:
@@ -4704,11 +4954,28 @@ def main(argv: list[str] | None = None) -> int:
                 plt, cmap=_AIR_CMAP_STOPS_MV, vmin=0.0, vmax=1.0, title="Gas diffusion",
                 pos=(0.87, 0.12), **_cb_kw,
             )
+            # Horizontal tortuosity bar: centred below the info panel.
+            # Info panel top ≈ 0.992, bottom ≈ 0.928, same width (≈39.9 %).
+            # We use rect mode (resize-robust) to pin it there.
+            _tort_info_gap = 0.006   # small gap below info panel bottom
+            _tort_bar_h_frac = 0.040 * _cbar_s   # proportional height
+            _tort_w_frac     = 0.38 * 1.05        # match info panel width
+            _tort_x0 = 0.5 - _tort_w_frac / 2.0
+            _tort_x1 = 0.5 + _tort_w_frac / 2.0
+            _tort_y1 = 1.0 - (0.064 + 0.008) - _tort_info_gap   # just below info bottom
+            _tort_y0 = _tort_y1 - _tort_bar_h_frac
             _cbar_mv_tortuosity = _CB2D(
                 plt, cmap=TORTUOSITY_CMAP_STOPS,
                 vmin=TORTUOSITY_VMIN, vmax=TORTUOSITY_VMAX,
                 title="Tortuosity",
-                pos=(0.87, 0.30), **_cb_kw,
+                rect=(_tort_x0, _tort_y0, _tort_x1, _tort_y1),
+                horizontal=True, reverse=True,
+                left_label="tortuous path", right_label="short path",
+                bar_w=round(14  * _cbar_s),
+                bar_h=round(200 * _cbar_s),
+                title_h=round(18 * _cbar_s),
+                pad=round(4  * _cbar_s),
+                font_size=round(10 * _cbar_s),
             )
             print("      colormap overlays attached")
         # Start all hidden; per-frame loop shows/hides as needed.
@@ -4777,8 +5044,12 @@ def main(argv: list[str] | None = None) -> int:
         _EP_DELAY = 23.0  # entrance appears after this many seconds (was 25.0, −2 s)
         _EP_ON    = 0.8   # entrance image visible (s)  — short equal-duration cycles
         _EP_CYCLE = 1.6   # entrance blink period: 0.8 s on + 0.8 s off
+        _PANELS_HIDE_AFTER = 50.0  # sponsors + entrance hidden after this many seconds
         for _fi in range(len(track)):
             _t = (_pnl_offset + _fi) / _pnl_fps
+            if _t >= _PANELS_HIDE_AFTER:
+                # Hide both panels on the return path
+                continue
             # -- sponsors --
             if _t >= _SP_DELAY:
                 _sp_rel = _t - _SP_DELAY
@@ -4833,9 +5104,45 @@ def main(argv: list[str] | None = None) -> int:
     # and every frame ends up identical to the first one (resulting in
     # an absurdly small MP4 — symptom: a 1-MB file for an 8K stereo
     # 47 s clip where every frame is bit-for-bit the same).
-    _eye_suffix   = f"_{args._frame_offset}" if args._worker else ""
-    left_eye_png  = frames_dir / f"_eye_left{_eye_suffix}.png"
-    right_eye_png = frames_dir / f"_eye_right{_eye_suffix}.png"
+    _eye_suffix        = f"_{args._frame_offset}" if args._worker else ""
+    left_eye_png       = frames_dir / f"_eye_left{_eye_suffix}.png"
+    right_eye_png      = frames_dir / f"_eye_right{_eye_suffix}.png"
+    # Scratch files for the "from-mode" render during VR cross-fades.
+    left_eye_from_png  = frames_dir / f"_eye_left_from{_eye_suffix}.png"
+    right_eye_from_png = frames_dir / f"_eye_right_from{_eye_suffix}.png"
+
+    # ── Gaze reticle (hollow circle + VR direction triangle) ────────────────
+    _gaze_reticle = None
+    try:
+        from marvel_view.visualization.gaze_reticle import (
+            GazeReticle as _GazeReticle,
+            angular_velocity_2d as _ang_vel_2d,
+        )
+        _gr_ren = (
+            plt.renderers[0]
+            if hasattr(plt, "renderers") and plt.renderers
+            else plt.renderer
+        )
+        _gaze_reticle = _GazeReticle(
+            _gr_ren,
+            circle_deg=2.0,
+            line_width=2.0,
+            vr_mode=(vr_mode != "off"),
+        )
+        # Estimate focal distance from track for initial placement.
+        _gr_foc_dists = np.linalg.norm(
+            np.array([s["camera"]["focal_point"] for s in track], dtype=float)
+            - np.array([s["camera"]["position"]  for s in track], dtype=float),
+            axis=1,
+        )
+        _gr_focal_dist = float(np.median(_gr_foc_dists)) if _gr_foc_dists.size else 100.0
+        print(f"      gaze reticle attached  "
+              f"({'VR+triangle' if vr_mode != 'off' else 'flat/circle'})")
+    except Exception as _gr_exc:
+        logger.warning("Could not create GazeReticle: %s", _gr_exc)
+        _gr_focal_dist = 100.0
+    # Track previous cam_dir for angular-velocity computation (VR triangle).
+    _gr_prev_dir: np.ndarray | None = None
 
     t_start = time.time()
     # Compute physical IPD once — used in the VR stereo offset per frame.
@@ -4900,7 +5207,7 @@ def main(argv: list[str] | None = None) -> int:
                     _last_fired_mode = _mode_vi
                 continue
             if _mode_vi and _mode_vi != _last_fired_mode:
-                _end_vi = min(len(track), _vi + 4 * _fps_int)
+                _end_vi = min(len(track), _vi + 6 * _fps_int)
                 _info_visible_frames[_vi:_end_vi] = True
                 _last_fired_mode = _mode_vi
 
@@ -4926,6 +5233,19 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if ortho_billboard is not None or ortho_overlay is not None:
+            # Swap ortho-panel volume based on current view mode.
+            try:
+                _cur_vm_ortho = (state.get("ui_state") or {}).get("view_mode", "")
+                _ortho_vol_map = {
+                    "mesh_all":      raw_volume,
+                    "mesh_bridges":  raw_volume_cortex,
+                    "arrows_tracks": raw_volume_crowns,
+                }
+                _ortho_new_vol = _ortho_vol_map.get(_cur_vm_ortho, raw_volume)
+                _tgt_ov = ortho_overlay if ortho_overlay is not None else ortho_billboard
+                _tgt_ov.set_volume(_ortho_new_vol)
+            except Exception:  # noqa: BLE001
+                pass
             # Always use the un-shifted (mono) camera position — the red
             # dot represents the viewer's location, not the per-eye shift.
             cam_state = state["camera"]
@@ -4945,7 +5265,56 @@ def main(argv: list[str] | None = None) -> int:
                 ortho_overlay.set_speed_text(f"{_track_speeds_um_s[i]:.1f} um/s")
                 ortho_overlay.update(mono_pos, mono_dir)
 
-        # ── Colormap bars: show/hide + pose ──────────────────────────────────
+        # ── Gaze reticle update ───────────────────────────────────────────────
+        if _gaze_reticle is not None:
+            try:
+                _gr_cam = state["camera"]
+                _gr_pos = np.asarray(_gr_cam["position"], dtype=float)
+                if vr_mode != "off" and vr_travel_dirs is not None:
+                    # VR: use travel direction (same reference as ortho panels)
+                    # so the reticle is centred on the cable path.
+                    _gr_fwd = np.asarray(vr_travel_dirs[i], dtype=float)
+                    _gr_fn  = float(np.linalg.norm(_gr_fwd))
+                    _gr_fwd = (_gr_fwd / _gr_fn) if _gr_fn > 1e-9 else np.array([0.0, 0.0, -1.0])
+                    # Derive orthonormal right/up from travel dir + world_up.
+                    _gr_up_proj = np.asarray(vr_world_up, dtype=float)
+                    _gr_up_proj = _gr_up_proj - np.dot(_gr_up_proj, _gr_fwd) * _gr_fwd
+                    _gr_upn = float(np.linalg.norm(_gr_up_proj))
+                    _gr_up_proj = (_gr_up_proj / _gr_upn) if _gr_upn > 1e-9 else np.array([0.0, 1.0, 0.0])
+                    _gr_right = np.cross(_gr_up_proj, _gr_fwd)
+                    _gr_rn = float(np.linalg.norm(_gr_right))
+                    _gr_right = (_gr_right / _gr_rn) if _gr_rn > 1e-9 else np.array([1.0, 0.0, 0.0])
+                    _gr_up = np.cross(_gr_right, _gr_fwd)
+                    _gr_un = float(np.linalg.norm(_gr_up))
+                    _gr_up = (_gr_up / _gr_un) if _gr_un > 1e-9 else _gr_up_proj
+                    _gr_dist = _gr_focal_dist
+                else:
+                    # Flat: use focal direction (camera always looks at focal point).
+                    _gr_foc = np.asarray(_gr_cam["focal_point"], dtype=float)
+                    _gr_vu  = np.asarray(_gr_cam["view_up"],     dtype=float)
+                    _gr_d   = _gr_foc - _gr_pos
+                    _gr_dn  = float(np.linalg.norm(_gr_d))
+                    _gr_fwd = (_gr_d / _gr_dn) if _gr_dn > 1e-9 else np.array([0.0, 0.0, -1.0])
+                    _gr_right = np.cross(_gr_fwd, _gr_vu)
+                    _gr_rn = float(np.linalg.norm(_gr_right))
+                    _gr_right = (_gr_right / _gr_rn) if _gr_rn > 1e-9 else np.array([1.0, 0.0, 0.0])
+                    _gr_up = np.cross(_gr_right, _gr_fwd)
+                    _gr_un = float(np.linalg.norm(_gr_up))
+                    _gr_up = (_gr_up / _gr_un) if _gr_un > 1e-9 else _gr_vu / max(float(np.linalg.norm(_gr_vu)), 1e-9)
+                    _gr_dist = _gr_dn if _gr_dn > 1e-9 else _gr_focal_dist
+                # Angular velocity (VR only): change in travel direction.
+                _gr_av2d = None
+                if vr_mode != "off" and _gr_prev_dir is not None:
+                    _gr_av2d = _ang_vel_2d(_gr_prev_dir, _gr_fwd, _gr_right, _gr_up)
+                _gr_prev_dir = _gr_fwd.copy()
+                _gaze_reticle.update(
+                    _gr_pos, _gr_fwd, _gr_right, _gr_up, _gr_dist,
+                    ang_vel_2d=_gr_av2d,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+
         if any(b is not None for b in (_cbar_mv_density, _cbar_mv_radial,
                                         _cbar_mv_water, _cbar_mv_air,
                                         _cbar_mv_tortuosity)):
@@ -4962,7 +5331,7 @@ def main(argv: list[str] | None = None) -> int:
                 (_cbar_mv_radial,     _show_rad),
                 (_cbar_mv_water,      _is_dual),
                 (_cbar_mv_air,        _is_dual),
-                (_cbar_mv_tortuosity, _is_tracks),
+                (_cbar_mv_tortuosity, _is_tracks and bool(_info_visible_frames[i])),
             ):
                 if _b is not None:
                     _b.set_visible(_vis)
@@ -4974,7 +5343,7 @@ def main(argv: list[str] | None = None) -> int:
                     (_cbar_mv_radial,     _show_rad),
                     (_cbar_mv_water,      _is_dual),
                     (_cbar_mv_air,        _is_dual),
-                    (_cbar_mv_tortuosity, _is_tracks),
+                    (_cbar_mv_tortuosity, _is_tracks and bool(_info_visible_frames[i])),
                 ):
                     if _b is not None and _vis:
                         _b.update_pose(_cb_pos, vr_travel_dirs[i], vr_world_up)
@@ -5037,36 +5406,69 @@ def main(argv: list[str] | None = None) -> int:
             _update_vr_headlight(vr_lights, state["camera"], _td, vr_world_up,
                                  tilt_deg=args.torch_tilt)
 
-            # Left eye — render & write to disk (same code path as mono).
-            for renderer in plt.renderers:
-                cam = renderer.GetActiveCamera()
-                _apply_camera_state(cam, left_state["camera"])
-                # Fixed range: panoramic pass calls ResetCameraClippingRange
-                # independently per cube-face camera, but a tight fixed range
-                # on the main camera avoids any legacy Reset on this renderer.
-                cam.SetClippingRange(0.5, 10_000.0)
-            plt.render()
-            plt.screenshot(str(left_eye_png))
+            # ── VR cross-fade: render both modes and blend pixel arrays ──
+            _ui_st_vr  = state.get("ui_state") or {}
+            _cf_t      = _ui_st_vr.get("mode_crossfade")
+            _cf_from   = _ui_st_vr.get("mode_crossfade_from")
+            _cf_to     = _ui_st_vr.get("mode_crossfade_to")
+            _do_vr_fade = (
+                getattr(args, "vr_mode_fade", False)
+                and _cf_t is not None
+                and _cf_from is not None
+                and _cf_to   is not None
+            )
 
+            def _render_eye(cam_state, out_png):
+                for renderer in plt.renderers:
+                    cam = renderer.GetActiveCamera()
+                    _apply_camera_state(cam, cam_state["camera"])
+                    cam.SetClippingRange(0.5, 10_000.0)
+                plt.render()
+                plt.screenshot(str(out_png))
+
+            if _do_vr_fade:
+                # Render from-mode (scene is currently in to-mode after apply()).
+                ui_bundle._set_view_mode(_cf_from)
+                _render_eye(left_state,  left_eye_from_png)
+                _render_eye(right_state, right_eye_from_png)
+                # Restore to-mode.
+                ui_bundle._set_view_mode(_cf_to)
+
+            # Left eye — render & write to disk (same code path as mono).
+            _render_eye(left_state,  left_eye_png)
             # Right eye.
-            for renderer in plt.renderers:
-                cam = renderer.GetActiveCamera()
-                _apply_camera_state(cam, right_state["camera"])
-                cam.SetClippingRange(0.5, 10_000.0)
-            plt.render()
-            plt.screenshot(str(right_eye_png))
+            _render_eye(right_state, right_eye_png)
+
+            def _read_rgb(p):
+                arr = imageio.imread(str(p))
+                if arr.ndim == 3 and arr.shape[2] == 4:
+                    arr = arr[..., :3]
+                return arr
+
+            left_img  = _read_rgb(left_eye_png)
+            right_img = _read_rgb(right_eye_png)
+
+            if _do_vr_fade:
+                t_fade = float(_cf_t)
+                left_from  = _read_rgb(left_eye_from_png)
+                right_from = _read_rgb(right_eye_from_png)
+                # Blend: from × (1-t) + to × t  (float32 to avoid uint8 overflow).
+                left_img  = np.clip(
+                    left_from.astype(np.float32)  * (1.0 - t_fade)
+                    + left_img.astype(np.float32)  * t_fade,
+                    0, 255,
+                ).astype(np.uint8)
+                right_img = np.clip(
+                    right_from.astype(np.float32) * (1.0 - t_fade)
+                    + right_img.astype(np.float32) * t_fade,
+                    0, 255,
+                ).astype(np.uint8)
 
             # Stitch side-by-side (left | right).
-            left_img  = imageio.imread(str(left_eye_png))
-            right_img = imageio.imread(str(right_eye_png))
-            if left_img.ndim == 3 and left_img.shape[2] == 4:
-                left_img  = left_img[..., :3]
-            if right_img.ndim == 3 and right_img.shape[2] == 4:
-                right_img = right_img[..., :3]
             if left_img.shape != right_img.shape:
                 h = min(left_img.shape[0], right_img.shape[0])
                 w = min(left_img.shape[1], right_img.shape[1])
-                left_img = left_img[:h, :w]
+                left_img  = left_img[:h, :w]
                 right_img = right_img[:h, :w]
             sbs = np.concatenate([left_img, right_img], axis=1)
             imageio.imwrite(str(frames_dir / f"frame_{i + args._frame_offset:05d}.png"), sbs)
@@ -5077,7 +5479,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
 
     # Clean up the per-eye scratch PNGs.
-    for p in (left_eye_png, right_eye_png):
+    for p in (left_eye_png, right_eye_png, left_eye_from_png, right_eye_from_png):
         if p.exists():
             p.unlink()
 

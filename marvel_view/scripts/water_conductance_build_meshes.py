@@ -87,7 +87,14 @@ from marvel_view.scripts.water_conductance import (  # noqa: E402
     DEFAULT_OVERLAY_CACHE_PATH,
     DEFAULT_OVERLAY_LEVEL,
     DEFAULT_OVERLAY_TIFF_PATH,
+    DEFAULT_ALL_OUTSIDE_CROWN_PATH,
+    DEFAULT_PATHS_DOMAIN_ALL_CROWN_PATH,
     DEFAULT_PATHS_DOMAIN_PATH,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_ARROWS_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE,
     DEFAULT_PILLARS_CACHE_PATH,
     DEFAULT_PILLARS_LEVEL,
     DEFAULT_PILLARS_TIFF_PATH,
@@ -439,6 +446,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--skip-dilatation", action="store_true",
                    help="Don't write the dilatation TIFF.")
     # Crown Dijkstra tracks.
+    p.add_argument("--from-all-crown", action="store_true",
+                   help="Build Dijkstra tracks from the full outer surface "
+                        "(All_outside_crown.tif) rather than only the cortical-bridge "
+                        "outer crown (Source_crown.tif).  The traversable domain "
+                        "switches to Source_Target_Possible_Paths_from_all_crown.tif; "
+                        "outputs are written to crown_tracks_all_crown.* files.  "
+                        "Target (Target_crown.tif) is unchanged.")
     p.add_argument("--source-crown", default=str(DEFAULT_SOURCE_CROWN_PATH),
                    help="8-bit TIFF (Source_crown.tif) -- Dijkstra path sources.")
     p.add_argument("--target-crown", default=str(DEFAULT_TARGET_CROWN_PATH),
@@ -599,6 +613,36 @@ def main(argv: list[str] | None = None) -> int:
         args.skip_membranes       = True
         args.skip_lames           = True
         args.skip_lame2           = True
+
+    # --from-all-crown: override source, domain and output paths to the
+    # all-outside-crown variants, unless the user explicitly passed a value.
+    if getattr(args, "from_all_crown", False):
+        if args.source_crown == str(DEFAULT_SOURCE_CROWN_PATH):
+            args.source_crown = str(DEFAULT_ALL_OUTSIDE_CROWN_PATH)
+        if args.paths_domain == str(DEFAULT_PATHS_DOMAIN_PATH):
+            args.paths_domain = str(DEFAULT_PATHS_DOMAIN_ALL_CROWN_PATH)
+        if args.tracks_output == str(DEFAULT_CROWN_TRACKS_CACHE):
+            args.tracks_output = str(DEFAULT_CROWN_TRACKS_ALL_CROWN_CACHE)
+        if args.tracks_vtp_output == str(DEFAULT_CROWN_TRACKS_VTP_CACHE):
+            args.tracks_vtp_output = str(DEFAULT_CROWN_TRACKS_ALL_CROWN_VTP_CACHE)
+        if args.tracks_arrows_vtp_output == str(DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE):
+            args.tracks_arrows_vtp_output = str(
+                DEFAULT_CROWN_TRACKS_ALL_CROWN_ARROWS_VTP_CACHE
+            )
+        if args.tracks_splined_vtp_output == str(DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE):
+            args.tracks_splined_vtp_output = str(
+                DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_VTP_CACHE
+            )
+        if args.tracks_splined_small_vtp_output == str(
+            DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE
+        ):
+            args.tracks_splined_small_vtp_output = str(
+                DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE
+            )
+        logger.info(
+            "--from-all-crown: source=%s  domain=%s  outputs=crown_tracks_all_crown.*",
+            args.source_crown, args.paths_domain,
+        )
 
     input_path = Path(args.input).expanduser().resolve()
     out_path = Path(args.output).expanduser().resolve()

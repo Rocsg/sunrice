@@ -12,10 +12,10 @@ from .constants import (
     DEFAULT_ALL_MESH_CACHE_PATH,
     DEFAULT_ARROW_STRIDE,
     DEFAULT_ARROWS_CACHE_PATH,
-    DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE,
-    DEFAULT_CROWN_TRACKS_CACHE,
-    DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE,
-    DEFAULT_CROWN_TRACKS_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_ARROWS_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_VTP_CACHE,
+    DEFAULT_CROWN_TRACKS_ALL_CROWN_VTP_CACHE,
     DEFAULT_DENSITY_ALL_CACHE,
     DEFAULT_DENSITY_BRIDGES_CACHE,
     DEFAULT_RADIAL_GRADIENT_ALL_CACHE,
@@ -43,6 +43,8 @@ from .constants import (
     DEFAULT_PILLARS_LEVEL,
     DEFAULT_PILLARS_TIFF_PATH,
     DEFAULT_RAW_PATH,
+    DEFAULT_RAW_CORTEX_PATH,
+    DEFAULT_RAW_CROWNS_PATH,
     DEFAULT_SMOOTH_ITER,
     DEFAULT_STELE_MASK_CACHE,
     DEFAULT_AIR_DUAL_ARROWS_CACHE,
@@ -64,6 +66,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--raw", default=str(DEFAULT_RAW_PATH),
                    help="Path to the raw greyscale volume (Raw.tif) used "
                         "for the orthogonal-slice locator panel.")
+    p.add_argument("--raw-cortex", default=str(DEFAULT_RAW_CORTEX_PATH),
+                   help="Raw volume masked to cortex only "
+                        "(Raw_masked_with_only_cortex.tif). "
+                        "Shown in the ortho panel when in cortex-mesh mode.")
+    p.add_argument("--raw-crowns", default=str(DEFAULT_RAW_CROWNS_PATH),
+                   help="Raw volume masked to crowns only "
+                        "(Raw_masked_with_only_crowns.tif). "
+                        "Shown in the ortho panel when in Dijkstra-path mode.")
     p.add_argument("--mesh-cache", default=str(DEFAULT_MESH_CACHE_PATH),
                    help="Path to a cached .vtk mesh.  If the file exists "
                         "it is loaded directly (instant) instead of "
@@ -212,22 +222,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Don't load the wind / gas particle caches "
                         "(hides the O₂ and CH₄ toggle buttons).")
     # Crown geodesic tracks (Arrows view #2) — built by build-meshes, loaded here.
-    p.add_argument("--tracks-cache", default=str(DEFAULT_CROWN_TRACKS_CACHE),
+    p.add_argument("--tracks-cache", default=str(DEFAULT_CROWN_TRACKS_ALL_CROWN_CACHE),
                    help="Cached .npz of pre-computed Dijkstra track segments "
                         "(produced by marvel-water-conductance-build-meshes).")
-    p.add_argument("--tracks-vtp-cache", default=str(DEFAULT_CROWN_TRACKS_VTP_CACHE),
+    p.add_argument("--tracks-vtp-cache", default=str(DEFAULT_CROWN_TRACKS_ALL_CROWN_VTP_CACHE),
                    help="Cached binary .vtp of crown-track polylines "
                         "(produced alongside the .npz by build-meshes). "
                         "When present, loaded instead of reconstructing cells "
                         "from the .npz, giving near-instant actor construction.")
     p.add_argument("--tracks-arrows-vtp-cache",
-                   default=str(DEFAULT_CROWN_TRACKS_ARROWS_VTP_CACHE),
+                   default=str(DEFAULT_CROWN_TRACKS_ALL_CROWN_ARROWS_VTP_CACHE),
                    help="Cached binary .vtp of pre-computed arrow glyph centres, "
                         "tangents and arc-length fractions (produced by "
                         "build-meshes).  When present, skips the Python for-loop "
                         "in _make_tracks_actor_curves.")
     p.add_argument("--tracks-splined-vtp-cache",
-                   default=str(DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE),
+                   default=str(DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_VTP_CACHE),
                    help="Cached binary .vtp of pre-splined crown-track polylines "
                         "(64 subdivisions, produced by build-meshes).  When "
                         "present, the viewer and movie skip vtkSplineFilter.")

@@ -171,19 +171,28 @@ def _render_bar_image_h(
     text_color: tuple = (220, 220, 220),
     border_color: tuple = (80, 80, 90),
     font_size: int = 11,
+    left_label: str | None = None,
+    right_label: str | None = None,
+    reverse: bool = False,
 ) -> np.ndarray:
     """Render a *horizontal* colormap bar as an RGB uint8 ``(H, W, 3)`` array.
 
-    The gradient runs left (vmin) → right (vmax).  ``bar_h`` controls the
-    length (width) of the strip; ``bar_w`` controls the strip height.
+    The gradient runs left (vmin) → right (vmax) unless *reverse* is True,
+    in which case it runs left (vmax) → right (vmin).
+    *left_label* / *right_label* override the auto-formatted numeric tick labels
+    at the left and right ends of the bar respectively.
+    ``bar_h`` controls the length (width) of the strip; ``bar_w`` controls the
+    strip height.
     """
     total_w = 2 * pad + bar_h
     label_row_h = font_size + 4          # space below the strip for tick labels
     total_h = title_h + pad + bar_w + pad + label_row_h
     img = np.full((total_h, total_w, 3), bg_color, dtype=np.uint8)
 
-    # ── colour gradient (left = vmin, right = vmax) ─────────────────────
+    # ── colour gradient (left = vmin, right = vmax, or reversed) ───────
     colors = _sample_cmap(cmap, bar_h)   # (bar_h, 3) uint8
+    if reverse:
+        colors = colors[::-1]
     bar_x0 = pad
     bar_x1 = pad + bar_h
     bar_y0 = title_h + pad
@@ -228,26 +237,31 @@ def _render_bar_image_h(
                 return f"{int(v)}"
             return f"{v:.2f}"
 
+        # If custom labels provided, use them for left/right ends; suppress mid tick.
+        _left_str  = left_label  if left_label  is not None else (_fmt(vmax) if reverse else _fmt(vmin))
+        _right_str = right_label if right_label is not None else (_fmt(vmin) if reverse else _fmt(vmax))
+        _show_mid  = (left_label is None and right_label is None)
+
         label_y = bar_y1 + 3
-        # vmin – left-aligned
-        draw.text((bar_x0, label_y), _fmt(vmin), fill=text_color, font=font_sm)
-        # mid – centred
-        mid_s = _fmt(mid)
+        # left end label
+        draw.text((bar_x0, label_y), _left_str, fill=text_color, font=font_sm)
+        # mid – centred (only when no custom labels)
+        if _show_mid:
+            mid_s = _fmt(mid)
+            try:
+                tb2 = draw.textbbox((0, 0), mid_s, font=font_sm)
+                tw2 = tb2[2] - tb2[0]
+            except AttributeError:
+                tw2 = len(mid_s) * (font_size - 2)
+            draw.text((bar_x0 + bar_h // 2 - tw2 // 2, label_y),
+                      mid_s, fill=text_color, font=font_sm)
+        # right end label – right-aligned
         try:
-            tb2 = draw.textbbox((0, 0), mid_s, font=font_sm)
-            tw2 = tb2[2] - tb2[0]
-        except AttributeError:
-            tw2 = len(mid_s) * (font_size - 2)
-        draw.text((bar_x0 + bar_h // 2 - tw2 // 2, label_y),
-                  mid_s, fill=text_color, font=font_sm)
-        # vmax – right-aligned
-        vmax_s = _fmt(vmax)
-        try:
-            tb3 = draw.textbbox((0, 0), vmax_s, font=font_sm)
+            tb3 = draw.textbbox((0, 0), _right_str, font=font_sm)
             tw3 = tb3[2] - tb3[0]
         except AttributeError:
-            tw3 = len(vmax_s) * (font_size - 2)
-        draw.text((bar_x1 - tw3, label_y), vmax_s, fill=text_color, font=font_sm)
+            tw3 = len(_right_str) * (font_size - 2)
+        draw.text((bar_x1 - tw3, label_y), _right_str, fill=text_color, font=font_sm)
 
         # ── tick marks (short vertical lines below the strip) ───────────
         for _tick_x in (bar_x0, bar_x0 + bar_h // 2, bar_x1 - 1):
@@ -309,6 +323,9 @@ class ColormapBar2D:
         pad: int = _DEFAULT_PAD,
         font_size: int = 11,
         horizontal: bool = False,
+        reverse: bool = False,
+        left_label: str | None = None,
+        right_label: str | None = None,
     ) -> None:
         self._plotter = plotter
         self._cmap = cmap
@@ -330,6 +347,9 @@ class ColormapBar2D:
                 bar_w=bar_w, bar_h=bar_h,
                 label_w=label_w, title_h=title_h, pad=pad,
                 font_size=font_size,
+                reverse=reverse,
+                left_label=left_label,
+                right_label=right_label,
             )
         else:
             self._img = _render_bar_image(
@@ -455,6 +475,10 @@ class ColormapBar3DBillboard:
         title_h: int = _DEFAULT_TITLE_H,
         pad: int = _DEFAULT_PAD,
         font_size: int = 11,
+        horizontal: bool = False,
+        reverse: bool = False,
+        left_label: str | None = None,
+        right_label: str | None = None,
     ) -> None:
         import math
         self._cmap = cmap
@@ -471,12 +495,23 @@ class ColormapBar3DBillboard:
         # half-angle tangent for the bar *width*
         self._panel_tan_w = math.tan(math.radians(angular_size_deg / 2.0))
 
-        self._img = _render_bar_image(
-            cmap, vmin, vmax, title,
-            bar_w=bar_w, bar_h=bar_h,
-            label_w=label_w, title_h=title_h, pad=pad,
-            font_size=font_size,
-        )
+        if horizontal:
+            self._img = _render_bar_image_h(
+                cmap, vmin, vmax, title,
+                bar_w=bar_w, bar_h=bar_h,
+                label_w=label_w, title_h=title_h, pad=pad,
+                font_size=font_size,
+                reverse=reverse,
+                left_label=left_label,
+                right_label=right_label,
+            )
+        else:
+            self._img = _render_bar_image(
+                cmap, vmin, vmax, title,
+                bar_w=bar_w, bar_h=bar_h,
+                label_w=label_w, title_h=title_h, pad=pad,
+                font_size=font_size,
+            )
         total_h, total_w = self._img.shape[:2]
         self._aspect = float(total_h) / float(total_w) if total_w > 0 else 1.0
 

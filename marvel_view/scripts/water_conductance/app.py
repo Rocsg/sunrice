@@ -100,6 +100,9 @@ def _attach_controls(
     plt, mesh,
     arrows_data=None,
     ortho_overlay=None,
+    ortho_volume_raw=None,
+    ortho_volume_cortex=None,
+    ortho_volume_crowns=None,
     alt_mesh=None,
     pillars_mesh=None,
     tracks_data=None,
@@ -700,6 +703,21 @@ def _attach_controls(
     # stored so they can be hidden when not in Custom mode.
     import numpy as np
 
+    # ── Gaze reticle (hollow circle, fixed at window centre) ────────────────
+    _gaze_reticle = None
+    try:
+        from marvel_view.visualization.gaze_reticle import GazeReticle2D as _GazeReticle2D
+        _main_ren = getattr(plt, "renderer", None)
+        if _main_ren is None and hasattr(plt, "renderers") and plt.renderers:
+            _main_ren = plt.renderers[0]
+        if _main_ren is not None:
+            _gr_win = plt.window.GetSize() if hasattr(plt, "window") and plt.window else (800, 600)
+            # radius_px ≈ 1 % of the smaller window dimension (≈ 2° apparent diameter).
+            _gr_radius = max(8.0, min(_gr_win[0], _gr_win[1]) * 0.010)
+            _gaze_reticle = _GazeReticle2D(_main_ren, radius_px=_gr_radius, line_width=2.0)
+    except Exception as _gr_exc:  # noqa: BLE001
+        logger.warning("Could not create GazeReticle2D: %s", _gr_exc)
+
     _nav_buttons: list = []
 
     # Translation: 5 speed levels (×5 between each).
@@ -737,9 +755,6 @@ def _attach_controls(
         return cam, forward, right, up, fn
 
     def _refresh_ortho():
-        if ortho_overlay is None:
-            logger.debug("_refresh_ortho: overlay is None, skipping.")
-            return
         try:
             cam = plt.camera
             pos = np.asarray(cam.GetPosition(), dtype=float)
@@ -750,13 +765,22 @@ def _attach_controls(
                 direction = direction / n
             else:
                 direction = np.array([0.0, 0.0, -1.0])
-            logger.debug(
-                "_refresh_ortho  cam.pos=(%.2f, %.2f, %.2f)  cam.foc=(%.2f, %.2f, %.2f)",
-                pos[0], pos[1], pos[2], foc[0], foc[1], foc[2],
-            )
-            ortho_overlay.update(pos, direction)
+            dist = n if n > 1e-9 else 1.0
+            if ortho_overlay is not None:
+                logger.debug(
+                    "_refresh_ortho  cam.pos=(%.2f, %.2f, %.2f)  cam.foc=(%.2f, %.2f, %.2f)",
+                    pos[0], pos[1], pos[2], foc[0], foc[1], foc[2],
+                )
+                ortho_overlay.update(pos, direction)
         except Exception as exc:  # noqa: BLE001
             logger.warning("_refresh_ortho failed: %s", exc)
+        # Update gaze reticle (recentre if window was resized).
+        if _gaze_reticle is not None:
+            try:
+                _gr_sz = plt.window.GetSize()
+                _gaze_reticle.update_window_size(_gr_sz[0], _gr_sz[1])
+            except Exception:  # noqa: BLE001
+                pass
         # Also refresh the camera orientation HUD.
         try:
             _update_orient_text()
@@ -3350,6 +3374,22 @@ def _attach_controls(
                     _st.text(_sub)
                 except Exception:  # noqa: BLE001
                     pass
+            # ── Swap ortho-panel background volume ───────────────────────
+            if ortho_overlay is not None:
+                # mesh_all     → Raw.tif (unmasked)
+                # mesh_bridges → Raw_masked_with_only_cortex.tif
+                # arrows_tracks → Raw_masked_with_only_crowns.tif
+                # anything else → Raw.tif (unmasked)
+                _vol_map = {
+                    "mesh_all":      ortho_volume_raw,
+                    "mesh_bridges":  ortho_volume_cortex,
+                    "arrows_tracks": ortho_volume_crowns,
+                }
+                _new_vol = _vol_map.get(new_mode, ortho_volume_raw)
+                try:
+                    ortho_overlay.set_volume(_new_vol)
+                except Exception as _ov_exc:  # noqa: BLE001
+                    logger.warning("ortho set_volume failed: %s", _ov_exc)
             plt.render()
 
         # ─── 4 exclusive radio buttons ──────────────────────────────────
@@ -6029,6 +6069,44 @@ def main(argv: list[str] | None = None) -> int:
     else:
         logger.info("Raw volume not found at %s.", raw_path)
 
+    # Load optional mode-specific masked volumes for the ortho panel.
+    # Falls back to raw_volume when a file is absent.
+    raw_volume_cortex: np.ndarray | None = None
+    raw_volume_crowns: np.ndarray | None = None
+    if raw_volume is not None:
+        for _attr, _argname in (
+            ("raw_volume_cortex", "raw_cortex"),
+            ("raw_volume_crowns", "raw_crowns"),
+        ):
+            _path_str = getattr(args, _argname, None)
+            if _path_str:
+                _p = Path(_path_str).expanduser().resolve()
+                if _p.exists():
+                    try:
+                        _vol = load_raw_volume(_p)
+                        if _vol.shape == raw_volume.shape:
+                            locals()[_attr]   # just a reference; assign below
+                            if _attr == "raw_volume_cortex":
+                                raw_volume_cortex = _vol
+                            else:
+                                raw_volume_crowns = _vol
+                            logger.info("Masked raw volume loaded (%s, shape=%s).",
+                                        _p, _vol.shape)
+                        else:
+                            logger.warning(
+                                "Masked volume %s shape %s != raw shape %s — ignored.",
+                                _p, _vol.shape, raw_volume.shape,
+                            )
+                    except Exception as _exc:  # noqa: BLE001
+                        logger.warning("Failed to load masked volume %s: %s", _p, _exc)
+                else:
+                    logger.info("Masked raw volume not found at %s.", _p)
+    # Fall back to raw_volume for any mode that has no dedicated masked volume.
+    if raw_volume_cortex is None:
+        raw_volume_cortex = raw_volume
+    if raw_volume_crowns is None:
+        raw_volume_crowns = raw_volume
+
     # Optional orthogonal-slice locator panel.
     ortho_overlay = None
     if not args.no_ortho_panel and raw_volume is not None:
@@ -6357,6 +6435,9 @@ def main(argv: list[str] | None = None) -> int:
         arrows_data=arrows_data,
         dual_arrows_data=dual_arrows_data,
         ortho_overlay=ortho_overlay,
+        ortho_volume_raw=raw_volume,
+        ortho_volume_cortex=raw_volume_cortex,
+        ortho_volume_crowns=raw_volume_crowns,
         alt_mesh=alt_mesh,
         pillars_mesh=pillars_mesh,
         tracks_data=tracks_data,

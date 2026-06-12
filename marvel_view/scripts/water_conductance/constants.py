@@ -18,6 +18,8 @@ from marvel_view import aerench_config as acfg
 
 DEFAULT_INPUT_PATH: Path = acfg.DEFAULT_INPUT_DIR / "Wat_Norm_Cortex.tif"
 DEFAULT_RAW_PATH: Path = acfg.DEFAULT_INPUT_DIR / "Raw.tif"
+DEFAULT_RAW_CORTEX_PATH: Path = acfg.DEFAULT_INPUT_DIR / "Raw_masked_with_only_cortex.tif"
+DEFAULT_RAW_CROWNS_PATH: Path = acfg.DEFAULT_INPUT_DIR / "Raw_masked_with_only_crowns.tif"
 DEFAULT_LEVEL: float = 0.2
 DEFAULT_SPACING = (1.0, 1.0, 1.0)
 DEFAULT_SMOOTH_ITER: int = 20  # gentle smoothing, keeps vertices dense
@@ -54,7 +56,7 @@ DEFAULT_ALL_MESH_CACHE_PATH: Path = (
 # Glowing green "pillars" isosurface superimposed on the cortex (Cortical
 # bridges) mesh.  Extracted from the 8-bit Pillars.tif at iso=122 and
 # rendered translucent with lighting off so it reads as a faint glow.
-DEFAULT_PILLARS_TIFF_PATH: Path = acfg.DEFAULT_INPUT_DIR / "Pillars.tif"
+DEFAULT_PILLARS_TIFF_PATH: Path = acfg.DEFAULT_INPUT_DIR / "Pillars_all_crown.tif"
 DEFAULT_PILLARS_CACHE_PATH: Path = (
     DEFAULT_VTK_OUTPUT_DIR / "pillars_iso.vtk"
 )
@@ -406,6 +408,33 @@ DEFAULT_CROWN_TRACKS_SPLINED_VTP_CACHE: Path = (
 # ``marvel-water-conductance-build-meshes``.
 DEFAULT_CROWN_TRACKS_SPLINED_SMALL_VTP_CACHE: Path = (
     DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_splined_small.vtp"
+)
+
+# ── All-outside-crown Dijkstra tracks (--from-all-crown mode) ────────────────
+# Sources are sampled uniformly on the full outer surface (All_outside_crown.tif)
+# instead of only the cortical-bridge outer crown (Source_crown.tif).
+# The traversable domain is Source_Target_Possible_Paths_from_all_crown.tif.
+# Target remains Target_crown.tif (unchanged).
+DEFAULT_ALL_OUTSIDE_CROWN_PATH: Path = (
+    acfg.DEFAULT_INPUT_DIR / "All_outside_crown.tif"
+)
+DEFAULT_PATHS_DOMAIN_ALL_CROWN_PATH: Path = (
+    acfg.DEFAULT_INPUT_DIR / "Source_Target_Possible_Paths_from_all_crown.tif"
+)
+DEFAULT_CROWN_TRACKS_ALL_CROWN_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_all_crown.npz"
+)
+DEFAULT_CROWN_TRACKS_ALL_CROWN_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_all_crown.vtp"
+)
+DEFAULT_CROWN_TRACKS_ALL_CROWN_ARROWS_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_all_crown_arrows.vtp"
+)
+DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_all_crown_splined.vtp"
+)
+DEFAULT_CROWN_TRACKS_ALL_CROWN_SPLINED_SMALL_VTP_CACHE: Path = (
+    DEFAULT_VTK_OUTPUT_DIR / "crown_tracks_all_crown_splined_small.vtp"
 )
 
 # Line width for track lines: interactor uses a thin line (4 pt),

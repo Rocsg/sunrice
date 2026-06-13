@@ -1458,6 +1458,21 @@ class InfoPanelOverlay:
         except Exception:  # noqa: BLE001
             pass
 
+    def _push_canvas(self, canvas: np.ndarray) -> None:
+        """Push *canvas*, syncing VTK extent and actor position to its actual height."""
+        actual_h = canvas.shape[0]
+        cur_vtk_h = self._importer.GetDataExtent()[3] + 1
+        if actual_h != cur_vtk_h:
+            self._importer.SetWholeExtent(0, self.panel_w - 1, 0, actual_h - 1, 0, 0)
+            self._importer.SetDataExtent(0, self.panel_w - 1, 0, actual_h - 1, 0, 0)
+        self._push_pixels(canvas)
+        # Re-anchor the actor bottom-left to the correct window position.
+        win_w, win_h = self._renwin_ref.GetSize()
+        if win_w > 0 and win_h > 0:
+            nx = 0.5 - self.panel_w / (2.0 * win_w)
+            ny = 1.0 - actual_h / float(win_h) - 0.008
+            self.image_actor.GetPositionCoordinate().SetValue(nx, ny)
+
     # ------------------------------------------------------------------
 
     def _cmap_h_px(self, panel_w: int, panel_h_total: int) -> int:
@@ -1470,7 +1485,21 @@ class InfoPanelOverlay:
         return max(0, panel_h_total - round(panel_h_total * frac))
 
     def _make_tile(self, subtitle: str, speed_text: str, show_cmap: bool) -> np.ndarray:
-        """Render combined text + (optional) colormap strip tile."""
+        """Render combined text + (optional) colormap strip tile.
+
+        When *show_cmap* is False the cmap strip is omitted entirely so the
+        panel stays slim in non-tortuosity modes.
+        """
+        if self._cmap_img_src is not None and not show_cmap:
+            # Slim panel: render text at text-only height.
+            text_h = max(10, int(self._renwin_ref.GetSize()[1] * self._height_frac_text))
+            text_tile = _render_info_tile(
+                self._title, subtitle, speed_text,
+                subtitle_font_scale=self._subtitle_font_scale,
+                w=self.panel_w, h=text_h,
+            )
+            return text_tile
+
         text_h = self.panel_h - self._cmap_h_px(self.panel_w, self.panel_h)
         text_h = max(10, text_h)
         text_tile = _render_info_tile(
@@ -1479,18 +1508,15 @@ class InfoPanelOverlay:
             w=self.panel_w, h=text_h,
         )
         cmap_h = self.panel_h - text_h
-        if self._cmap_img_src is not None and cmap_h > 0:
-            if show_cmap:
-                try:
-                    from PIL import Image as _PIR  # noqa: PLC0415
-                    cmap_strip = np.array(
-                        _PIR.fromarray(self._cmap_img_src, "RGB").resize(
-                            (self.panel_w, cmap_h),
-                            resample=_PIR.Resampling.BILINEAR,
-                        ), dtype=np.uint8)
-                except Exception:  # noqa: BLE001
-                    cmap_strip = np.full((cmap_h, self.panel_w, 3), 10, dtype=np.uint8)
-            else:
+        if self._cmap_img_src is not None and cmap_h > 0 and show_cmap:
+            try:
+                from PIL import Image as _PIR  # noqa: PLC0415
+                cmap_strip = np.array(
+                    _PIR.fromarray(self._cmap_img_src, "RGB").resize(
+                        (self.panel_w, cmap_h),
+                        resample=_PIR.Resampling.BILINEAR,
+                    ), dtype=np.uint8)
+            except Exception:  # noqa: BLE001
                 cmap_strip = np.full((cmap_h, self.panel_w, 3), 10, dtype=np.uint8)
             return np.vstack([text_tile, cmap_strip])
         return text_tile
@@ -1520,9 +1546,7 @@ class InfoPanelOverlay:
         ph = max(20, int(win_h * self._height_frac))
         self.panel_w = pw
         self.panel_h = ph
-        self._importer.SetWholeExtent(0, pw - 1, 0, ph - 1, 0, 0)
-        self._importer.SetDataExtent(0, pw - 1, 0, ph - 1, 0, 0)
-        self._push_pixels(self._make_tile(self._subtitle, self._speed_text, show_cmap=False))
+        self._push_canvas(self._make_tile(self._subtitle, self._speed_text, show_cmap=False))
         self._reposition(renwin)
 
     def _reposition(self, renwin) -> None:
@@ -1534,15 +1558,9 @@ class InfoPanelOverlay:
         if pw != self.panel_w or ph != self.panel_h:
             self.panel_w = pw
             self.panel_h = ph
-            self._importer.SetWholeExtent(0, pw - 1, 0, ph - 1, 0, 0)
-            self._importer.SetDataExtent(0, pw - 1, 0, ph - 1, 0, 0)
-            self._push_pixels(self._make_tile(
-                self._subtitle, self._speed_text, self._show_cmap))
-        # Bottom-left of the actor in normalised display coords — actor is
-        # rendered upward from this point (VTK convention).
-        nx = 0.5 - self.panel_w / (2.0 * win_w)
-        ny = 1.0 - self.panel_h / float(win_h) - 0.008
-        self.image_actor.GetPositionCoordinate().SetValue(nx, ny)
+        # Always re-push so extent and position match current show_cmap state.
+        self._push_canvas(self._make_tile(
+            self._subtitle, self._speed_text, self._show_cmap))
 
     def update(self, subtitle: str, speed_text: str = "",
                show_cmap: bool = False) -> None:
@@ -1553,7 +1571,7 @@ class InfoPanelOverlay:
         self._subtitle   = subtitle
         self._speed_text = speed_text
         self._show_cmap  = show_cmap
-        self._push_pixels(self._make_tile(subtitle, speed_text, show_cmap))
+        self._push_canvas(self._make_tile(subtitle, speed_text, show_cmap))
 
     def set_visible(self, visible: bool) -> None:
         """Show or hide the info-panel overlay."""

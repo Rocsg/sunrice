@@ -4869,19 +4869,23 @@ def main(argv: list[str] | None = None) -> int:
             else max(100, int(eye_w * 0.38 * 1.05))
         )
         _tort_is_vr  = vr_mode != "off"
-        # VR: text 2× bigger; overall bar 10% smaller (scale=0.9).
-        _tort_vr_scale = 0.9 if _tort_is_vr else 1.0
-        _tort_font   = round(11 * 1.8 * 2) if _tort_is_vr else 11
-        _tort_pad    = round(8  * _tort_vr_scale) if _tort_is_vr else 6
-        _tort_bar_w  = round(22 * 1.8 * _tort_vr_scale) if _tort_is_vr else 22
-        _tort_bar_h  = round((_info_panel_w - 2 * _tort_pad) * _tort_vr_scale)
+        # VR:   text 2× bigger; overall bar 10% smaller (scale=0.9).
+        # Flat: scale by render resolution (eye_h/540), same as the other flat
+        #       colorbars, so fonts grow proportionally without overflowing.
+        _tort_vr_scale   = 0.9 if _tort_is_vr else 1.0
+        _tort_flat_scale = 1.0 if _tort_is_vr else max(1.0, eye_h / 540.0)
+        _tort_font   = round(11 * 1.8 * 2) if _tort_is_vr else round(11 * _tort_flat_scale)
+        _tort_pad    = round(8  * _tort_vr_scale) if _tort_is_vr else round(6  * _tort_flat_scale)
+        _tort_bar_w  = round(22 * 1.8 * _tort_vr_scale) if _tort_is_vr else round(22 * _tort_flat_scale)
+        _tort_bar_h  = round((_info_panel_w - 2 * _tort_pad) * _tort_vr_scale) if _tort_is_vr else (_info_panel_w - 2 * _tort_pad)
+        _tort_title_h = round(20 * (1.8 * _tort_vr_scale if _tort_is_vr else _tort_flat_scale))
         _tort_cmap_img = _rbih(
             TORTUOSITY_CMAP_STOPS,
             TORTUOSITY_VMIN, TORTUOSITY_VMAX,
             "Tortuosity",
             bar_w=_tort_bar_w,
             bar_h=_tort_bar_h,
-            title_h=round(20 * (1.8 * _tort_vr_scale if _tort_is_vr else 1.0)),
+            title_h=_tort_title_h,
             pad=_tort_pad,
             font_size=_tort_font,
             reverse=True,

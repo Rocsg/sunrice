@@ -2599,6 +2599,196 @@ def _make_panel_frame_actor(
     return actor
 
 
+def _render_scalebar_tile(
+    label_left: str,
+    label_right: str,
+    w: int = 380,
+    h: int = 600,
+    font_size: int = 42,
+    bg_color: tuple = (140, 140, 140),
+) -> np.ndarray:
+    """PIL-render a ``(h, w, 3)`` uint8 tile: a vertical scale bar with labels.
+
+    Layout (left → right):
+      left text  |  vertical bar  |  right text
+
+    *label_left* (e.g. "0.5 mm\\n(real world)") is right-aligned on the left
+    half; *label_right* (e.g. "74 m\\n(Virtual Reality)") is left-aligned on
+    the right half.  The bar runs the full canvas height minus a small padding
+    and has small horizontal end-cap ticks at top and bottom.
+    Background is *bg_color* (RGB tuple); bar and text are black.
+    """
+    tile = np.full((h, w, 3), bg_color[0] if isinstance(bg_color, tuple) else 140, dtype=np.uint8)
+    tile[:, :, 1] = bg_color[1] if isinstance(bg_color, tuple) else 140
+    tile[:, :, 2] = bg_color[2] if isinstance(bg_color, tuple) else 140
+    try:
+        from PIL import Image as _PI, ImageDraw as _PD, ImageFont as _PF  # noqa: PLC0415
+        img = _PI.fromarray(tile, "RGB")
+        d   = _PD.Draw(img)
+        try:
+            fnt = _PF.load_default(size=font_size)
+        except TypeError:
+            fnt = _PF.load_default()
+
+        bar_w     = max(10, w // 12)          # bar pixel width
+        bar_cx    = (3*w) // 4                    # bar horizontal centre
+        pad_v     = max(12, h // 16)          # vertical padding above/below bar
+        bar_x0    = bar_cx - bar_w // 2
+        bar_x1    = bar_cx + bar_w // 2
+        bar_y0    = pad_v
+        bar_y1    = h - pad_v
+        tick_w    = max(6, bar_w * 2)         # horizontal tick half-width
+        tick_h    = max(3, bar_w // 3)        # tick height
+
+        BAR_COLOR   = (20, 20, 20)
+        LEFT_COLOR  = (10, 10, 10)
+        RIGHT_COLOR = (10, 10, 10)
+
+        # ── Draw vertical bar ────────────────────────────────────────────
+        d.rectangle([bar_x0, bar_y0, bar_x1, bar_y1], fill=BAR_COLOR)
+        # End-cap ticks (horizontal)
+        for ty in (bar_y0, bar_y1):
+            d.rectangle([bar_cx - tick_w // 2, ty - tick_h // 2,
+                         bar_cx + tick_w // 2, ty + tick_h // 2],
+                        fill=BAR_COLOR)
+
+        # ── Helper: measure + draw multi-line text ────────────────────────
+        def _draw_lines(lines, color, x_anchor, align):
+            sizes = []
+            for ln in lines:
+                bb = d.textbbox((0, 0), ln, font=fnt)
+                sizes.append((bb[2] - bb[0], bb[3] - bb[1]))
+            total_th = sum(s[1] for s in sizes) + max(0, len(sizes) - 1) * 4
+            cy = max(4, (h - total_th) // 2)
+            for (tw, th), ln in zip(sizes, lines):
+                tx = (x_anchor - tw) if align == "right" else x_anchor
+                d.text((tx, cy), ln, fill=color, font=fnt)
+                cy += th + 4
+
+        text_pad  = max(6, w // 24)
+        _draw_lines(label_left.split("\n"),  LEFT_COLOR,
+                    bar_x0 - text_pad, "right")
+        # label_right not displayed
+
+        tile = np.array(img, dtype=np.uint8)
+    except Exception:  # noqa: BLE001
+        pass
+    return tile
+
+
+def _build_scalebar_actor(
+    mesh,
+    meters_per_voxel: float = 0.0,
+    *,
+    center_offset: tuple[float, float, float] = (1.0, 0.0, 3.0),
+    panel_width_voxels: float = 100.0,
+) -> "vtk.vtkActor | None":
+    """Build a static vertical scale-bar actor placed to the left of the sponsors panel.
+
+    The bar is oriented vertically (along ``panel_up``) and sits on the same
+    3-D plane as the sponsors billboard.  Its length ≈ the sponsors panel
+    height, snapped to a clean real-world label.
+
+    Left label: ``X mm (real world)`` — Right label: ``Y m (Virtual Reality)``
+    where X and Y are derived from the bar length and ``meters_per_voxel``.
+
+    Returns ``None`` when the actor cannot be built (e.g. missing Pillow).
+    """
+    import math as _math
+    try:
+        from marvel_view.scripts.water_conductance.constants import VOXEL_SIZE_UM as _VOXEL_SIZE_UM
+    except Exception:
+        _VOXEL_SIZE_UM = 6.71  # µm per voxel (fallback)
+
+    try:
+        bnd = mesh.bounds()
+    except Exception:  # noqa: BLE001
+        bnd = [0.0, 100.0, 0.0, 100.0, 0.0, 100.0]
+    xmin, xmax, ymin, ymax, zmin, zmax = (float(b) for b in bnd)
+    dx, dy, dz = center_offset
+
+    # Reproduce the sponsors-panel centre exactly (same formula as _build_sponsors_panel).
+    base_center = np.array([xmax + dx, ymax * 0.28 + dy, zmax + dz], dtype=float)
+    _theta  = _math.radians(10.0)
+    _c, _s  = _math.cos(_theta), _math.sin(_theta)
+    _up0    = np.array([0.0,  0.866,  0.5  ], dtype=float)
+    _right0 = np.array([0.0,  0.5,   -0.866], dtype=float)
+    panel_up    = _c * _up0    + _s * _right0
+    panel_right = -_s * _up0   + _c * _right0
+
+    sponsors_center = (
+        base_center
+        + 26.0 * panel_up
+        - 22.0 * panel_right
+    )
+
+    # Sponsors approximate half-sizes.
+    _half_w_base      = panel_width_voxels * 1.2 / 2.0   # 21 vox
+    _sponsors_half_w  = _half_w_base * 1.7               # ≈ 35.7 vox (half-width)
+    _sponsors_half_h  = _half_w_base * 1.7               # ≈ 35.7 vox (half-height, square image)
+
+    # Bar represents exactly 1 mm in real-world space.
+    # Number of voxels = 1 mm / voxel_size_µm × 1000 µm/mm
+    bar_length_vox = 500.0 / _VOXEL_SIZE_UM   # 250 µm in voxels (~37.2 at 6.71 µm/vox)
+    label_left = "250 um\n(Real world)\n\n"
+    if meters_per_voxel > 0.0:
+        vr_m        = bar_length_vox * meters_per_voxel
+        label_right = f"{vr_m:.1f} meters\n(VR)"
+        label_left = f"  250 um\nreal size\n\n\n{vr_m:.0f} m\nvirtual reality"
+    else:
+        label_right = "? meters\n(VR)"
+
+    # Panel is vertical: half_h along panel_up, half_w along panel_right.
+    half_h_vox = bar_length_vox / 2.0
+    tile_w, tile_h = 220, 220
+    # ── Scalebar appearance — edit here to retoucher ────────────────────
+    SCALEBAR_BG_COLOR = (164, 168, 174)   # gray background (R, G, B) — 0=black, 255=white
+    # ───────────────────────────────────────────────────────────────────
+    tile = _render_scalebar_tile(label_left, " ",
+                                  w=tile_w, h=tile_h, font_size=24,
+                                  bg_color=SCALEBAR_BG_COLOR)
+    half_w_vox = half_h_vox * (tile_w / tile_h)
+
+    # Place to the LEFT of the sponsors panel (negative panel_right direction).
+    gap = -340.0
+    scalebar_center = (
+        sponsors_center
+        -panel_right * (_sponsors_half_w + gap + half_w_vox)+panel_up * 20.0
+    )
+
+    # Build VTK texture from the PIL tile.
+    import vtk as _vtk  # noqa: PLC0415
+    tile_c = np.ascontiguousarray(tile[::-1])   # flip vertically for VTK
+    imp = _vtk.vtkImageImport()
+    imp.SetDataScalarTypeToUnsignedChar()
+    imp.SetNumberOfScalarComponents(3)
+    imp.SetWholeExtent(0, tile_w - 1, 0, tile_h - 1, 0, 0)
+    imp.SetDataExtent(0, tile_w - 1, 0, tile_h - 1, 0, 0)
+    imp.SetDataSpacing(1.0, 1.0, 1.0)
+    imp.SetDataOrigin(0.0, 0.0, 0.0)
+    _raw = tile_c.tobytes()
+    imp.CopyImportVoidPointer(_raw, len(_raw))
+    imp.Modified()
+    tex = _vtk.vtkTexture()
+    tex.SetInputConnection(imp.GetOutputPort())
+    tex.InterpolateOn()
+    tex.RepeatOff()
+    tex.EdgeClampOn()
+
+    actor = _make_image_panel_actor(
+        scalebar_center, panel_up, panel_right, half_w_vox, half_h_vox, tex,
+    )
+    actor.SetVisibility(1)
+    logger.info(
+        "Scale-bar actor: center=(%.1f,%.1f,%.1f)  bar=%.1f vox  "
+        "labels='%s' / '%s'",
+        *scalebar_center, bar_length_vox,
+        label_left.replace("\n", " "), "",#label_right.replace("\n", " "),
+    )
+    return actor
+
+
+
 def _build_sponsors_panel(
     mesh,
     sponsors_path: str | None,
@@ -5027,6 +5217,23 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as _sp_exc:  # noqa: BLE001
             logger.warning("Failed to attach image panels: %s", _sp_exc)
 
+    # ── Static scale-bar actor at root entry ─────────────────────────────────
+    # A single bar showing "1 millimeter (real world)" / "X meters (VR)"
+    # placed on the opposite side of the root from the sponsors billboard.
+    _sb_actor = None
+    try:
+        _sb_actor = _build_scalebar_actor(mesh, meters_per_voxel=args.meters_per_voxel)
+        if _sb_actor is not None:
+            _main_ren_sb = (
+                plt.renderers[0]
+                if hasattr(plt, "renderers") and plt.renderers
+                else plt.renderer
+            )
+            _main_ren_sb.AddActor(_sb_actor)
+            print("      scale-bar actor attached")
+    except Exception as _sb_exc:  # noqa: BLE001
+        logger.warning("Failed to attach scale-bar actor: %s", _sb_exc)
+
     actor = getattr(mesh, "actor", None) or mesh
 
     # ── Per-frame sponsors / entrance panel state (parallel-safe) ────────────
@@ -5134,13 +5341,17 @@ def main(argv: list[str] | None = None) -> int:
                 vr_mode=True,
                 tri_gap_factor=1.7,
             )
-            # Estimate focal distance from track for initial placement.
-            _gr_foc_dists = np.linalg.norm(
-                np.array([s["camera"]["focal_point"] for s in track], dtype=float)
-                - np.array([s["camera"]["position"]  for s in track], dtype=float),
-                axis=1,
-            )
-            _gr_focal_dist = float(np.median(_gr_foc_dists)) if _gr_foc_dists.size else 100.0
+            # Place reticle at the same forward distance as the ortho/info panels
+            # (_pfm metres, converted to voxels when meters_per_voxel is set).
+            if args.meters_per_voxel > 0.0:
+                _gr_focal_dist = _pfm / args.meters_per_voxel
+            else:
+                _gr_foc_dists = np.linalg.norm(
+                    np.array([s["camera"]["focal_point"] for s in track], dtype=float)
+                    - np.array([s["camera"]["position"]  for s in track], dtype=float),
+                    axis=1,
+                )
+                _gr_focal_dist = float(np.median(_gr_foc_dists)) if _gr_foc_dists.size else 100.0
             print("      gaze reticle attached  (VR+triangle)")
         except Exception as _gr_exc:
             logger.warning("Could not create GazeReticle: %s", _gr_exc)
@@ -5316,7 +5527,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 # Show triangle when accumulated yaw > 30° (horizontal turn only).
                 _gr_ang_vel_out = None
-                _YAW_SHOW_DEG  = 30.0
+                _YAW_SHOW_DEG  = 20.0
                 _YAW_MAX_DEG   = 80.0
                 if abs(_gr_yaw_accum) >= _YAW_SHOW_DEG:
                     # Map [30°, 80°] → size [threshold, fast] in the reticle.
@@ -5324,7 +5535,7 @@ def main(argv: list[str] | None = None) -> int:
                         _TRI_SHOW_THRESHOLD as _GR_TMIN,
                         _TRI_FAST_SPEED     as _GR_TMAX,
                     )
-                    _t = min(1.0, (abs(_gr_yaw_accum) - _YAW_SHOW_DEG) / (_YAW_MAX_DEG - _YAW_SHOW_DEG))
+                    _t = min(1.0, (abs(_gr_yaw_accum) - _YAW_SHOW_DEG) / (80.0 - _YAW_SHOW_DEG))
                     _eff_spd = _GR_TMIN + (_GR_TMAX - _GR_TMIN) * _t
                     # Purely horizontal direction (no pitch component).
                     _gr_ang_vel_out = (math.copysign(_eff_spd, _gr_yaw_accum), 0.0)
@@ -5391,6 +5602,9 @@ def main(argv: list[str] | None = None) -> int:
                 _sa.SetVisibility(1 if _sp_st == _k else 0)
             if _sp_backing is not None:
                 _sp_backing.SetVisibility(1 if _sp_st != -1 else 0)
+        # Scale-bar is always visible, independent of sponsors state.
+        if _sb_actor is not None:
+            _sb_actor.SetVisibility(1)
         _ep_vis = int(_entrance_vis[i])
         if _ep_actor is not None:
             _ep_actor.SetVisibility(1 if _ep_vis == 1 else 0)

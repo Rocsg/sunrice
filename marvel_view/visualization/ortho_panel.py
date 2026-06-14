@@ -1948,3 +1948,298 @@ class InfoBillboard3D:
         """Combined per-frame update: reposition + refresh image if needed."""
         self.update_pose(cam_pos, travel_dir, world_up)
         self.update_image(subtitle, speed_text, show_cmap)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ScaleBar3DBillboard
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _render_scalebar_tile(
+    w: int = 560,
+    h: int = 240,
+    font_size: int = 36,
+) -> np.ndarray:
+    """PIL-render a ``(h, w, 3)`` uint8 tile with two labelled scale bars.
+
+    Both bars span the same pixel width to convey that "1 millimeter (Real
+    world)" and "100 meters (Virtual Reality)" represent the same length in
+    VR-space.  Labels appear above each bar; a short end-cap tick marks each
+    extremity.
+    """
+    tile = np.full((h, w, 3), 8, dtype=np.uint8)  # near-black background
+    try:
+        from PIL import Image as _PI, ImageDraw as _PD, ImageFont as _PF  # noqa: PLC0415
+
+        img = _PI.fromarray(tile, "RGB")
+        d   = _PD.Draw(img)
+
+        # ── fonts ─────────────────────────────────────────────────────────
+        try:
+            fnt_label = _PF.load_default(size=font_size)
+            fnt_unit  = _PF.load_default(size=max(8, font_size - 8))
+        except TypeError:  # Pillow < 9.2
+            fnt_label = fnt_unit = _PF.load_default()
+
+        # ── layout constants ──────────────────────────────────────────────
+        pad_h      = max(12, w // 28)     # horizontal side padding
+        bar_x0     = pad_h
+        bar_x1     = w - pad_h
+        bar_len    = bar_x1 - bar_x0
+        bar_thick  = max(14, h // 12)     # bar height in pixels
+        tick_h     = bar_thick + 8        # end-cap tick height
+        label_gap  = 6                    # gap between label line and bar top
+        section_h  = h // 2              # height allocated to each bar+label
+
+        # ── bar colours ───────────────────────────────────────────────────
+        COLOR_REAL = (80, 200, 230)   # cyan-blue  → real world
+        COLOR_VR   = (80, 230, 120)   # green      → virtual reality
+
+        for idx, (label_line1, label_line2, color) in enumerate([
+            ("1 millimeter", "(Real world)",      COLOR_REAL),
+            ("100 meters",   "(Virtual Reality)",  COLOR_VR),
+        ]):
+            y_top = idx * section_h
+            y_mid = y_top + section_h // 2   # vertical centre of this section
+
+            # measure label bounding boxes
+            bb1 = d.textbbox((0, 0), label_line1, font=fnt_label)
+            bb2 = d.textbbox((0, 0), label_line2, font=fnt_unit)
+            l1_w = bb1[2] - bb1[0];  l1_h = bb1[3] - bb1[1]
+            l2_w = bb2[2] - bb2[0];  l2_h = bb2[3] - bb2[1]
+
+            total_text_h = l1_h + 2 + l2_h
+            text_y = y_mid - total_text_h - bar_thick // 2 - label_gap
+            text_y = max(y_top + 4, text_y)
+
+            # ── draw text (two lines, centred) ───────────────────────────
+            d.text(((w - l1_w) // 2, text_y),           label_line1,
+                   fill=(240, 240, 240), font=fnt_label)
+            d.text(((w - l2_w) // 2, text_y + l1_h + 2), label_line2,
+                   fill=(190, 190, 190), font=fnt_unit)
+
+            # ── draw bar ─────────────────────────────────────────────────
+            bar_y_top = text_y + total_text_h + label_gap
+            bar_y_bot = bar_y_top + bar_thick
+            d.rectangle([bar_x0, bar_y_top, bar_x1, bar_y_bot], fill=color)
+
+            # end-cap ticks
+            tick_y0 = bar_y_top - (tick_h - bar_thick) // 2
+            tick_y1 = tick_y0 + tick_h
+            tick_w  = max(3, bar_thick // 5)
+            for tx in (bar_x0, bar_x1):
+                d.rectangle([tx - tick_w // 2, tick_y0,
+                              tx + tick_w // 2, tick_y1], fill=color)
+
+        tile = np.array(img, dtype=np.uint8)
+    except Exception:  # noqa: BLE001  (PIL not available)
+        pass
+    return tile
+
+
+class ScaleBar3DBillboard:
+    """VR 3-D billboard showing a double real-world / VR-world scale bar.
+
+    Renders a static PIL image with two horizontal bars (one for "1 mm real
+    world", one for "100 m virtual reality") as a camera-following plane in
+    VTK layer 0.  The billboard is meant to be visible at the start of the
+    movie when the camera is at the root entry, placed on the side of the
+    root that is opposite the ortho-panel and info-panel billboards.
+
+    Parameters
+    ----------
+    forward_metres / left_metres / vert_metres:
+        Position of the billboard centre relative to the camera, expressed
+        in physical metres (converted to voxels via *meters_per_voxel*).
+        Positive *left_metres* places the panel to the left of the travel
+        direction (use negative for right).
+    angular_width_deg:
+        Horizontal FOV subtended by the billboard in degrees.
+    aspect:
+        Width-to-height ratio of the billboard canvas.
+    font_size:
+        Pixel size of the primary label font in the rendered tile.
+    """
+
+    def __init__(
+        self,
+        plotter,
+        *,
+        focal_dist: float = 100.0,
+        meters_per_voxel: float = 0.0,
+        forward_metres: float = 2.0,
+        left_metres: float = 0.5,
+        vert_metres: float = 0.0,
+        angular_width_deg: float = 22.0,
+        aspect: float = 2.33,
+        font_size: int = 36,
+        tile_scale: float = 1.0,
+    ) -> None:
+        self.focal_dist          = float(focal_dist)
+        self._meters_per_voxel   = float(meters_per_voxel)
+        self._forward_metres     = float(forward_metres)
+        self._left_metres        = float(left_metres)
+        self._vert_metres        = float(vert_metres)
+        self._tan_x = math.tan(math.radians(float(angular_width_deg) / 2.0))
+        self._tan_y = self._tan_x / float(aspect)
+
+        _base_w = 560
+        _base_h = round(_base_w / aspect)
+        self.panel_w = max(1, round(_base_w * tile_scale))
+        self.panel_h = max(1, round(_base_h * tile_scale))
+        _fs = max(8, round(font_size * tile_scale))
+
+        canvas = _render_scalebar_tile(self.panel_w, self.panel_h, font_size=_fs)
+
+        # ── VTK image pipeline ────────────────────────────────────────────
+        self._importer = vtk.vtkImageImport()
+        self._importer.SetDataScalarTypeToUnsignedChar()
+        self._importer.SetNumberOfScalarComponents(3)
+        self._importer.SetWholeExtent(0, self.panel_w - 1, 0, self.panel_h - 1, 0, 0)
+        self._importer.SetDataExtent(0, self.panel_w - 1, 0, self.panel_h - 1, 0, 0)
+        self._importer.SetDataSpacing(1.0, 1.0, 1.0)
+        self._importer.SetDataOrigin(0.0, 0.0, 0.0)
+        _raw = canvas.tobytes()
+        self._importer.CopyImportVoidPointer(_raw, len(_raw))
+        self._importer.Modified()
+
+        self._texture = vtk.vtkTexture()
+        self._texture.SetInputConnection(self._importer.GetOutputPort())
+        self._texture.InterpolateOn()
+        self._texture.RepeatOff()
+        self._texture.EdgeClampOn()
+
+        self._plane = vtk.vtkPlaneSource()
+        self._plane.SetResolution(1, 1)
+        self._plane.SetOrigin(0.0, 0.0, 0.0)
+        self._plane.SetPoint1(1.0, 0.0, 0.0)
+        self._plane.SetPoint2(0.0, 1.0, 0.0)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(self._plane.GetOutputPort())
+
+        self._actor = vtk.vtkActor()
+        self._actor.SetMapper(mapper)
+        self._actor.SetTexture(self._texture)
+        prop = self._actor.GetProperty()
+        prop.SetOpacity(1.0)
+        try:
+            prop.LightingOff()
+        except Exception:  # noqa: BLE001
+            pass
+        self._actor.GetProperty().BackfaceCullingOff()
+
+        # Add to layer-0 renderer (panoramic pass operates on layer 0).
+        target_ren = None
+        try:
+            renwin = plotter.window
+            for _ri in range(renwin.GetNumberOfLayers()):
+                _r = renwin.GetRenderers().GetItemAsObject(_ri)
+                if _r is not None and _r.GetLayer() == 0:
+                    target_ren = _r
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        if target_ren is None:
+            try:
+                target_ren = plotter.renderer
+            except Exception:  # noqa: BLE001
+                target_ren = plotter.renderers[0]
+        target_ren.AddActor(self._actor)
+
+    # ── VTK plane helpers ─────────────────────────────────────────────────
+
+    def _place_plane(
+        self,
+        panel_center: np.ndarray,
+        cam_pos: np.ndarray,
+        world_up: np.ndarray,
+    ) -> None:
+        """Orient and size the vtkPlaneSource as a wide rectangle facing *cam_pos*."""
+        normal = np.asarray(cam_pos, dtype=float) - np.asarray(panel_center, dtype=float)
+        n_len  = float(np.linalg.norm(normal))
+        if n_len < 1e-9:
+            return
+        normal /= n_len
+
+        up = np.asarray(world_up, dtype=float).copy()
+        up -= np.dot(up, normal) * normal
+        up_n = float(np.linalg.norm(up))
+        if up_n < 1e-6:
+            fallback = (
+                np.array([1.0, 0.0, 0.0]) if abs(normal[0]) < 0.9
+                else np.array([0.0, 1.0, 0.0])
+            )
+            up   = fallback - np.dot(fallback, normal) * normal
+            up_n = float(np.linalg.norm(up))
+            if up_n < 1e-9:
+                return
+        up /= up_n
+
+        panel_right = np.cross(up, normal)
+        pr_n = float(np.linalg.norm(panel_right))
+        if pr_n < 1e-9:
+            return
+        panel_right /= pr_n
+
+        d      = float(np.linalg.norm(
+            np.asarray(cam_pos, dtype=float) - np.asarray(panel_center, dtype=float)
+        ))
+        half_x = d * self._tan_x
+        half_y = d * self._tan_y
+
+        c      = np.asarray(panel_center, dtype=float)
+        origin = c - panel_right * half_x - up * half_y
+        point1 = c + panel_right * half_x - up * half_y
+        point2 = c - panel_right * half_x + up * half_y
+        self._plane.SetOrigin(*origin.tolist())
+        self._plane.SetPoint1(*point1.tolist())
+        self._plane.SetPoint2(*point2.tolist())
+        self._plane.Modified()
+
+    def update_pose(
+        self,
+        cam_pos: np.ndarray,
+        travel_dir: np.ndarray,
+        world_up: np.ndarray,
+    ) -> None:
+        """Reposition the billboard for the current camera / travel direction."""
+        travel = np.asarray(travel_dir, dtype=float)
+        t_n    = float(np.linalg.norm(travel))
+        if t_n < 1e-9:
+            return
+        travel /= t_n
+
+        up   = np.asarray(world_up, dtype=float)
+        up_n = float(np.linalg.norm(up))
+        up   = up / up_n if up_n > 1e-9 else np.array([0.0, 1.0, 0.0])
+
+        right = np.cross(travel, up)
+        r_n   = float(np.linalg.norm(right))
+        if r_n < 1e-6:
+            return
+        right /= r_n
+
+        if self._meters_per_voxel > 0.0:
+            fwd_vox  = self._forward_metres / self._meters_per_voxel
+            left_vox = self._left_metres    / self._meters_per_voxel
+            vert_vox = self._vert_metres    / self._meters_per_voxel
+        else:
+            D = self.focal_dist
+            fwd_vox  = D * 0.50
+            left_vox = D * 0.30
+            vert_vox = 0.0
+
+        panel_center = (
+            np.asarray(cam_pos, dtype=float)
+            + travel   * fwd_vox
+            + (-right) * left_vox
+            + up       * vert_vox
+        )
+        self._place_plane(panel_center, cam_pos, up)
+
+    def set_visible(self, visible: bool) -> None:
+        """Show or hide the scale-bar billboard."""
+        if visible:
+            self._actor.VisibilityOn()
+        else:
+            self._actor.VisibilityOff()

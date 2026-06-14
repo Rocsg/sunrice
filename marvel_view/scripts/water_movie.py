@@ -2662,16 +2662,24 @@ def _render_scalebar_tile(
                         fill=BAR_COLOR)
 
         # ── Helper: measure + draw multi-line text ────────────────────────
+        # Reference height for blank lines (empty string has zero bbox height).
+        _ref_bb = d.textbbox((0, 0), "Mg", font=fnt)
+        _line_h_ref = max(1, _ref_bb[3] - _ref_bb[1])
+
         def _draw_lines(lines, color, x_anchor, align):
             sizes = []
             for ln in lines:
-                bb = d.textbbox((0, 0), ln, font=fnt)
-                sizes.append((bb[2] - bb[0], bb[3] - bb[1]))
+                if ln:
+                    bb = d.textbbox((0, 0), ln, font=fnt)
+                    sizes.append((bb[2] - bb[0], bb[3] - bb[1]))
+                else:
+                    sizes.append((0, _line_h_ref))   # blank line = full line height
             total_th = sum(s[1] for s in sizes) + max(0, len(sizes) - 1) * 4
             cy = max(4, (h - total_th) // 2)
             for (tw, th), ln in zip(sizes, lines):
-                tx = (x_anchor - tw) if align == "right" else x_anchor
-                d.text((tx, cy), ln, fill=color, font=fnt)
+                if ln:
+                    tx = (x_anchor - tw) if align == "right" else x_anchor
+                    d.text((tx, cy), ln, fill=color, font=fnt)
                 cy += th + 4
 
         text_pad  = max(8, w // 18)
@@ -2739,11 +2747,11 @@ def _build_scalebar_actor(
     # Bar represents exactly 1 mm in real-world space.
     # Number of voxels = 1 mm / voxel_size_µm × 1000 µm/mm
     bar_length_vox = 500.0 / _VOXEL_SIZE_UM   # 250 µm in voxels (~37.2 at 6.71 µm/vox)
-    label_left = "250 um\n(Real world)\n\n"
+    label_left = "250 µm\n(Real world)\n\n"
     if meters_per_voxel > 0.0:
         vr_m        = bar_length_vox * meters_per_voxel
         label_right = f"{vr_m:.1f} meters\n(VR)"
-        label_left = f"Real size:\n250 um\n\nVirtual reality:\n{vr_m:.0f} m\n"
+        label_left = f"Real size:\n250 µm\n\nVirtual reality:\n{vr_m:.0f} m\n"
     else:
         label_right = "? meters\n(VR)"
 

@@ -549,6 +549,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    dest="_chunk_end",   help=argparse.SUPPRESS)
     p.add_argument("--_frame-offset", type=int, default=0,
                    dest="_frame_offset", help=argparse.SUPPRESS)
+    p.add_argument("--_total-frames", type=int, default=0,
+                   dest="_total_frames", help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
 
@@ -3455,7 +3457,7 @@ def _run_parallel(
         old.unlink()
 
     # ── Build worker argv: start from sys.argv, strip orchestrator flags ──
-    _FLAGS_WITH_VALUE  = {"--parallel", "--_chunk-start", "--_chunk-end", "--_frame-offset"}
+    _FLAGS_WITH_VALUE  = {"--parallel", "--_chunk-start", "--_chunk-end", "--_frame-offset", "--_total-frames"}
     _FLAGS_NO_VALUE    = {"--_worker"}
     base_argv: list[str] = []
     skip_next = False
@@ -3483,6 +3485,7 @@ def _run_parallel(
             "--_chunk-start", str(chunk_start),
             "--_chunk-end",   str(chunk_end),
             "--_frame-offset", str(chunk_start),
+            "--_total-frames", str(total_frames),
         ]
         cmd = [sys.executable, "-m", "marvel_view.scripts.water_movie"] + worker_argv
         log_path = frames_dir / f"_worker_{k}.log"
@@ -5444,7 +5447,7 @@ def main(argv: list[str] | None = None) -> int:
         # 5-second block and the mode-debounce initialisation are correct.
         _frame_offset = int(getattr(args, "_frame_offset", 0) or 0)
         _INTRO_END_S = 35.0  # info panel inhibited during intro; first fire at cave entry
-        _MESH_ALL_SHOW_S   = 67.0   # fixed-time trigger: show mesh_all subtitle at ~1 min 07
+        _MESH_ALL_SHOW_S   = 64.0   # fixed-time trigger: show mesh_all subtitle at ~1 min 04
         _MESH_ALL_SHOW_DUR = 5.0    # seconds
         # Seed _last_fired_mode from the first frame's mode so we don't
         # re-trigger for the same mode that a previous chunk already showed.
@@ -5474,11 +5477,11 @@ def main(argv: list[str] | None = None) -> int:
             _lames_vi = bool(_ui_vi.get("lames_visible", False))
             _abs_t = (_frame_offset + _vi) / _fps_int
             if _abs_t < _INTRO_END_S:
-                # Still in intro: seed both debounce and seen-set so modes
-                # encountered before the cave entry never trigger the panel.
-                if _mode_vi:
-                    _last_fired_mode = _mode_vi
-                    _seen_modes.add(_mode_vi)
+                # Still in intro: advance the lames debounce state but do NOT
+                # seed _last_fired_mode or _seen_modes — this ensures the first
+                # mode seen after the intro (e.g. mesh_bridges at ~1:20) still
+                # triggers the info panel even if it was already active during
+                # the intro sequence.
                 _last_lames_vis = _lames_vi
                 continue
             if _mode_vi and _mode_vi != _last_fired_mode:
@@ -5542,7 +5545,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _o_fps  = max(1.0, float(args.fps))
         _o_foff = int(getattr(args, "_frame_offset", 0) or 0)
-        _o_total_abs_t = (_o_foff + len(track)) / _o_fps
+        # Workers receive the full-movie frame count via --_total-frames so
+        # the outro fires at the real end, not the end of the chunk.
+        _o_total_frames = int(getattr(args, "_total_frames", 0) or 0)
+        _o_total_abs_t  = (_o_total_frames if _o_total_frames > 0
+                           else (_o_foff + len(track))) / _o_fps
         if len(track) > 1:
             _o_tpos = np.array([s["camera"]["position"] for s in track], dtype=float)
             _o_vspd = np.linalg.norm(np.diff(_o_tpos, axis=0), axis=1)

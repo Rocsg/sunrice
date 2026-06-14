@@ -1,7 +1,7 @@
 """add_audio.py — Add an audio track to a marvel-water-movie MP4.
 
-The video stream is copied without re-encoding.  The audio is looped to fill
-the full video duration and cut exactly at the video end.  When ``--vr`` is
+The video stream is copied without re-encoding.  The audio plays once and is
+padded with silence to fill the full video duration.  When ``--vr`` is
 given, the Google Spatial-Media spherical XMP metadata (vr360, stereo
 left-right) is re-injected after the remux, because ffmpeg silently drops that
 custom UUID box during any container operation.
@@ -88,8 +88,8 @@ def main(argv: list[str] | None = None) -> None:
         prog="marvel-add-audio-to-movie",
         description=(
             "Add an audio track to a marvel-water-movie MP4 without "
-            "re-encoding the video.  The audio loops to fill the video "
-            "duration and is cut at the end."
+            "re-encoding the video.  The audio plays once, then silence "
+            "fills the remaining video duration."
         ),
     )
     parser.add_argument("input_video", help="Input MP4 file.")
@@ -143,13 +143,17 @@ def main(argv: list[str] | None = None) -> None:
     cmd = [
         ffmpeg, "-y",
         "-i", str(input_path),
-        "-stream_loop", "-1",           # loop audio indefinitely
         "-i", str(audio_path),
+        "-filter_complex",
+        # Pad audio with silence so it matches the video duration exactly.
+        # apad alone stops at the shorter stream; combining with -shortest on
+        # the video input ensures the output length equals the video.
+        "[1:a]apad[aout]",
         "-c:v", "copy",                 # no video re-encoding
         "-c:a", "aac",
         "-b:a", "192k",
         "-map", "0:v:0",
-        "-map", "1:a:0",
+        "-map", "[aout]",
         "-map_metadata", "0",           # carry over container metadata
         "-movflags", "+faststart",
         "-shortest",                    # stop at video end

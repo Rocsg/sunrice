@@ -372,8 +372,8 @@ PANEL_TITLE = "Specimen Dolores. 3 cm from apex of root 4."
 
 # Mode subtitle shown on the second line of the info panel.
 VIEW_MODE_SUBTITLES: dict = {
-    "mesh_bridges":  "Cortical bridges (without stele and sclerenchyme)",
-    "mesh_all":      "All watered tissue displayed.",
+    "mesh_bridges":  "Cortical bridges\n(Water-conducting tissues, excluding stele and sclerenchyma)",
+    "mesh_all":      "All water-conducting tissues displayed.",
     "arrows_grid":   "Coupled water & gas gradient fields",
     "arrows_dual":   "Coupled water & gas gradient fields",
     "arrows_tracks": "Water conduction shortest paths",

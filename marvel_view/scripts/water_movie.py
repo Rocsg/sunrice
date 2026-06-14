@@ -2630,7 +2630,7 @@ def _render_scalebar_tile(
         except TypeError:
             fnt = _PF.load_default()
 
-        bar_w     = max(10, w // 12)          # bar pixel width
+        bar_w     = max(8, w // 15)          # bar pixel width
         bar_cx    = (3*w) // 4                    # bar horizontal centre
         pad_v     = max(12, h // 16)          # vertical padding above/below bar
         bar_x0    = bar_cx - bar_w // 2
@@ -2665,7 +2665,7 @@ def _render_scalebar_tile(
                 d.text((tx, cy), ln, fill=color, font=fnt)
                 cy += th + 4
 
-        text_pad  = max(6, w // 24)
+        text_pad  = max(8, w // 18)
         _draw_lines(label_left.split("\n"),  LEFT_COLOR,
                     bar_x0 - text_pad, "right")
         # label_right not displayed
@@ -2734,7 +2734,7 @@ def _build_scalebar_actor(
     if meters_per_voxel > 0.0:
         vr_m        = bar_length_vox * meters_per_voxel
         label_right = f"{vr_m:.1f} meters\n(VR)"
-        label_left = f"  250 um\nreal size\n\n\n{vr_m:.0f} m\nvirtual reality"
+        label_left = f"Real size:\n250 um\n\nVirtual reality:\n{vr_m:.0f} m\n"
     else:
         label_right = "? meters\n(VR)"
 
@@ -5030,8 +5030,8 @@ def main(argv: list[str] | None = None) -> int:
                 plt, "", _init_sub,          # title="" → subtitle-only display
                 focal_dist=_focal_dist,
                 meters_per_voxel=args.meters_per_voxel,
-                angular_width_deg=34.27 * 1.05,   # +5 % wider  ≈ 35.98°
-                aspect=8.0,                        # height ÷ 2 (was 4.0)
+                angular_width_deg=34.27 * 1.05 * 1.2 * 1.15,   # ×1.2 intro fit, ×1.15 mode text fit
+                aspect=8.0 / 1.2,                  # ×1.2 taller for intro panel headroom
                 tile_scale=2.38,                   # 1.7 × 1.4
                 subtitle_font_scale=1.15,          # subtitle font +15 %
                 forward_metres=_pfm,
@@ -5043,8 +5043,8 @@ def main(argv: list[str] | None = None) -> int:
             info_overlay = _InfoPO(
                 plt, "", _init_sub,         # title="" → subtitle-only display
                 opacity=0.72,
-                width_frac=0.38 * 1.05,    # +5 % wider  ≈ 0.399
-                height_frac=0.064,         # ×2 taller (was 0.032) to fit bigger font
+                width_frac=0.38 * 1.05 * 1.2 * 1.15,    # ×1.2 intro fit, ×1.15 mode text fit
+                height_frac=0.064 * 1.2,   # ×1.2 taller for intro panel headroom
                 subtitle_font_scale=1.61,  # ×2×0.7 font (was 1.15)
             )
             print("      info overlay attached")
@@ -5243,17 +5243,29 @@ def main(argv: list[str] | None = None) -> int:
     # _entrance_vis:   0 = hidden, 1 = show image, 2 = show white rectangle
     _sponsors_state: np.ndarray = np.full(len(track), -1, dtype=np.int8)
     _entrance_vis:   np.ndarray = np.zeros(len(track), dtype=np.int8)
+    _sb_visible:     np.ndarray = np.ones(len(track),  dtype=bool)   # fallback: always visible
+    _INTRO_TEXT_DURATION = 10.0   # seconds the opening title panel is shown
+    _INTRO_TEXT = (
+        "Inside rice root aerenchyma\n"
+        "A 3D VR exploration of gas cavities and water-conducting tissues."
+    )
     if _sp_actors or _ep_actor is not None:
         _pnl_fps    = max(1.0, float(args.fps))
         _pnl_offset = int(getattr(args, "_frame_offset", 0) or 0)
-        _SP_DELAY = 20.5 if vr_mode != "off" else 8.0  # VR: +1 s later; flat: −2 s earlier
-        _SP_SHOW  = 3.9   # seconds each sponsors image is shown (was 4.4, −0.5 s)
-        _SP_FLASH = 0.6   # seconds of white flash between images
+        _SP_DELAY = 21.9 if vr_mode != "off" else 8.0  # VR: +1 s later; flat: −2 s earlier
+        _SP_SHOW  = 3.35   # seconds each sponsors image is shown (was 4.4, −0.5 s)
+        _SP_FLASH = 0.4   # seconds of white flash between images
         _SP_CYCLE = 3.0 * (_SP_SHOW + _SP_FLASH)   # = 13.5 s
-        _EP_DELAY = 23.0  # entrance appears after this many seconds (was 25.0, −2 s)
-        _EP_ON    = 0.8   # entrance image visible (s)  — short equal-duration cycles
-        _EP_CYCLE = 1.6   # entrance blink period: 0.8 s on + 0.8 s off
+        _EP_DELAY = 29.10  # entrance appears after this many seconds (was 25.0, −2 s)
+        _EP_ON    = 0.9333   # entrance image visible (s)  — short equal-duration cycles
+        _EP_CYCLE = 1.8667   # entrance blink period: 0.8 s on + 0.8 s off
         _PANELS_HIDE_AFTER = 50.0  # sponsors + entrance hidden after this many seconds
+        _SB_DELAY = 14.87           # seconds before scale-bar appears
+        _sb_visible = np.array(
+            [_SB_DELAY <= (_pnl_offset + _fi) / _pnl_fps < _PANELS_HIDE_AFTER
+             for _fi in range(len(track))],
+            dtype=bool,
+        )
         for _fi in range(len(track)):
             _t = (_pnl_offset + _fi) / _pnl_fps
             if _t >= _PANELS_HIDE_AFTER:
@@ -5399,6 +5411,7 @@ def main(argv: list[str] | None = None) -> int:
     # at consecutive control points (the smoothstep interpolation can cause brief
     # blank-mode frames between keyframes, which would otherwise re-trigger).
     _info_visible_frames: np.ndarray = np.zeros(len(track), dtype=bool)
+    _info_lames_frames:   np.ndarray = np.zeros(len(track), dtype=bool)
     if info_billboard is not None or info_overlay is not None:
         _fps_int = max(1, round(args.fps))
         # In parallel workers the track is a sub-chunk whose local index 0
@@ -5409,25 +5422,184 @@ def main(argv: list[str] | None = None) -> int:
         _INTRO_END_S = 35.0  # info panel inhibited during intro; first fire at cave entry
         # Seed _last_fired_mode from the first frame's mode so we don't
         # re-trigger for the same mode that a previous chunk already showed.
+        # _seen_modes: tracks every mode ever shown so we only fire once per mode.
         if _frame_offset > 0 and track:
             _last_fired_mode = (
                 (track[0].get("ui_state") or {}).get("view_mode") or ""
             )
+            _last_lames_vis = bool(
+                (track[0].get("ui_state") or {}).get("lames_visible", False)
+            )
+            # In a worker slice we don't know what earlier chunks showed, so
+            # seed _seen_modes conservatively with every mode present in this
+            # chunk — the orchestrator pass will have shown them all already.
+            _seen_modes: set = {
+                (s.get("ui_state") or {}).get("view_mode") or ""
+                for s in track
+                if (s.get("ui_state") or {}).get("view_mode")
+            }
         else:
             _last_fired_mode = ""
+            _last_lames_vis  = False
+            _seen_modes = set()
         for _vi, _vs in enumerate(track):
-            _mode_vi = ((_vs.get("ui_state") or {}).get("view_mode") or "")
+            _ui_vi   = (_vs.get("ui_state") or {})
+            _mode_vi = (_ui_vi.get("view_mode") or "")
+            _lames_vi = bool(_ui_vi.get("lames_visible", False))
             _abs_t = (_frame_offset + _vi) / _fps_int
             if _abs_t < _INTRO_END_S:
-                # Still in intro: track mode changes to seed debounce but
-                # do NOT show the info panel.
+                # Still in intro: seed both debounce and seen-set so modes
+                # encountered before the cave entry never trigger the panel.
                 if _mode_vi:
                     _last_fired_mode = _mode_vi
+                    _seen_modes.add(_mode_vi)
+                _last_lames_vis = _lames_vi
                 continue
             if _mode_vi and _mode_vi != _last_fired_mode:
-                _end_vi = min(len(track), _vi + 6 * _fps_int)
-                _info_visible_frames[_vi:_end_vi] = True
+                if _mode_vi not in _seen_modes:
+                    # First time this mode is shown — display the info panel.
+                    _end_vi = min(len(track), _vi + 6 * _fps_int)
+                    _info_visible_frames[_vi:_end_vi] = True
+                    _seen_modes.add(_mode_vi)
                 _last_fired_mode = _mode_vi
+            # lames_visible rising edge → show "Water flux simulation" for 3 s,
+            # but delay until the view is stable (small angular change per frame).
+            if _lames_vi and not _last_lames_vis:
+                _LAMES_ANG_STABLE    = 1.0   # °/frame — below this = stable
+                _LAMES_STABLE_FRAMES = max(1, round(_fps_int * 0.3))  # consecutive stable frames
+                _LAMES_MAX_WAIT      = round(_fps_int * 8.0)  # give up after 8 s
+                _stable_start = _vi   # fallback: trigger frame
+                _consec = 0
+                for _svi in range(_vi, min(len(track), _vi + _LAMES_MAX_WAIT)):
+                    if _svi > 0:
+                        if vr_travel_dirs is not None:
+                            _td_p = np.asarray(vr_travel_dirs[_svi - 1], dtype=float)
+                            _td_c = np.asarray(vr_travel_dirs[_svi],     dtype=float)
+                        else:
+                            _cp = track[_svi - 1]["camera"]
+                            _cc = track[_svi]["camera"]
+                            _td_p = (np.asarray(_cp["focal_point"], dtype=float)
+                                     - np.asarray(_cp["position"],    dtype=float))
+                            _td_c = (np.asarray(_cc["focal_point"], dtype=float)
+                                     - np.asarray(_cc["position"],    dtype=float))
+                            _td_p /= (np.linalg.norm(_td_p) + 1e-9)
+                            _td_c /= (np.linalg.norm(_td_c) + 1e-9)
+                        _cos_a = float(np.clip(np.dot(_td_p, _td_c), -1.0, 1.0))
+                        _ang_f = math.degrees(math.acos(_cos_a))
+                    else:
+                        _ang_f = 0.0
+                    if _ang_f < _LAMES_ANG_STABLE:
+                        _consec += 1
+                        if _consec >= _LAMES_STABLE_FRAMES:
+                            _stable_start = _svi - _LAMES_STABLE_FRAMES + 1
+                            break
+                    else:
+                        _consec = 0
+                _end_lv = min(len(track), _stable_start + 3 * _fps_int)
+                _info_visible_frames[_stable_start:_end_lv] = True
+                _info_lames_frames[_stable_start:_end_lv]   = True
+            _last_lames_vis = _lames_vi
+
+    # ── Outro billboard + fade-to-black pre-computation ──────────────────────
+    # Finds the first frame in the last 20 s where the camera is (nearly)
+    # stopped, then:
+    #   • builds a 3-D image panel (sponsors_fullpage.png) 10 m ahead, 20° tilt
+    #   • pre-computes fade-alpha: 0 → 1 linearly from 3 s to 1 s before end,
+    #     then stays at 1 for the last second (pure black).
+    _outro_actor = None
+    _outro_start_frame = -1
+    _outro_fade_alpha: np.ndarray = np.zeros(len(track), dtype=np.float32)
+    try:
+        _o_fps  = max(1.0, float(args.fps))
+        _o_foff = int(getattr(args, "_frame_offset", 0) or 0)
+        _o_total_abs_t = (_o_foff + len(track)) / _o_fps
+        if len(track) > 1:
+            _o_tpos = np.array([s["camera"]["position"] for s in track], dtype=float)
+            _o_vspd = np.linalg.norm(np.diff(_o_tpos, axis=0), axis=1)
+            _o_vspd = np.concatenate([_o_vspd, [_o_vspd[-1]]])
+            _o_win  = max(1, round(_o_fps * 0.5))
+            _o_vspd = np.convolve(_o_vspd, np.ones(_o_win) / _o_win, mode="same")
+        else:
+            _o_vspd = np.zeros(len(track))
+        _OUTRO_LAST_S  = 20.0
+        _OUTRO_SPD_THR = 0.05   # voxels/frame ≈ stopped
+        for _ofi in range(len(track)):
+            _o_abs_t  = (_o_foff + _ofi) / _o_fps
+            if _outro_start_frame < 0 and _o_abs_t >= _o_total_abs_t - _OUTRO_LAST_S:
+                if _o_vspd[_ofi] < _OUTRO_SPD_THR:
+                    _outro_start_frame = _ofi
+            _o_t_left = _o_total_abs_t - _o_abs_t
+            if _o_t_left <= 1.0:
+                _outro_fade_alpha[_ofi] = 1.0
+            elif _o_t_left <= 3.0:
+                _outro_fade_alpha[_ofi] = 1.0 - (_o_t_left - 1.0) / 2.0
+    except Exception as _o_pre_exc:
+        logger.warning("Outro pre-computation failed: %s", _o_pre_exc)
+
+    if _outro_start_frame >= 0:
+        try:
+            from marvel_view.scripts.water_conductance.constants import (
+                DEFAULT_VTK_OUTPUT_DIR as _DVOD,
+            )
+            _o_fp = _DVOD / "sponsors_fullpage.png"
+            if not _o_fp.exists():
+                _o_fp = _DVOD / "sponsors_fullpage.jpg"
+            if _o_fp.exists():
+                _o_tex_res = _load_image_texture(_o_fp)
+                if _o_tex_res is not None:
+                    _o_tex, _o_iw, _o_ih = _o_tex_res
+                    _o_mpv   = max(float(args.meters_per_voxel), 1e-9)
+                    _o_cam   = track[_outro_start_frame]["camera"]
+                    _o_pos   = np.asarray(_o_cam["position"], dtype=float)
+                    # Forward direction at outro start
+                    if vr_travel_dirs is not None:
+                        _o_fwd = np.asarray(
+                            vr_travel_dirs[_outro_start_frame], dtype=float)
+                    else:
+                        _o_foc = np.asarray(
+                            _o_cam.get("focal_point", _o_pos + [0, 0, -1]),
+                            dtype=float)
+                        _o_fwd = _o_foc - _o_pos
+                        _o_fn  = float(np.linalg.norm(_o_fwd))
+                        _o_fwd = (_o_fwd / _o_fn
+                                  if _o_fn > 1e-9 else np.array([0.0, 0.0, -1.0]))
+                    _o_wup = (np.asarray(vr_world_up, dtype=float)
+                              if vr_world_up is not None
+                              else np.array([0.0, 1.0, 0.0]))
+                    # Panel right/up: face toward viewer
+                    _o_right = np.cross(_o_fwd, _o_wup)
+                    _o_rn    = float(np.linalg.norm(_o_right))
+                    _o_right = (_o_right / _o_rn
+                                if _o_rn > 1e-9 else np.array([1.0, 0.0, 0.0]))
+                    _o_up    = np.cross(_o_right, _o_fwd)
+                    _o_un    = float(np.linalg.norm(_o_up))
+                    _o_up    = (_o_up / _o_un
+                                if _o_un > 1e-9 else np.array([0.0, 1.0, 0.0]))
+                    # 20° tilt: top leans away from viewer (natural poster angle)
+                    _o_tilt  = math.radians(20.0)
+                    _o_up_t  = math.cos(_o_tilt) * _o_up + math.sin(_o_tilt) * _o_fwd
+                    _o_up_t  /= (np.linalg.norm(_o_up_t) + 1e-9)
+                    # 3 m half-width → ~60° apparent FOV at 10 m distance
+                    _o_fwd_vox = 10.0 / _o_mpv
+                    _o_half_w  = 3.0  / _o_mpv
+                    _o_half_h  = _o_half_w * (_o_ih / max(_o_iw, 1))
+                    _o_center  = _o_pos + _o_fwd_vox * _o_fwd
+                    _outro_actor = _make_image_panel_actor(
+                        _o_center, _o_up_t, _o_right, _o_half_w, _o_half_h, _o_tex,
+                    )
+                    _outro_actor.SetVisibility(0)
+                    _main_ren_outro = (
+                        plt.renderers[0]
+                        if hasattr(plt, "renderers") and plt.renderers
+                        else plt.renderer
+                    )
+                    _main_ren_outro.AddActor(_outro_actor)
+                    print(f"      outro billboard attached "
+                          f"(frame {_outro_start_frame}, {_o_fp.name})")
+            else:
+                logger.warning("Outro billboard image not found at %s", _o_fp)
+        except Exception as _o_bld_exc:
+            logger.warning("Failed to build outro billboard: %s", _o_bld_exc)
 
     for i, state in enumerate(track):
         _apply_actor_state(actor, state["actor"])
@@ -5482,6 +5654,16 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 ortho_overlay.set_speed_text(f"{_track_speeds_um_s[i]:.1f} um/s")
                 ortho_overlay.update(mono_pos, mono_dir)
+
+        # ── Outro billboard visibility + ortho suppression ──────────────────
+        _is_outro = _outro_start_frame >= 0 and i >= _outro_start_frame
+        if _outro_actor is not None:
+            _outro_actor.SetVisibility(1 if _is_outro else 0)
+        if _is_outro:
+            if ortho_billboard is not None:
+                ortho_billboard.set_visible(False)
+            if ortho_overlay is not None:
+                ortho_overlay.set_visible(False)
 
         # ── Gaze reticle update (VR only) ────────────────────────────────────
         if _gaze_reticle is not None:
@@ -5584,7 +5766,14 @@ def main(argv: list[str] | None = None) -> int:
             _vm_info  = _ui_st.get("view_mode", "")
             _is_tracks = (_vm_info == "arrows_tracks")
             _sub_text = _VIEW_MODE_SUBTITLES.get(_vm_info, "")
-            _panel_vis = bool(_info_visible_frames[i])
+            _abs_t_i  = (int(getattr(args, "_frame_offset", 0) or 0) + i) / max(1.0, float(args.fps))
+            if _abs_t_i < _INTRO_TEXT_DURATION:
+                _panel_vis = True
+                _sub_text  = _INTRO_TEXT
+            else:
+                _panel_vis = bool(_info_visible_frames[i])
+                if _panel_vis and _info_lames_frames[i]:
+                    _sub_text = "Water flux simulation"
             if info_billboard is not None:
                 info_billboard.set_visible(_panel_vis)
                 if _panel_vis:
@@ -5602,9 +5791,9 @@ def main(argv: list[str] | None = None) -> int:
                 _sa.SetVisibility(1 if _sp_st == _k else 0)
             if _sp_backing is not None:
                 _sp_backing.SetVisibility(1 if _sp_st != -1 else 0)
-        # Scale-bar is always visible, independent of sponsors state.
+        # Scale-bar: visible from _SB_DELAY until _PANELS_HIDE_AFTER.
         if _sb_actor is not None:
-            _sb_actor.SetVisibility(1)
+            _sb_actor.SetVisibility(1 if _sb_visible[i] else 0)
         _ep_vis = int(_entrance_vis[i])
         if _ep_actor is not None:
             _ep_actor.SetVisibility(1 if _ep_vis == 1 else 0)
@@ -5747,6 +5936,21 @@ def main(argv: list[str] | None = None) -> int:
                 right_img = right_img[:h, :w]
             sbs = np.concatenate([left_img, right_img], axis=1)
             imageio.imwrite(str(frames_dir / f"frame_{i + args._frame_offset:05d}.png"), sbs)
+
+        # ── Outro fade-to-black ─────────────────────────────────────────────────────────
+        if _outro_fade_alpha[i] > 0.0:
+            _fa    = float(_outro_fade_alpha[i])
+            _fpath = frames_dir / f"frame_{i + args._frame_offset:05d}.png"
+            try:
+                _fr_arr = imageio.imread(str(_fpath))
+                if _fr_arr.ndim == 3 and _fr_arr.shape[2] == 4:
+                    _fr_arr = _fr_arr[..., :3]
+                _faded = np.clip(
+                    _fr_arr.astype(np.float32) * (1.0 - _fa), 0, 255
+                ).astype(np.uint8)
+                imageio.imwrite(str(_fpath), _faded)
+            except Exception:  # noqa: BLE001
+                pass
 
         if not args._worker:
             _print_progress(i, total_frames, t_start)

@@ -988,6 +988,10 @@ class OrthoPanel3DBillboard:
             return
         self.volume = new_volume
 
+    def set_visible(self, visible: bool) -> None:
+        """Show or hide the billboard actor."""
+        self._actor.SetVisibility(1 if visible else 0)
+
     def _place_plane(
         self,
         panel_center: np.ndarray,
@@ -1308,12 +1312,14 @@ def _render_info_tile(
             font_small = font_sub = _PF.load_default()
         line_gap   = max(2, round(4 * _fscale))   # px between the two rows
         inline_gap = max(4, round(6 * _fscale))   # px between title and speed on row 1
+        # Multiline subtitle (e.g. intro panel): first line rendered 20 % bigger
+        # and centred individually; remaining lines use the normal subtitle font.
+        _sub_lines = subtitle.split("\n")
+        _is_multi  = len(_sub_lines) > 1
         try:
             # ── measure row 1 (title + optional speed, same line) ────────
-            bb_t  = d.textbbox((0, 0), title,    font=font_small)
-            bb_s  = d.textbbox((0, 0), subtitle, font=font_sub)
+            bb_t  = d.textbbox((0, 0), title, font=font_small)
             t_w, t_h = bb_t[2] - bb_t[0], bb_t[3] - bb_t[1]
-            s_w, s_h = bb_s[2] - bb_s[0], bb_s[3] - bb_s[1]
             if speed_text:
                 bb_sp  = d.textbbox((0, 0), speed_text, font=font_small)
                 sp_w   = bb_sp[2] - bb_sp[0]
@@ -1322,6 +1328,24 @@ def _render_info_tile(
                 sp_w   = 0
                 row1_w = t_w
             row1_h = t_h   # title and speed share the same font → same height
+            # ── measure subtitle block ────────────────────────────────────
+            if _is_multi:
+                try:
+                    _font_h1 = _PF.load_default(
+                        size=max(9, round(14 * _fscale * subtitle_font_scale * 1.2))
+                    )
+                except TypeError:
+                    _font_h1 = font_sub
+                _sub_hs = []
+                for _li, _ln in enumerate(_sub_lines):
+                    _fnt_l = _font_h1 if _li == 0 else font_sub
+                    _bb_l  = d.textbbox((0, 0), _ln, font=_fnt_l)
+                    _sub_hs.append(_bb_l[3] - _bb_l[1])
+                s_h = sum(_sub_hs) + line_gap * (len(_sub_lines) - 1)
+                s_w = w  # not used for per-line centering
+            else:
+                bb_s  = d.textbbox((0, 0), subtitle, font=font_sub)
+                s_w, s_h = bb_s[2] - bb_s[0], bb_s[3] - bb_s[1]
             total_h = row1_h + line_gap + s_h
             y = max(2, (h - total_h) // 2)
             # ── draw row 1 ───────────────────────────────────────────────
@@ -1332,8 +1356,18 @@ def _render_info_tile(
                        fill=(180, 220, 160), font=font_small)
             y += row1_h + line_gap
             # ── draw row 2 (subtitle) ────────────────────────────────────
-            d.text((max(4, (w - s_w) // 2), y), subtitle,
-                   fill=(255, 255, 255), font=font_sub)
+            if _is_multi:
+                for _li, _ln in enumerate(_sub_lines):
+                    _fnt_l = _font_h1 if _li == 0 else font_sub
+                    _bb_l  = d.textbbox((0, 0), _ln, font=_fnt_l)
+                    _lw    = _bb_l[2] - _bb_l[0]
+                    _lh    = _bb_l[3] - _bb_l[1]
+                    d.text((max(4, (w - _lw) // 2), y), _ln,
+                           fill=(255, 255, 255), font=_fnt_l)
+                    y += _lh + line_gap
+            else:
+                d.text((max(4, (w - s_w) // 2), y), subtitle,
+                       fill=(255, 255, 255), font=font_sub)
         except AttributeError:  # old Pillow: no textbbox
             y = 4
             spd_suffix = ("  " + speed_text) if speed_text else ""

@@ -357,6 +357,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "~87%% of normal pixels), cube-face to 3584 px, CRF 14.  "
                         "A good middle ground when --compromise is too soft but "
                         "--normal is too heavy for the Quest decoder.")
+    p.add_argument("--compatible-high", action="store_true",
+                   help="VR-only quality mode: uses the --high cube-face resolution "
+                        "(4096 px) for sharper intermediate rendering, but keeps the "
+                        "normal SBS canvas unchanged so the output file is fully "
+                        "compatible with any headset.  Encodes at CRF 20, preset "
+                        "medium, and defaults to 60 fps.  Does not affect flat mode.  "
+                        "Explicit --crf / --preset / --fps still take precedence.")
     p.add_argument("--trick", type=int, default=None, metavar="N",
                    help="Keep only the first N control points before "
                         "building the track.  Handy to quickly render the "
@@ -3714,6 +3721,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.crf is None:
             args.crf = 14
 
+    # ── Compatible-high mode (--compatible-high) ────────────────────────────
+    # VR only: high cube-face resolution, normal SBS canvas, CRF 20, medium preset, 60 fps.
+    if args.compatible_high:
+        if vr_mode != "off":
+            if args.vr_cube_resolution == VR_CUBE_RESOLUTION:
+                args.vr_cube_resolution = 4096
+            # SBS canvas intentionally NOT changed → normal output geometry.
+        if args.crf is None:
+            args.crf = 20
+        if args.preset is None:
+            args.preset = "medium"
+        if args.fps == FPS:  # only override if user hasn't set --fps explicitly
+            args.fps = 60
+
     if vr_mode != "off":
         if args.width % 2 != 0:
             logger.error("SBS canvas width must be even; got %d.", args.width)
@@ -3741,6 +3762,8 @@ def main(argv: list[str] | None = None) -> int:
             quality_prefix = "ULTRA_"
         elif args.high:
             quality_prefix = "HIGH_"
+        elif args.compatible_high:
+            quality_prefix = "COMPATHIGH_"
         elif args.compromise_better:
             quality_prefix = f"COMPB{args.width}_"
         elif args.compromise:
@@ -5030,10 +5053,10 @@ def main(argv: list[str] | None = None) -> int:
                 plt, "", _init_sub,          # title="" → subtitle-only display
                 focal_dist=_focal_dist,
                 meters_per_voxel=args.meters_per_voxel,
-                angular_width_deg=34.27 * 1.05 * 1.2 * 1.15,   # ×1.2 intro fit, ×1.15 mode text fit
+                angular_width_deg=34.27 * 1.05 * 1.2 * 1.15 * 0.9,  # ×1.2 intro fit, ×1.15 mode text, ×0.9 size
                 aspect=8.0 / 1.2,                  # ×1.2 taller for intro panel headroom
                 tile_scale=2.38,                   # 1.7 × 1.4
-                subtitle_font_scale=1.15,          # subtitle font +15 %
+                subtitle_font_scale=1.15 * 0.8,    # ×0.8 font (intro text was overflowing)
                 forward_metres=_pfm,
                 left_metres=0.0,
                 vert_metres=_pfm * 0.053,          # slightly above gaze centre (≈3°)
@@ -5043,9 +5066,9 @@ def main(argv: list[str] | None = None) -> int:
             info_overlay = _InfoPO(
                 plt, "", _init_sub,         # title="" → subtitle-only display
                 opacity=0.72,
-                width_frac=0.38 * 1.05 * 1.2 * 1.15,    # ×1.2 intro fit, ×1.15 mode text fit
-                height_frac=0.064 * 1.2,   # ×1.2 taller for intro panel headroom
-                subtitle_font_scale=1.61,  # ×2×0.7 font (was 1.15)
+                width_frac=0.38 * 1.05 * 1.2 * 1.15 * 0.9,     # ×1.2 intro fit, ×1.15 mode text, ×0.9 size
+                height_frac=0.064 * 1.2 * 0.9,   # ×1.2 taller for intro, ×0.9 size
+                subtitle_font_scale=1.61 * 0.8,   # ×0.8 font (intro text was overflowing)
             )
             print("      info overlay attached")
     except Exception as exc:  # noqa: BLE001
@@ -5410,8 +5433,9 @@ def main(argv: list[str] | None = None) -> int:
     # non-empty value — this prevents multiple refires when the same mode appears
     # at consecutive control points (the smoothstep interpolation can cause brief
     # blank-mode frames between keyframes, which would otherwise re-trigger).
-    _info_visible_frames: np.ndarray = np.zeros(len(track), dtype=bool)
-    _info_lames_frames:   np.ndarray = np.zeros(len(track), dtype=bool)
+    _info_visible_frames:   np.ndarray = np.zeros(len(track), dtype=bool)
+    _info_lames_frames:     np.ndarray = np.zeros(len(track), dtype=bool)
+    _info_mesh_all_frames:  np.ndarray = np.zeros(len(track), dtype=bool)
     if info_billboard is not None or info_overlay is not None:
         _fps_int = max(1, round(args.fps))
         # In parallel workers the track is a sub-chunk whose local index 0
@@ -5420,6 +5444,8 @@ def main(argv: list[str] | None = None) -> int:
         # 5-second block and the mode-debounce initialisation are correct.
         _frame_offset = int(getattr(args, "_frame_offset", 0) or 0)
         _INTRO_END_S = 35.0  # info panel inhibited during intro; first fire at cave entry
+        _MESH_ALL_SHOW_S   = 67.0   # fixed-time trigger: show mesh_all subtitle at ~1 min 07
+        _MESH_ALL_SHOW_DUR = 5.0    # seconds
         # Seed _last_fired_mode from the first frame's mode so we don't
         # re-trigger for the same mode that a previous chunk already showed.
         # _seen_modes: tracks every mode ever shown so we only fire once per mode.
@@ -5498,6 +5524,10 @@ def main(argv: list[str] | None = None) -> int:
                 _end_lv = min(len(track), _stable_start + 3 * _fps_int)
                 _info_visible_frames[_stable_start:_end_lv] = True
                 _info_lames_frames[_stable_start:_end_lv]   = True
+            # Fixed-time trigger: mesh_all subtitle at ~1 min 07.
+            if _MESH_ALL_SHOW_S <= _abs_t < _MESH_ALL_SHOW_S + _MESH_ALL_SHOW_DUR:
+                _info_visible_frames[_vi]  = True
+                _info_mesh_all_frames[_vi] = True
             _last_lames_vis = _lames_vi
 
     # ── Outro billboard + fade-to-black pre-computation ──────────────────────
@@ -5774,15 +5804,28 @@ def main(argv: list[str] | None = None) -> int:
                 _panel_vis = bool(_info_visible_frames[i])
                 if _panel_vis and _info_lames_frames[i]:
                     _sub_text = "Water flux simulation"
+                elif _panel_vis and _info_mesh_all_frames[i]:
+                    _sub_text = _VIEW_MODE_SUBTITLES.get("mesh_all", "")
+            _is_lames    = _panel_vis and bool(_info_lames_frames[i])
+            _is_mesh_all = _panel_vis and bool(_info_mesh_all_frames[i])
+            _show_cmap_flag = _is_tracks and not _is_lames
+            # Subtitle colour: blue for Water-flux message, scalebar-gray for mesh modes, white otherwise.
+            if _is_lames:
+                _sub_color: tuple = (126, 180, 236)   # blue
+            elif _is_mesh_all or _vm_info in ("mesh_bridges", "mesh_all"):
+                _sub_color = (164, 168, 174)           # scalebar panel gray
+            else:
+                _sub_color = (255, 255, 255)           # white
             if info_billboard is not None:
                 info_billboard.set_visible(_panel_vis)
                 if _panel_vis:
                     _ipos = np.asarray(state["camera"]["position"], dtype=float)
-                    info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text, show_cmap=_is_tracks)
+                    info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text,
+                                         show_cmap=_show_cmap_flag, subtitle_color=_sub_color)
             elif info_overlay is not None:
                 info_overlay.set_visible(_panel_vis)
                 if _panel_vis:
-                    info_overlay.update(_sub_text, show_cmap=_is_tracks)
+                    info_overlay.update(_sub_text, show_cmap=_show_cmap_flag, subtitle_color=_sub_color)
 
         # ── Animated panels: sponsors cycle + entrance blink ─────────────
         if _sp_actors:

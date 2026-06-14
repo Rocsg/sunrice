@@ -133,22 +133,41 @@ def main(argv: list[str] | None = None) -> None:
     ffmpeg = _find_ffmpeg()
 
     # ------------------------------------------------------------------
-    # Step 1 — remux: copy video, loop audio, stop at video end
+    # Step 1 — probe video duration so apad is bounded
     # ------------------------------------------------------------------
     print(f"Input  : {input_path}")
     print(f"Audio  : {audio_path}")
     print(f"Output : {output_path}")
     print()
 
+    ffprobe = shutil.which("ffprobe") or ffmpeg.replace("ffmpeg", "ffprobe")
+    probe = subprocess.run(
+        [
+            ffprobe, "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(input_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        video_duration = float(probe.stdout.strip())
+    except ValueError:
+        sys.exit(f"Could not determine video duration: {probe.stderr.strip()}")
+    print(f"Video duration: {video_duration:.3f}s")
+
+    # ------------------------------------------------------------------
+    # Step 2 — remux: copy video, pad audio to exact video duration
+    # ------------------------------------------------------------------
+    # apad=whole_dur=<seconds> caps the silence so ffmpeg doesn't hang
+    # waiting for an unbounded apad stream to finish.
     cmd = [
         ffmpeg, "-y",
         "-i", str(input_path),
         "-i", str(audio_path),
         "-filter_complex",
-        # Pad audio with silence so it matches the video duration exactly.
-        # apad alone stops at the shorter stream; combining with -shortest on
-        # the video input ensures the output length equals the video.
-        "[1:a]apad[aout]",
+        f"[1:a]apad=whole_dur={video_duration:.6f}[aout]",
         "-c:v", "copy",                 # no video re-encoding
         "-c:a", "aac",
         "-b:a", "192k",
@@ -166,7 +185,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(f"ffmpeg failed with exit code {result.returncode}.")
 
     # ------------------------------------------------------------------
-    # Step 2 — re-inject VR metadata if requested
+    # Step 3 — re-inject VR metadata if requested
     # ------------------------------------------------------------------
     if args.vr:
         print("\nRe-injecting spatial-media vr360 metadata…")

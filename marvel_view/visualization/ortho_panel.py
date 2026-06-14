@@ -1296,6 +1296,7 @@ def _render_info_tile(
     w: int = _INFO_W,
     h: int = _INFO_H,
     subtitle_font_scale: float = 1.0,
+    subtitle_color: tuple = (255, 255, 255),
 ) -> np.ndarray:
     """PIL-render a ``(h, w, 3)`` uint8 tile: title + speed + subtitle, all centred."""
     tile = np.full((h, w, 3), 10, dtype=np.uint8)   # near-black background
@@ -1363,17 +1364,17 @@ def _render_info_tile(
                     _lw    = _bb_l[2] - _bb_l[0]
                     _lh    = _bb_l[3] - _bb_l[1]
                     d.text((max(4, (w - _lw) // 2), y), _ln,
-                           fill=(255, 255, 255), font=_fnt_l)
+                           fill=subtitle_color, font=_fnt_l)
                     y += _lh + line_gap
             else:
                 d.text((max(4, (w - s_w) // 2), y), subtitle,
-                       fill=(255, 255, 255), font=font_sub)
+                       fill=subtitle_color, font=font_sub)
         except AttributeError:  # old Pillow: no textbbox
             y = 4
             spd_suffix = ("  " + speed_text) if speed_text else ""
             d.text((4, y), title + spd_suffix, fill=(190, 190, 190), font=font_small)
             y += 15
-            d.text((4, y), subtitle, fill=(255, 255, 255), font=font_sub)
+            d.text((4, y), subtitle, fill=subtitle_color, font=font_sub)
         tile = np.array(img, dtype=np.uint8)
     except Exception:  # noqa: BLE001  (PIL not available)
         pass
@@ -1421,6 +1422,7 @@ class InfoPanelOverlay:
         self._subtitle_font_scale = subtitle_font_scale
         self._cmap_img_src: "np.ndarray | None" = None
         self._show_cmap: bool = False
+        self._subtitle_color: tuple = (255, 255, 255)
         self._cached_bytes: bytes = b""
 
         # ── VTK pipeline ──────────────────────────────────────────────────
@@ -1518,7 +1520,8 @@ class InfoPanelOverlay:
         frac = self._height_frac_text / max(1e-9, self._height_frac)
         return max(0, panel_h_total - round(panel_h_total * frac))
 
-    def _make_tile(self, subtitle: str, speed_text: str, show_cmap: bool) -> np.ndarray:
+    def _make_tile(self, subtitle: str, speed_text: str, show_cmap: bool,
+                   subtitle_color: tuple = (255, 255, 255)) -> np.ndarray:
         """Render combined text + (optional) colormap strip tile.
 
         When *show_cmap* is False the cmap strip is omitted entirely so the
@@ -1531,6 +1534,7 @@ class InfoPanelOverlay:
                 self._title, subtitle, speed_text,
                 subtitle_font_scale=self._subtitle_font_scale,
                 w=self.panel_w, h=text_h,
+                subtitle_color=subtitle_color,
             )
             return text_tile
 
@@ -1540,6 +1544,7 @@ class InfoPanelOverlay:
             self._title, subtitle, speed_text,
             subtitle_font_scale=self._subtitle_font_scale,
             w=self.panel_w, h=text_h,
+            subtitle_color=subtitle_color,
         )
         cmap_h = self.panel_h - text_h
         if self._cmap_img_src is not None and cmap_h > 0 and show_cmap:
@@ -1594,18 +1599,21 @@ class InfoPanelOverlay:
             self.panel_h = ph
         # Always re-push so extent and position match current show_cmap state.
         self._push_canvas(self._make_tile(
-            self._subtitle, self._speed_text, self._show_cmap))
+            self._subtitle, self._speed_text, self._show_cmap, self._subtitle_color))
 
     def update(self, subtitle: str, speed_text: str = "",
-               show_cmap: bool = False) -> None:
+               show_cmap: bool = False,
+               subtitle_color: tuple = (255, 255, 255)) -> None:
         """Re-render the panel only when content has changed."""
         if (subtitle == self._subtitle and speed_text == self._speed_text
-                and show_cmap == self._show_cmap):
+                and show_cmap == self._show_cmap
+                and subtitle_color == self._subtitle_color):
             return
-        self._subtitle   = subtitle
-        self._speed_text = speed_text
-        self._show_cmap  = show_cmap
-        self._push_canvas(self._make_tile(subtitle, speed_text, show_cmap))
+        self._subtitle       = subtitle
+        self._speed_text     = speed_text
+        self._show_cmap      = show_cmap
+        self._subtitle_color = subtitle_color
+        self._push_canvas(self._make_tile(subtitle, speed_text, show_cmap, subtitle_color))
 
     def set_visible(self, visible: bool) -> None:
         """Show or hide the info-panel overlay."""
@@ -1684,6 +1692,7 @@ class InfoBillboard3D:
         self._cmap_img_src: "np.ndarray | None" = None
         self._panel_h_cmap: int = 0
         self._show_cmap: bool = False
+        self._subtitle_color: tuple = (255, 255, 255)
         self.panel_h = self._panel_h_text          # updated below if cmap provided
 
         canvas = _render_info_tile(title, initial_subtitle,
@@ -1754,7 +1763,8 @@ class InfoBillboard3D:
 
     # ------------------------------------------------------------------
 
-    def _make_tile(self, subtitle: str, speed_text: str, show_cmap: bool) -> np.ndarray:
+    def _make_tile(self, subtitle: str, speed_text: str, show_cmap: bool,
+                   subtitle_color: tuple = (255, 255, 255)) -> np.ndarray:
         """Render text tile and optionally append the colormap strip below.
 
         When *show_cmap* is False the cmap strip is **omitted entirely** so
@@ -1764,6 +1774,7 @@ class InfoBillboard3D:
             self._title, subtitle, speed_text,
             subtitle_font_scale=self._subtitle_font_scale,
             w=self.panel_w, h=self._panel_h_text,
+            subtitle_color=subtitle_color,
         )
         if self._cmap_img_src is not None and self._panel_h_cmap > 0 and show_cmap:
             try:
@@ -1950,15 +1961,18 @@ class InfoBillboard3D:
             self._actor.VisibilityOff()
 
     def update_image(self, subtitle: str, speed_text: str = "",
-                     show_cmap: bool = False) -> None:
+                     show_cmap: bool = False,
+                     subtitle_color: tuple = (255, 255, 255)) -> None:
         """Re-render the PIL tile only when content has changed."""
         if (subtitle == self._subtitle and speed_text == self._speed_text
-                and show_cmap == self._show_cmap):
+                and show_cmap == self._show_cmap
+                and subtitle_color == self._subtitle_color):
             return
-        self._subtitle   = subtitle
-        self._speed_text = speed_text
-        self._show_cmap  = show_cmap
-        canvas = self._make_tile(subtitle, speed_text, show_cmap)
+        self._subtitle       = subtitle
+        self._speed_text     = speed_text
+        self._show_cmap      = show_cmap
+        self._subtitle_color = subtitle_color
+        canvas = self._make_tile(subtitle, speed_text, show_cmap, subtitle_color)
         _premultiply_tile(canvas)
         actual_h = canvas.shape[0]
         # Resize VTK extent when show_cmap toggles (cmap strip appears/disappears).
@@ -1978,10 +1992,11 @@ class InfoBillboard3D:
         subtitle: str,
         speed_text: str = "",
         show_cmap: bool = False,
+        subtitle_color: tuple = (255, 255, 255),
     ) -> None:
         """Combined per-frame update: reposition + refresh image if needed."""
         self.update_pose(cam_pos, travel_dir, world_up)
-        self.update_image(subtitle, speed_text, show_cmap)
+        self.update_image(subtitle, speed_text, show_cmap, subtitle_color)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

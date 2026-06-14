@@ -2747,11 +2747,11 @@ def _build_scalebar_actor(
     # Bar represents exactly 1 mm in real-world space.
     # Number of voxels = 1 mm / voxel_size_µm × 1000 µm/mm
     bar_length_vox = 500.0 / _VOXEL_SIZE_UM   # 250 µm in voxels (~37.2 at 6.71 µm/vox)
-    label_left = "250 µm\n(Real world)\n\n"
+    label_left = "250 um\n(Real world)\n\n"
     if meters_per_voxel > 0.0:
         vr_m        = bar_length_vox * meters_per_voxel
         label_right = f"{vr_m:.1f} meters\n(VR)"
-        label_left = f"Real size:\n250 µm\n\nVirtual reality:\n{vr_m:.0f} m\n"
+        label_left = f"Real size:\n250 um\n\nVirtual reality:\n{vr_m:.0f} m\n"
     else:
         label_right = "? meters\n(VR)"
 

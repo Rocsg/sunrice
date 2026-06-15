@@ -1102,7 +1102,7 @@ def build_track(
 
     # ─────────────────────────── Stage B ──────────────────────────────────
     n_segs      = max(1, n_ctrl - 1)
-    v_cruise    = L_total / (n_segs * max(1, frames_per_segment))
+    v_cruise    = L_total / (n_segs * max(1, frames_per_segment)) * 1.4885
     ease_frames = max(1, ease_segments * max(1, frames_per_segment))
     a_max       = v_cruise / ease_frames       # arc-length / frame²
     a_lat_max   = 2.0 * a_max                  # lateral comfort margin (VR)

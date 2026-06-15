@@ -185,8 +185,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--prefix", "-P", default=None,
                    help="String prepended to the auto-generated MP4 / frames-dir names "
                         "(useful to run two renders in parallel without collisions).")
-    p.add_argument("--fps", type=int, default=FPS,
-                   help="Frame rate of the output movie.")
+    p.add_argument("--fps", type=int, default=None,
+                   help="Frame rate of the output movie (default: %(default)s → "
+                        f"{FPS} fps unless a quality preset overrides it).")
     p.add_argument("--seconds-per-segment", type=float,
                    default=SECONDS_PER_SEGMENT,
                    help="Duration between two consecutive control points "
@@ -224,8 +225,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "trajectory.  No MP4 is produced.")
     p.add_argument("--no-path", action="store_true",
                    help="Hide the green cable-car line.")
-    p.add_argument("--keep-frames", action="store_true",
-                   help="Keep individual PNG frames next to the MP4.")
+    p.add_argument("--keep-frames", "--frames", action="store_true",
+                   dest="keep_frames",
+                   help="Keep individual PNG frames next to the MP4 "
+                        "(--frames is an alias for --keep-frames).")
 
     # ── stereo VR ─────────────────────────────────────────────────────────
     p.add_argument("--vr", action="store_true",
@@ -3743,8 +3746,12 @@ def main(argv: list[str] | None = None) -> int:
             args.crf = 20
         if args.preset is None:
             args.preset = "medium"
-        if args.fps == FPS:  # only override if user hasn't set --fps explicitly
+        if args.fps is None:  # only override if user hasn't set --fps explicitly
             args.fps = 60
+
+    # Resolve fps: apply global default now that all preset overrides are done.
+    if args.fps is None:
+        args.fps = FPS
 
     if vr_mode != "off":
         if args.width % 2 != 0:
@@ -5290,9 +5297,9 @@ def main(argv: list[str] | None = None) -> int:
         _SP_SHOW  = 3.35   # seconds each sponsors image is shown (was 4.4, −0.5 s)
         _SP_FLASH = 0.4   # seconds of white flash between images
         _SP_CYCLE = 3.0 * (_SP_SHOW + _SP_FLASH)   # = 13.5 s
-        _EP_DELAY = 29.10  # entrance appears after this many seconds (was 25.0, −2 s)
-        _EP_ON    = 0.9333   # entrance image visible (s)  — short equal-duration cycles
-        _EP_CYCLE = 1.8667   # entrance blink period: 0.8 s on + 0.8 s off
+        _EP_DELAY = 29.20  # entrance appears after this many seconds (was 25.0, −2 s)
+        _EP_ON    = 0.92   # entrance image visible (s)  — short equal-duration cycles
+        _EP_CYCLE = 1.84   # entrance blink period: 0.8 s on + 0.8 s off
         _PANELS_HIDE_AFTER = 50.0  # sponsors + entrance hidden after this many seconds
         _SB_DELAY = 14.87           # seconds before scale-bar appears
         _sb_visible = np.array(

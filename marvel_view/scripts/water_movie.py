@@ -102,7 +102,7 @@ logger = logging.getLogger("marvel_view.water_movie")
 
 WIDTH, HEIGHT = 1920, 1080
 FPS = 90
-SECONDS_PER_SEGMENT = 2.9355  # 5 % faster than 3.09 s/segment
+SECONDS_PER_SEGMENT = 4.5975  # slowed ×0.638457 (camera speed correction 2026-06-15)
 HOLD_SECONDS = 10.0
 EASE_SEGMENTS = 2     # number of trailing segments over which to ease-out
 EASE_STRENGTH = 3.0   # power of the ease-out curve on the very last segment
@@ -229,6 +229,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    dest="keep_frames",
                    help="Keep individual PNG frames next to the MP4 "
                         "(--frames is an alias for --keep-frames).")
+    p.add_argument("--debug-eye-frames", action="store_true",
+                   help="(VR debug) Keep the per-eye _eye_left / _eye_right "
+                        "scratch PNGs in the frames directory.  "
+                        "Only meaningful with --keep-frames.  "
+                        "Without this flag the per-eye files are always "
+                        "deleted, even when --keep-frames is active.")
 
     # ── stereo VR ─────────────────────────────────────────────────────────
     p.add_argument("--vr", action="store_true",
@@ -3583,6 +3589,16 @@ def _run_parallel(
             pass
         print("      cleaned up intermediate frames.")
 
+    # Always purge per-eye scratch PNGs from the frames dir (workers clean
+    # up their own, but any that slipped through on error are removed here).
+    # Kept only when --debug-eye-frames is explicitly requested.
+    if not getattr(args, "debug_eye_frames", False):
+        for _ep in frames_dir.glob("_eye_*.png"):
+            try:
+                _ep.unlink()
+            except OSError:
+                pass
+
     # ── VR spatial-media metadata ─────────────────────────────────────────
     if vr_mode != "off":
         print(f"[5/5] Tagging spatial-media metadata ({vr_mode}, SBS) \u2026")
@@ -6023,9 +6039,21 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
 
     # Clean up the per-eye scratch PNGs.
+    # Always removed unless --debug-eye-frames is explicitly set:
+    # when --keep-frames is active we want only the final stitched
+    # frame_XXXXX.png files (full SBS resolution) in the frames dir.
+    _keep_eye = getattr(args, "debug_eye_frames", False)
     for p in (left_eye_png, right_eye_png, left_eye_from_png, right_eye_from_png):
-        if p.exists():
+        if p.exists() and not _keep_eye:
             p.unlink()
+    # Belt-and-suspenders: purge any stray _eye_*.png that might have
+    # been left by a previous interrupted run or a parallel worker.
+    if not _keep_eye:
+        for _ep in frames_dir.glob("_eye_*.png"):
+            try:
+                _ep.unlink()
+            except OSError:
+                pass
 
     plt.close()
     del pano_passes  # explicit – release the panoramic pass references
@@ -6094,6 +6122,15 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
         print("      cleaned up intermediate frames.")
+
+    # Always purge per-eye scratch PNGs (stray files from this run or a
+    # previous interrupted one).  Kept only with --debug-eye-frames.
+    if not getattr(args, "debug_eye_frames", False):
+        for _ep in frames_dir.glob("_eye_*.png"):
+            try:
+                _ep.unlink()
+            except OSError:
+                pass
 
     # ── 5. Spatial-media metadata injection (VR only) ─────────────────────
     if vr_mode != "off":

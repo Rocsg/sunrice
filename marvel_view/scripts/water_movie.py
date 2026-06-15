@@ -3663,6 +3663,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Resolve fps early: preset overrides (--compatible-high etc.) may still
+    # lower it later, but we need a non-None value for frames_per_segment.
+    # The preset block below will override args.fps again if needed.
+    if args.fps is None:
+        args.fps = FPS
+
     frames_per_segment = int(round(args.fps * args.seconds_per_segment))
     if frames_per_segment < 1:
         logger.error("fps × seconds_per_segment must yield at least 1 frame.")

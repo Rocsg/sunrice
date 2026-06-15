@@ -102,7 +102,7 @@ logger = logging.getLogger("marvel_view.water_movie")
 
 WIDTH, HEIGHT = 1920, 1080
 FPS = 90
-SECONDS_PER_SEGMENT = 3.09   # ~3 % slower than the original 3.0 s/segment
+SECONDS_PER_SEGMENT = 2.9355  # 5 % faster than 3.09 s/segment
 HOLD_SECONDS = 10.0
 EASE_SEGMENTS = 2     # number of trailing segments over which to ease-out
 EASE_STRENGTH = 3.0   # power of the ease-out curve on the very last segment

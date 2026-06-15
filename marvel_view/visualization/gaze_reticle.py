@@ -30,7 +30,7 @@ __all__ = ["GazeReticle", "GazeReticle2D"]
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 # Angular speed threshold (rad/frame) below which the triangle is hidden.
-_TRI_SHOW_THRESHOLD = 4e-4
+_TRI_SHOW_THRESHOLD = 3.2e-4  # lowered 20 % for earlier triangle triggering
 # Angular speed (rad/frame) that maps to the maximum triangle size (2× circle r).
 _TRI_FAST_SPEED = 0.012
 
@@ -100,6 +100,7 @@ class GazeReticle:
         except AttributeError:
             pass
         renderer.AddActor(self._circle_actor)
+        self._circle_actor.SetVisibility(0)  # circle permanently hidden
 
         # ── Triangle (filled polydata, VR only) ───────────────────────────
         self._tri_pts_vtk = vtk.vtkPoints()
@@ -184,8 +185,8 @@ class GazeReticle:
             self._tri_actor.SetVisibility(0)
 
     def set_visible(self, visible: bool) -> None:
-        """Show or hide both actors."""
-        self._circle_actor.SetVisibility(1 if visible else 0)
+        """Show or hide the triangle actor (circle is always hidden)."""
+        # Circle is permanently hidden; only manage the triangle.
         if not visible:
             self._tri_actor.SetVisibility(0)
 
@@ -369,6 +370,7 @@ class GazeReticle2D:
         prop.SetColor(1.0, 1.0, 1.0)
         prop.SetLineWidth(float(line_width))
         renderer.AddActor2D(self._actor)
+        self._actor.SetVisibility(0)  # circle permanently hidden
 
         # Build with a sensible fallback size.
         self._rebuild(800, 600)
@@ -381,7 +383,7 @@ class GazeReticle2D:
             self._rebuild(win_w, win_h)
 
     def set_visible(self, visible: bool) -> None:
-        self._actor.SetVisibility(1 if visible else 0)
+        pass  # circle permanently hidden
 
     def remove(self) -> None:
         self._renderer.RemoveActor2D(self._actor)

@@ -225,10 +225,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "trajectory.  No MP4 is produced.")
     p.add_argument("--no-path", action="store_true",
                    help="Hide the green cable-car line.")
-    p.add_argument("--keep-frames", "--frames", action="store_true",
+    p.add_argument("--keep-frames", action="store_true",
                    dest="keep_frames",
                    help="Keep individual PNG frames next to the MP4 "
-                        "(--frames is an alias for --keep-frames).")
+                        "after encoding.")
+    p.add_argument("--frames", action="store_true",
+                   dest="frames_only",
+                   help="Render and save PNG frames only — skip ffmpeg encoding entirely. "
+                        "A ready-to-paste ffmpeg command is printed at the end so you can "
+                        "test different encoding presets (maxrate, bufsize, etc.) by hand.")
     p.add_argument("--debug-eye-frames", action="store_true",
                    help="(VR debug) Keep the per-eye _eye_left / _eye_right "
                         "scratch PNGs in the frames directory.  "
@@ -3572,6 +3577,26 @@ def _run_parallel(
     crf    = args.crf    if args.crf    is not None else (20 if codec == "h265" else 18)
     preset = args.preset if args.preset is not None else ("slow" if codec == "h265" else "medium")
 
+    # ── Frames-only mode: skip encoding, print the bash command ─────────
+    if getattr(args, "frames_only", False):
+        encoder = "libx265" if codec == "h265" else "libx264"
+        tag_str = " -tag:v hvc1" if codec == "h265" else ""
+        print("\n[4/4] --frames mode: skipping ffmpeg encoding.")
+        print(f"      PNG frames are in: {frames_dir}")
+        print(f"      Output will be:    {out_path}")
+        print("\n  ── encode command (adjust maxrate / bufsize to taste) ──────────")
+        print(
+            f"  ffmpeg -y -framerate {args.fps} \\\n"
+            f"    -i '{frames_dir}/frame_%05d.png' \\\n"
+            f"    -c:v {encoder}{tag_str} -pix_fmt yuv420p \\\n"
+            f"    -crf {crf} -preset {preset} \\\n"
+            f"    -maxrate 80M -bufsize 160M \\\n"
+            f"    '{out_path}'"
+        )
+        print("  ────────────────────────────────────────────────────────────────")
+        print("Done.")
+        return 0
+
     # ── Encode ────────────────────────────────────────────────────────────
     print(f"[4/4] Encoding MP4 \u2192 {out_path}")
     ok = _encode_mp4(frames_dir, out_path, fps=args.fps,
@@ -6106,6 +6131,26 @@ def main(argv: list[str] | None = None) -> int:
         preset = args.preset
     else:
         preset = "slow" if codec == "h265" else "medium"
+
+    # ── Frames-only mode: skip encoding, print the bash command ─────────
+    if getattr(args, "frames_only", False):
+        encoder = "libx265" if codec == "h265" else "libx264"
+        tag_str = " -tag:v hvc1" if codec == "h265" else ""
+        print("\n[4/4] --frames mode: skipping ffmpeg encoding.")
+        print(f"      PNG frames are in: {frames_dir}")
+        print(f"      Output will be:    {out_path}")
+        print("\n  ── encode command (adjust maxrate / bufsize to taste) ──────────")
+        print(
+            f"  ffmpeg -y -framerate {args.fps} \\\n"
+            f"    -i '{frames_dir}/frame_%05d.png' \\\n"
+            f"    -c:v {encoder}{tag_str} -pix_fmt yuv420p \\\n"
+            f"    -crf {crf} -preset {preset} \\\n"
+            f"    -maxrate 80M -bufsize 160M \\\n"
+            f"    '{out_path}'"
+        )
+        print("  ────────────────────────────────────────────────────────────────")
+        print("Done.")
+        return 0
 
     print(f"[4/4] Encoding MP4 → {out_path}")
     ok = _encode_mp4(

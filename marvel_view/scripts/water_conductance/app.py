@@ -4779,7 +4779,7 @@ def _attach_controls(
             _request_render()
             if _info_panel is not None:
                 try:
-                    _spd_um_s = _plane["fwd_v"] * _VOXEL_SIZE_UM
+                    _spd_um_s = _plane["fwd_v"] * (_VOXEL_SIZE_UM / 2.0)
                     _spd_text = (
                         f"Travelling speed:  {abs(_spd_um_s):.1f} um/s  {'(reverse)' if _spd_um_s < -0.1 else ''}".rstrip()
                         if abs(_spd_um_s) > 0.1 else ""

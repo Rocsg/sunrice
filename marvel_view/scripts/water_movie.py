@@ -5487,7 +5487,7 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             _VOXEL_SIZE_UM = 6.71
         _tpos     = np.array([s["camera"]["position"] for s in track], dtype=float)
-        _raw_spd  = np.linalg.norm(np.diff(_tpos, axis=0), axis=1) * args.fps * _VOXEL_SIZE_UM
+        _raw_spd  = np.linalg.norm(np.diff(_tpos, axis=0), axis=1) * args.fps * (_VOXEL_SIZE_UM / 2.0)
         _raw_spd  = np.concatenate([_raw_spd, [_raw_spd[-1]]])
         _spd_win  = max(1, args.fps // 4)
         _kern     = np.ones(_spd_win) / _spd_win
@@ -5521,14 +5521,18 @@ def main(argv: list[str] | None = None) -> int:
             _last_lames_vis = bool(
                 (track[0].get("ui_state") or {}).get("lames_visible", False)
             )
-            # In a worker slice we don't know what earlier chunks showed, so
-            # seed _seen_modes conservatively with every mode present in this
-            # chunk — the orchestrator pass will have shown them all already.
-            _seen_modes: set = {
-                (s.get("ui_state") or {}).get("view_mode") or ""
-                for s in track
-                if (s.get("ui_state") or {}).get("view_mode")
-            }
+            # Do NOT pre-seed _seen_modes with all modes in this chunk.
+            # Pre-seeding used to assume "the orchestrator already showed them",
+            # but the orchestrator only runs build_track() — it never renders
+            # frames.  Pre-seeding caused parallel workers (frame_offset > 0)
+            # to permanently suppress the info panel for every mode, so e.g.
+            # the first transition to mesh_bridges or arrows_tracks was silently
+            # skipped.  Instead, each worker starts with an empty _seen_modes
+            # and fires the info panel for the first new-mode transition it
+            # encounters.  _last_fired_mode is still seeded from the first
+            # frame so a mode continuing unchanged from a previous chunk does
+            # not re-trigger at the chunk boundary.
+            _seen_modes: set = set()
         else:
             _last_fired_mode = ""
             _last_lames_vis  = False

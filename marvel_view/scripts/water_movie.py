@@ -6078,8 +6078,11 @@ def main(argv: list[str] | None = None) -> int:
         if p.exists() and not _keep_eye:
             p.unlink()
     # Belt-and-suspenders: purge any stray _eye_*.png that might have
-    # been left by a previous interrupted run or a parallel worker.
-    if not _keep_eye:
+    # been left by a previous interrupted run.
+    # IMPORTANT: skip the broad glob in worker mode — other workers may
+    # still be actively writing/reading their own _eye_*_<offset>.png
+    # scratch files and deleting them would cause a FileNotFoundError.
+    if not _keep_eye and not args._worker:
         for _ep in frames_dir.glob("_eye_*.png"):
             try:
                 _ep.unlink()

@@ -565,6 +565,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    dest="_frame_offset", help=argparse.SUPPRESS)
     p.add_argument("--_total-frames", type=int, default=0,
                    dest="_total_frames", help=argparse.SUPPRESS)
+    p.add_argument("--_info-sched", default=None,
+                   dest="_info_sched", help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
 
@@ -3406,6 +3408,105 @@ def _summarise_control_points(control_points: List[dict]) -> None:
               f"act.pos={ap}  act.ori={ao}{flag}")
 
 
+def _compute_info_visibility_sched(
+    track: list,
+    fps: float,
+    *,
+    intro_end_s: float = 35.0,
+    mesh_all_show_s: float = 64.0,
+    mesh_all_show_dur: float = 5.0,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    """Compute info-panel visibility flags for an entire track in one pass.
+
+    Returns three boolean numpy arrays (iv, il, ima) of length ``len(track)``:
+      * ``iv``  — panel should be visible
+      * ``il``  — lames ("Water flux simulation") subtitle variant
+      * ``ima`` — mesh_all fixed-time trigger variant
+
+    This function is intentionally free of VTK / rendering state so it can
+    be called from the parallel orchestrator *before* any worker starts, then
+    the result is written to a small .npz file that each worker reads and
+    slices.  This is the only architecturally correct approach for parallel
+    rendering: the visibility decision at frame N depends on what happened
+    globally from frame 0, not on each worker's local chunk view.
+    """
+    import math as _m
+
+    n       = len(track)
+    iv      = np.zeros(n, dtype=bool)
+    il      = np.zeros(n, dtype=bool)
+    ima     = np.zeros(n, dtype=bool)
+    fps_int = max(1, round(fps))
+    last_fired_mode: str  = ""
+    last_lames_vis:  bool = False
+    seen_modes: set = set()
+
+    for vi, vs in enumerate(track):
+        ui_vi    = (vs.get("ui_state") or {})
+        mode_vi  = (ui_vi.get("view_mode") or "")
+        lames_vi = bool(ui_vi.get("lames_visible", False))
+        abs_t    = vi / fps_int
+
+        if abs_t < intro_end_s:
+            # Intro window: do NOT seed last_fired_mode or seen_modes so that
+            # the first post-intro mode transition still triggers the panel
+            # even if the same mode was active throughout the intro.
+            last_lames_vis = lames_vi
+            continue
+
+        if mode_vi and mode_vi != last_fired_mode:
+            # mesh_all is shown only via the fixed-time trigger below,
+            # never from the mode-change detector (avoids spurious panel
+            # at the intro boundary when mesh_all is already on-screen).
+            if mode_vi not in seen_modes and mode_vi != "mesh_all":
+                end_vi = min(n, vi + 6 * fps_int)
+                iv[vi:end_vi] = True
+                seen_modes.add(mode_vi)
+            last_fired_mode = mode_vi
+
+        # Lames rising edge → show "Water flux simulation" for 3 s,
+        # delayed until camera angular motion is below threshold.
+        if lames_vi and not last_lames_vis:
+            _ANG_STABLE    = 1.0
+            _STABLE_FRAMES = max(1, round(fps_int * 0.3))
+            _MAX_WAIT      = round(fps_int * 8.0)
+            stable_start   = vi
+            consec = 0
+            for svi in range(vi, min(n, vi + _MAX_WAIT)):
+                if svi > 0:
+                    cp = track[svi - 1]["camera"]
+                    cc = track[svi]["camera"]
+                    td_p = (np.asarray(cp["focal_point"], dtype=float)
+                            - np.asarray(cp["position"],    dtype=float))
+                    td_c = (np.asarray(cc["focal_point"], dtype=float)
+                            - np.asarray(cc["position"],    dtype=float))
+                    td_p /= (np.linalg.norm(td_p) + 1e-9)
+                    td_c /= (np.linalg.norm(td_c) + 1e-9)
+                    cos_a = float(np.clip(np.dot(td_p, td_c), -1.0, 1.0))
+                    ang_f = _m.degrees(_m.acos(cos_a))
+                else:
+                    ang_f = 0.0
+                if ang_f < _ANG_STABLE:
+                    consec += 1
+                    if consec >= _STABLE_FRAMES:
+                        stable_start = svi - _STABLE_FRAMES + 1
+                        break
+                else:
+                    consec = 0
+            end_lv = min(n, stable_start + 3 * fps_int)
+            iv[stable_start:end_lv] = True
+            il[stable_start:end_lv] = True
+
+        # Fixed-time trigger: force mesh_all subtitle at a specific timestamp.
+        if mesh_all_show_s <= abs_t < mesh_all_show_s + mesh_all_show_dur:
+            iv[vi]  = True
+            ima[vi] = True
+
+        last_lames_vis = lames_vi
+
+    return iv, il, ima
+
+
 def _run_parallel(
     args: "argparse.Namespace",
     control_points: list,
@@ -3479,7 +3580,7 @@ def _run_parallel(
         old.unlink()
 
     # ── Build worker argv: start from sys.argv, strip orchestrator flags ──
-    _FLAGS_WITH_VALUE  = {"--parallel", "--_chunk-start", "--_chunk-end", "--_frame-offset", "--_total-frames"}
+    _FLAGS_WITH_VALUE  = {"--parallel", "--_chunk-start", "--_chunk-end", "--_frame-offset", "--_total-frames", "--_info-sched"}
     _FLAGS_NO_VALUE    = {"--_worker"}
     base_argv: list[str] = []
     skip_next = False
@@ -3499,16 +3600,72 @@ def _run_parallel(
     # ── Spawn one subprocess per chunk ────────────────────────────────────
     procs:     list[subprocess.Popen] = []
     log_paths: list["Path"]             = []
+    # ── Pre-compute info-panel visibility schedule ────────────────────────
+    # Done ONCE here, before any worker starts, from the full trimmed track.
+    # Saved to a small .npz file that every worker loads and slices.  This
+    # guarantees all workers use an identical schedule regardless of any
+    # per-worker state differences (e.g. crossfade frames with empty
+    # view_mode that could shift _last_fired_mode in per-worker computations).
+    _sched_path = frames_dir / "_info_sched.npz"
+    try:
+        _iv_s, _il_s, _ima_s = _compute_info_visibility_sched(track, args.fps)
+        np.savez_compressed(str(_sched_path),
+                            iv=_iv_s, il=_il_s, ima=_ima_s)
+        print(f"  [parallel] info schedule: {int(_iv_s.sum())} visible frames "
+              f"→ {_sched_path.name}")
+        # ── Write human-readable schedule for quick debugging ─────────────
+        try:
+            _txt_path = out_path.parent / "last_schedule.txt"
+            _fps_r = max(1, round(args.fps))
+            with open(_txt_path, "w") as _fh:
+                _fh.write(f"Info-panel schedule  ({len(track)} frames @ {args.fps} fps)\n")
+                _fh.write(f"Generated: {__import__('datetime').datetime.now().isoformat(timespec='seconds')}\n")
+                _fh.write(f"Positions: {getattr(args, 'positions', '?')}\n")
+                _fh.write("-" * 60 + "\n")
+                _fh.write(f"{'frame':>7}  {'time':>8}  type\n")
+                _fh.write("-" * 60 + "\n")
+                _in_run = False
+                _run_start = 0
+                for _fi in range(len(track)):
+                    _vis = bool(_iv_s[_fi])
+                    if _vis and not _in_run:
+                        _in_run = True
+                        _run_start = _fi
+                        _t_s = _fi / _fps_r
+                        _t_e = min(len(track) - 1, _fi + int(_iv_s[_fi:].argmin() or len(track)))
+                        _kind = ("mesh_all(fixed)" if bool(_ima_s[_fi])
+                                 else "lames" if bool(_il_s[_fi])
+                                 else "mode-change")
+                        _fh.write(f"{_fi:>7d}  {_t_s:>7.2f}s  {_kind}\n")
+                    elif not _vis and _in_run:
+                        _in_run = False
+                        _t_end = (_fi - 1) / _fps_r
+                        _fh.write(f"        → ends frame {_fi - 1:>6d} ({_t_end:.2f}s)  "
+                                  f"dur={((_fi - 1 - _run_start) / _fps_r):.2f}s\n")
+                if _in_run:
+                    _fh.write(f"        → ends frame {len(track)-1:>6d} (EOF)\n")
+                _fh.write("-" * 60 + "\n")
+                _fh.write(f"Total visible frames: {int(_iv_s.sum())}\n")
+            print(f"  [parallel] schedule written → {_txt_path}")
+        except Exception as _we:
+            print(f"  [parallel] WARNING: could not write schedule txt ({_we})")
+    except Exception as _se:
+        print(f"  [parallel] WARNING: info schedule computation failed ({_se}); "
+              "workers will fall back to per-worker computation.")
+        _sched_path = None
+
     for k in range(N):
         chunk_start = k * total_frames // N
         chunk_end   = (k + 1) * total_frames // N
+        _sched_arg = (["--_info-sched", str(_sched_path)]
+                      if _sched_path is not None else [])
         worker_argv = base_argv + [
             "--_worker",
             "--_chunk-start", str(chunk_start),
             "--_chunk-end",   str(chunk_end),
             "--_frame-offset", str(chunk_start),
             "--_total-frames", str(total_frames),
-        ]
+        ] + _sched_arg
         cmd = [sys.executable, "-m", "marvel_view.scripts.water_movie"] + worker_argv
         log_path = frames_dir / f"_worker_{k}.log"
         print(f"  [parallel] spawning worker {k}:  "
@@ -5348,7 +5505,7 @@ def main(argv: list[str] | None = None) -> int:
         _EP_ON    = 0.92   # entrance image visible (s)  — short equal-duration cycles
         _EP_CYCLE = 1.84   # entrance blink period: 0.8 s on + 0.8 s off
         _PANELS_HIDE_AFTER = 50.0  # sponsors + entrance hidden after this many seconds
-        _SB_DELAY = 14.87           # seconds before scale-bar appears
+        _SB_DELAY = 18.37           # seconds before scale-bar appears
         _sb_visible = np.array(
             [_SB_DELAY <= (_pnl_offset + _fi) / _pnl_fps < _PANELS_HIDE_AFTER
              for _fi in range(len(track))],
@@ -5499,94 +5656,35 @@ def main(argv: list[str] | None = None) -> int:
     # at consecutive control points (the smoothstep interpolation can cause brief
     # blank-mode frames between keyframes, which would otherwise re-trigger).
     #
-    # ── Info-panel visibility schedule (computed on the FULL track) ──────────
-    # We iterate full_track (the un-sliced sequence that every worker already
-    # holds in memory) so the schedule is identical in every parallel worker.
-    # After computing the full arrays we slice them to the worker's window.
-    # This is the only correct approach for parallel rendering: the decision of
-    # "show info at frame N" must be made from the global context (what modes
-    # appeared before frame N), not from each worker's local chunk view.
+    # ── Info-panel visibility schedule ───────────────────────────────────────
+    # For parallel rendering the orchestrator pre-computes the schedule from the
+    # full track and writes it to --_info-sched; workers load and slice it.
+    # For serial rendering (or if the file is absent) we compute it here from
+    # full_track so the logic is always identical and worker-boundary-agnostic.
     _info_visible_frames:   np.ndarray = np.zeros(len(track), dtype=bool)
     _info_lames_frames:     np.ndarray = np.zeros(len(track), dtype=bool)
     _info_mesh_all_frames:  np.ndarray = np.zeros(len(track), dtype=bool)
     if info_billboard is not None or info_overlay is not None:
-        _fps_int = max(1, round(args.fps))
-        _INTRO_END_S = 35.0  # info panel inhibited during intro; first fire at cave entry
-        _MESH_ALL_SHOW_S   = 64.0   # fixed-time trigger: show mesh_all subtitle at ~1 min 04
-        _MESH_ALL_SHOW_DUR = 5.0    # seconds
-        # Allocate for the FULL track length; we'll slice to the worker window below.
-        _nf = len(full_track)
-        _iv_full  = np.zeros(_nf, dtype=bool)
-        _il_full  = np.zeros(_nf, dtype=bool)
-        _ima_full = np.zeros(_nf, dtype=bool)
-        # Always start from a clean state — we're scanning the global track
-        # from frame 0 so there is no "earlier chunk" to inherit state from.
-        _last_fired_mode: str = ""
-        _last_lames_vis:  bool = False
-        _seen_modes: set = set()
-        for _vi, _vs in enumerate(full_track):
-            _ui_vi   = (_vs.get("ui_state") or {})
-            _mode_vi = (_ui_vi.get("view_mode") or "")
-            _lames_vi = bool(_ui_vi.get("lames_visible", False))
-            _abs_t = _vi / _fps_int   # global time — no chunk offset needed
-            if _abs_t < _INTRO_END_S:
-                # Still in intro: advance the lames debounce state but do NOT
-                # seed _last_fired_mode or _seen_modes — this ensures the first
-                # mode seen after the intro still triggers the info panel even
-                # if the same mode was already active during the intro sequence.
-                _last_lames_vis = _lames_vi
-                continue
-            if _mode_vi and _mode_vi != _last_fired_mode:
-                if _mode_vi not in _seen_modes:
-                    # First time this mode is shown — display the info panel.
-                    _end_vi = min(_nf, _vi + 6 * _fps_int)
-                    _iv_full[_vi:_end_vi] = True
-                    _seen_modes.add(_mode_vi)
-                _last_fired_mode = _mode_vi
-            # lames_visible rising edge → show "Water flux simulation" for 3 s,
-            # but delay until the view is stable (small angular change per frame).
-            if _lames_vi and not _last_lames_vis:
-                _LAMES_ANG_STABLE    = 1.0   # °/frame — below this = stable
-                _LAMES_STABLE_FRAMES = max(1, round(_fps_int * 0.3))  # consecutive stable frames
-                _LAMES_MAX_WAIT      = round(_fps_int * 8.0)  # give up after 8 s
-                _stable_start = _vi   # fallback: trigger frame
-                _consec = 0
-                for _svi in range(_vi, min(_nf, _vi + _LAMES_MAX_WAIT)):
-                    if _svi > 0:
-                        # Use raw camera positions (no vr_travel_dirs needed —
-                        # we're on the full track with global indices).
-                        _cp = full_track[_svi - 1]["camera"]
-                        _cc = full_track[_svi]["camera"]
-                        _td_p = (np.asarray(_cp["focal_point"], dtype=float)
-                                 - np.asarray(_cp["position"],    dtype=float))
-                        _td_c = (np.asarray(_cc["focal_point"], dtype=float)
-                                 - np.asarray(_cc["position"],    dtype=float))
-                        _td_p /= (np.linalg.norm(_td_p) + 1e-9)
-                        _td_c /= (np.linalg.norm(_td_c) + 1e-9)
-                        _cos_a = float(np.clip(np.dot(_td_p, _td_c), -1.0, 1.0))
-                        _ang_f = math.degrees(math.acos(_cos_a))
-                    else:
-                        _ang_f = 0.0
-                    if _ang_f < _LAMES_ANG_STABLE:
-                        _consec += 1
-                        if _consec >= _LAMES_STABLE_FRAMES:
-                            _stable_start = _svi - _LAMES_STABLE_FRAMES + 1
-                            break
-                    else:
-                        _consec = 0
-                _end_lv = min(_nf, _stable_start + 3 * _fps_int)
-                _iv_full[_stable_start:_end_lv] = True
-                _il_full[_stable_start:_end_lv] = True
-            # Fixed-time trigger: mesh_all subtitle at ~1 min 07.
-            if _MESH_ALL_SHOW_S <= _abs_t < _MESH_ALL_SHOW_S + _MESH_ALL_SHOW_DUR:
-                _iv_full[_vi]  = True
-                _ima_full[_vi] = True
-            _last_lames_vis = _lames_vi
-        # Slice the global schedule to this worker's frame window.
         _cs = args._chunk_start if args._chunk_start is not None else 0
-        _info_visible_frames  = _iv_full [_cs : _cs + len(track)]
-        _info_lames_frames    = _il_full [_cs : _cs + len(track)]
-        _info_mesh_all_frames = _ima_full[_cs : _cs + len(track)]
+        _sched_file = getattr(args, "_info_sched", None)
+        _sched_loaded = False
+        if _sched_file:
+            try:
+                _sd = np.load(str(_sched_file))
+                _info_visible_frames  = _sd["iv"] [_cs : _cs + len(track)]
+                _info_lames_frames    = _sd["il"] [_cs : _cs + len(track)]
+                _info_mesh_all_frames = _sd["ima"][_cs : _cs + len(track)]
+                _sched_loaded = True
+            except Exception as _sl_exc:
+                logger.warning("Could not load info schedule %s: %s; "
+                               "falling back to on-the-fly computation.",
+                               _sched_file, _sl_exc)
+        if not _sched_loaded:
+            # Serial render or missing schedule file: compute from full_track.
+            _iv, _il, _ima = _compute_info_visibility_sched(full_track, args.fps)
+            _info_visible_frames  = _iv [_cs : _cs + len(track)]
+            _info_lames_frames    = _il [_cs : _cs + len(track)]
+            _info_mesh_all_frames = _ima[_cs : _cs + len(track)]
 
     # ── Outro billboard + fade-to-black pre-computation ──────────────────────
     # Finds the first frame in the last 20 s where the camera is (nearly)

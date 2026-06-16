@@ -3539,7 +3539,7 @@ def _run_parallel(
                 )
             except ValueError:
                 pass
-    track, _ = build_track(
+    track, _t_out_ui = build_track(
         control_points,
         frames_per_segment,
         hold_frames=hold_frames,
@@ -3549,8 +3549,8 @@ def _run_parallel(
     )
     _par_trim_s = float(getattr(args, "trim_start_seconds", 5.0))
     if _par_trim_s > 0.0:
-        track, _ = _trim_ease_in(
-            track, _,
+        track, _t_out_ui = _trim_ease_in(
+            track, _t_out_ui,
             seconds=_par_trim_s,
             fps=args.fps,
         )
@@ -3608,6 +3608,23 @@ def _run_parallel(
     # view_mode that could shift _last_fired_mode in per-worker computations).
     _sched_path = frames_dir / "_info_sched.npz"
     try:
+        # Inject ui_state into track frames so _compute_info_visibility_sched
+        # can read view_mode / lames_visible — these fields are NOT present in
+        # the raw build_track() output; they come from _build_ui_track().
+        if not getattr(args, "ignore_ui_state", False):
+            _mff_orch = int(getattr(args, "mode_fade_seconds", 1.0) * args.fps)
+            _ui_orch = _build_ui_track(
+                control_points, _t_out_ui,
+                fps=args.fps,
+                frames_per_segment=frames_per_segment,
+                transition_seconds=float(args.ui_transition_seconds),
+                mode_fade_frames=_mff_orch,
+            )
+            if len(_ui_orch) > len(track):
+                _ui_orch = _ui_orch[:len(track)]
+            for _e, _u in zip(track, _ui_orch):
+                if _u is not None:
+                    _e["ui_state"] = _u
         _iv_s, _il_s, _ima_s = _compute_info_visibility_sched(track, args.fps)
         np.savez_compressed(str(_sched_path),
                             iv=_iv_s, il=_il_s, ima=_ima_s)
@@ -3620,7 +3637,7 @@ def _run_parallel(
             with open(_txt_path, "w") as _fh:
                 _fh.write(f"Info-panel schedule  ({len(track)} frames @ {args.fps} fps)\n")
                 _fh.write(f"Generated: {__import__('datetime').datetime.now().isoformat(timespec='seconds')}\n")
-                _fh.write(f"Positions: {getattr(args, 'positions', '?')}\n")
+                _fh.write(f"Positions: {args.positions or '(default)'}\n")
                 _fh.write("-" * 60 + "\n")
                 _fh.write(f"{'frame':>7}  {'time':>8}  type\n")
                 _fh.write("-" * 60 + "\n")

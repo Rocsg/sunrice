@@ -5498,63 +5498,49 @@ def main(argv: list[str] | None = None) -> int:
     # non-empty value — this prevents multiple refires when the same mode appears
     # at consecutive control points (the smoothstep interpolation can cause brief
     # blank-mode frames between keyframes, which would otherwise re-trigger).
+    #
+    # ── Info-panel visibility schedule (computed on the FULL track) ──────────
+    # We iterate full_track (the un-sliced sequence that every worker already
+    # holds in memory) so the schedule is identical in every parallel worker.
+    # After computing the full arrays we slice them to the worker's window.
+    # This is the only correct approach for parallel rendering: the decision of
+    # "show info at frame N" must be made from the global context (what modes
+    # appeared before frame N), not from each worker's local chunk view.
     _info_visible_frames:   np.ndarray = np.zeros(len(track), dtype=bool)
     _info_lames_frames:     np.ndarray = np.zeros(len(track), dtype=bool)
     _info_mesh_all_frames:  np.ndarray = np.zeros(len(track), dtype=bool)
     if info_billboard is not None or info_overlay is not None:
         _fps_int = max(1, round(args.fps))
-        # In parallel workers the track is a sub-chunk whose local index 0
-        # does NOT correspond to video frame 0.  Use _frame_offset (the
-        # absolute index of the first frame in this chunk) so the initial
-        # 5-second block and the mode-debounce initialisation are correct.
-        _frame_offset = int(getattr(args, "_frame_offset", 0) or 0)
         _INTRO_END_S = 35.0  # info panel inhibited during intro; first fire at cave entry
         _MESH_ALL_SHOW_S   = 64.0   # fixed-time trigger: show mesh_all subtitle at ~1 min 04
         _MESH_ALL_SHOW_DUR = 5.0    # seconds
-        # Seed _last_fired_mode from the first frame's mode so we don't
-        # re-trigger for the same mode that a previous chunk already showed.
-        # _seen_modes: tracks every mode ever shown so we only fire once per mode.
-        if _frame_offset > 0 and track:
-            _last_fired_mode = (
-                (track[0].get("ui_state") or {}).get("view_mode") or ""
-            )
-            _last_lames_vis = bool(
-                (track[0].get("ui_state") or {}).get("lames_visible", False)
-            )
-            # Do NOT pre-seed _seen_modes with all modes in this chunk.
-            # Pre-seeding used to assume "the orchestrator already showed them",
-            # but the orchestrator only runs build_track() — it never renders
-            # frames.  Pre-seeding caused parallel workers (frame_offset > 0)
-            # to permanently suppress the info panel for every mode, so e.g.
-            # the first transition to mesh_bridges or arrows_tracks was silently
-            # skipped.  Instead, each worker starts with an empty _seen_modes
-            # and fires the info panel for the first new-mode transition it
-            # encounters.  _last_fired_mode is still seeded from the first
-            # frame so a mode continuing unchanged from a previous chunk does
-            # not re-trigger at the chunk boundary.
-            _seen_modes: set = set()
-        else:
-            _last_fired_mode = ""
-            _last_lames_vis  = False
-            _seen_modes = set()
-        for _vi, _vs in enumerate(track):
+        # Allocate for the FULL track length; we'll slice to the worker window below.
+        _nf = len(full_track)
+        _iv_full  = np.zeros(_nf, dtype=bool)
+        _il_full  = np.zeros(_nf, dtype=bool)
+        _ima_full = np.zeros(_nf, dtype=bool)
+        # Always start from a clean state — we're scanning the global track
+        # from frame 0 so there is no "earlier chunk" to inherit state from.
+        _last_fired_mode: str = ""
+        _last_lames_vis:  bool = False
+        _seen_modes: set = set()
+        for _vi, _vs in enumerate(full_track):
             _ui_vi   = (_vs.get("ui_state") or {})
             _mode_vi = (_ui_vi.get("view_mode") or "")
             _lames_vi = bool(_ui_vi.get("lames_visible", False))
-            _abs_t = (_frame_offset + _vi) / _fps_int
+            _abs_t = _vi / _fps_int   # global time — no chunk offset needed
             if _abs_t < _INTRO_END_S:
                 # Still in intro: advance the lames debounce state but do NOT
                 # seed _last_fired_mode or _seen_modes — this ensures the first
-                # mode seen after the intro (e.g. mesh_bridges at ~1:20) still
-                # triggers the info panel even if it was already active during
-                # the intro sequence.
+                # mode seen after the intro still triggers the info panel even
+                # if the same mode was already active during the intro sequence.
                 _last_lames_vis = _lames_vi
                 continue
             if _mode_vi and _mode_vi != _last_fired_mode:
                 if _mode_vi not in _seen_modes:
                     # First time this mode is shown — display the info panel.
-                    _end_vi = min(len(track), _vi + 6 * _fps_int)
-                    _info_visible_frames[_vi:_end_vi] = True
+                    _end_vi = min(_nf, _vi + 6 * _fps_int)
+                    _iv_full[_vi:_end_vi] = True
                     _seen_modes.add(_mode_vi)
                 _last_fired_mode = _mode_vi
             # lames_visible rising edge → show "Water flux simulation" for 3 s,
@@ -5565,20 +5551,18 @@ def main(argv: list[str] | None = None) -> int:
                 _LAMES_MAX_WAIT      = round(_fps_int * 8.0)  # give up after 8 s
                 _stable_start = _vi   # fallback: trigger frame
                 _consec = 0
-                for _svi in range(_vi, min(len(track), _vi + _LAMES_MAX_WAIT)):
+                for _svi in range(_vi, min(_nf, _vi + _LAMES_MAX_WAIT)):
                     if _svi > 0:
-                        if vr_travel_dirs is not None:
-                            _td_p = np.asarray(vr_travel_dirs[_svi - 1], dtype=float)
-                            _td_c = np.asarray(vr_travel_dirs[_svi],     dtype=float)
-                        else:
-                            _cp = track[_svi - 1]["camera"]
-                            _cc = track[_svi]["camera"]
-                            _td_p = (np.asarray(_cp["focal_point"], dtype=float)
-                                     - np.asarray(_cp["position"],    dtype=float))
-                            _td_c = (np.asarray(_cc["focal_point"], dtype=float)
-                                     - np.asarray(_cc["position"],    dtype=float))
-                            _td_p /= (np.linalg.norm(_td_p) + 1e-9)
-                            _td_c /= (np.linalg.norm(_td_c) + 1e-9)
+                        # Use raw camera positions (no vr_travel_dirs needed —
+                        # we're on the full track with global indices).
+                        _cp = full_track[_svi - 1]["camera"]
+                        _cc = full_track[_svi]["camera"]
+                        _td_p = (np.asarray(_cp["focal_point"], dtype=float)
+                                 - np.asarray(_cp["position"],    dtype=float))
+                        _td_c = (np.asarray(_cc["focal_point"], dtype=float)
+                                 - np.asarray(_cc["position"],    dtype=float))
+                        _td_p /= (np.linalg.norm(_td_p) + 1e-9)
+                        _td_c /= (np.linalg.norm(_td_c) + 1e-9)
                         _cos_a = float(np.clip(np.dot(_td_p, _td_c), -1.0, 1.0))
                         _ang_f = math.degrees(math.acos(_cos_a))
                     else:
@@ -5590,14 +5574,19 @@ def main(argv: list[str] | None = None) -> int:
                             break
                     else:
                         _consec = 0
-                _end_lv = min(len(track), _stable_start + 3 * _fps_int)
-                _info_visible_frames[_stable_start:_end_lv] = True
-                _info_lames_frames[_stable_start:_end_lv]   = True
+                _end_lv = min(_nf, _stable_start + 3 * _fps_int)
+                _iv_full[_stable_start:_end_lv] = True
+                _il_full[_stable_start:_end_lv] = True
             # Fixed-time trigger: mesh_all subtitle at ~1 min 07.
             if _MESH_ALL_SHOW_S <= _abs_t < _MESH_ALL_SHOW_S + _MESH_ALL_SHOW_DUR:
-                _info_visible_frames[_vi]  = True
-                _info_mesh_all_frames[_vi] = True
+                _iv_full[_vi]  = True
+                _ima_full[_vi] = True
             _last_lames_vis = _lames_vi
+        # Slice the global schedule to this worker's frame window.
+        _cs = args._chunk_start if args._chunk_start is not None else 0
+        _info_visible_frames  = _iv_full [_cs : _cs + len(track)]
+        _info_lames_frames    = _il_full [_cs : _cs + len(track)]
+        _info_mesh_all_frames = _ima_full[_cs : _cs + len(track)]
 
     # ── Outro billboard + fade-to-black pre-computation ──────────────────────
     # Finds the first frame in the last 20 s where the camera is (nearly)

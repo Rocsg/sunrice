@@ -1978,15 +1978,19 @@ class _UiReplayBundle:
             logger.debug("view_mode swap failed: %s", exc)
 
     # --- per-frame bin culling for arrow_tracks ----------------------------
-    def update_tracks_bins(self, cam_pos: "np.ndarray") -> None:
+    def update_tracks_bins(self, cam_pos: "np.ndarray", *, force: bool = False) -> None:
         """Show/hide track bin actors based on camera position (mirrors viewer).
 
         Bins within ±BIN_FULL of the camera bin are shown at full opacity;
         bins between BIN_FULL and BIN_FADE fade linearly; beyond BIN_FADE
         are hidden.  No-op when view_mode != arrows_tracks.
+
+        Pass ``force=True`` to bypass the view_mode guard — used by the
+        crossfade renderer to populate track bins for the "to" render frame
+        without permanently changing ``_last["view_mode"]``.
         """
         if (not self.tracks_bin_actors
-                or self._last.get("view_mode") != "arrows_tracks"):
+                or (not force and self._last.get("view_mode") != "arrows_tracks")):
             return
         if self.tracks_axis_info is None:
             # Fallback mode: no bin culling, keep all tracks visible.
@@ -5808,6 +5812,27 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as _o_bld_exc:
             logger.warning("Failed to build outro billboard: %s", _o_bld_exc)
 
+    # ── GPU warmup: force VTK to upload track geometry before the loop ────────
+    # On the first frame where a large mesh becomes visible VTK uploads its
+    # OpenGL buffers, causing a 1-frame stall.  Pre-warming eliminates that
+    # hitch so the first tracks frame in the crossfade renders without delay.
+    if tracks_bin_actors:
+        try:
+            _warmup_cam = np.asarray(track[0]["camera"]["position"], dtype=float)
+            _wm_saved = ui_bundle._last.get("view_mode")
+            ui_bundle._last["view_mode"] = "arrows_tracks"
+            ui_bundle.update_tracks_bins(_warmup_cam, force=True)
+            plt.render()                               # triggers GPU upload
+            for _ta in tracks_bin_actors:              # re-hide everything
+                try:
+                    getattr(_ta, "actor", _ta).SetVisibility(0)
+                except Exception:  # noqa: BLE001
+                    pass
+            ui_bundle._last["view_mode"] = _wm_saved
+            print("      [warmup] track bin actors pre-uploaded to GPU.")
+        except Exception as _wm_exc:  # noqa: BLE001
+            logger.debug("Tracks GPU warmup failed: %s", _wm_exc)
+
     for i, state in enumerate(track):
         _apply_actor_state(actor, state["actor"])
         # Per-frame UI-state replay (visibility swap, pillars, fog/SSAO).
@@ -5997,8 +6022,16 @@ def main(argv: list[str] | None = None) -> int:
                 info_billboard.set_visible(_panel_vis)
                 if _panel_vis:
                     _ipos = np.asarray(state["camera"]["position"], dtype=float)
+                    # arrows_tracks intro panel: move 30 % farther so it appears 30 % smaller.
+                    _tracks_intro = (_is_tracks and not _is_lames
+                                     and _abs_t_i >= _INTRO_TEXT_DURATION)
+                    if _tracks_intro:
+                        _saved_fwd = info_billboard._forward_metres
+                        info_billboard._forward_metres = _pfm * 1.3
                     info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text,
                                          show_cmap=_show_cmap_flag, subtitle_color=_sub_color)
+                    if _tracks_intro:
+                        info_billboard._forward_metres = _saved_fwd
             elif info_overlay is not None:
                 info_overlay.set_visible(_panel_vis)
                 if _panel_vis:
@@ -6058,6 +6091,15 @@ def main(argv: list[str] | None = None) -> int:
                 plt.screenshot(str(left_eye_from_png))
                 # Render to-mode.
                 ui_bundle._set_view_mode(_cf_to_fl)
+                # arrows_tracks: _set_view_mode defers bin visibility to
+                # update_tracks_bins(), but that already ran before the
+                # crossfade and was wiped by the from-mode render above.
+                # Force a bin update so the "to" frame actually shows tracks.
+                if _cf_to_fl == "arrows_tracks":
+                    ui_bundle.update_tracks_bins(
+                        np.asarray(state["camera"]["position"], dtype=float),
+                        force=True,
+                    )
                 _apply_flat_cam()
                 plt.render()
                 plt.screenshot(str(left_eye_png))
@@ -6117,6 +6159,12 @@ def main(argv: list[str] | None = None) -> int:
                 _render_eye(right_state, right_eye_from_png)
                 # Restore to-mode.
                 ui_bundle._set_view_mode(_cf_to)
+                # Same fix as flat path: re-populate bins for arrows_tracks.
+                if _cf_to == "arrows_tracks":
+                    ui_bundle.update_tracks_bins(
+                        np.asarray(state["camera"]["position"], dtype=float),
+                        force=True,
+                    )
 
             # Left eye — render & write to disk (same code path as mono).
             _render_eye(left_state,  left_eye_png)

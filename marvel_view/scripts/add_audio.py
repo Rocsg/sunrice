@@ -43,7 +43,12 @@ def _find_ffmpeg() -> str:
 
 
 def _inject_vr360_metadata(mp4_path: Path) -> bool:
-    """Inject Google Spatial-Media vr360 XMP metadata in-place."""
+    """Inject Google Spatial-Media VR360 metadata in-place.
+
+    Injects both:
+    - legacy Google spherical UUID XML (v1) — for YouTube, Meta Quest TV
+    - modern MP4 sv3d + st3d boxes (v2) — for VeoVR and other modern players
+    """
     try:
         from spatialmedia import metadata_utils  # type: ignore
     except ImportError:
@@ -55,10 +60,17 @@ def _inject_vr360_metadata(mp4_path: Path) -> bool:
 
     tagged_path = mp4_path.with_suffix(".tagged.mp4")
 
-    metadata = metadata_utils.Metadata()
-    metadata.stereo_mode = "left-right"
-    metadata.projection = metadata_utils.generate_spherical_xml(
-        stereo="left-right",
+    stereo_mode = "left-right"
+
+    # projection + stereo_mode → modern sv3d + st3d MP4 boxes (v2)
+    metadata = metadata_utils.Metadata(
+        projection="equirectangular",
+        stereo_mode=stereo_mode,
+    )
+    # video → legacy spherical UUID XML box (v1)
+    metadata.video = metadata_utils.generate_spherical_xml(
+        projection="equirectangular",
+        stereo=stereo_mode,
     )
 
     try:
@@ -118,7 +130,7 @@ def main(argv: list[str] | None = None) -> None:
     input_path = Path(args.input_video).resolve()
     audio_path = Path(args.audio_file).resolve()
 
-    if not input_path.exists():
+    if not input_path.exists(): 
         sys.exit(f"Input video not found: {input_path}")
     if not audio_path.exists():
         sys.exit(f"Audio file not found: {audio_path}")

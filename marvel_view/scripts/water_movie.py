@@ -6018,24 +6018,49 @@ def main(argv: list[str] | None = None) -> int:
                 _sub_color = (164, 168, 174)           # scalebar panel gray
             else:
                 _sub_color = (255, 255, 255)           # white
+            # arrows_tracks intro panel is shown at 70 % of normal size.
+            # VR: scale the angular half-tangents; flat: scale the screen fractions.
+            # The _place_plane() formula is half_x = d * _tan_x, so d is irrelevant
+            # to apparent size — only _tan_x / _tan_y control angular size.
+            _tracks_intro = (_is_tracks and not _is_lames
+                             and _abs_t_i >= _INTRO_TEXT_DURATION)
             if info_billboard is not None:
                 info_billboard.set_visible(_panel_vis)
                 if _panel_vis:
                     _ipos = np.asarray(state["camera"]["position"], dtype=float)
-                    # arrows_tracks intro panel: move 30 % farther so it appears 30 % smaller.
-                    _tracks_intro = (_is_tracks and not _is_lames
-                                     and _abs_t_i >= _INTRO_TEXT_DURATION)
                     if _tracks_intro:
-                        _saved_fwd = info_billboard._forward_metres
-                        info_billboard._forward_metres = _pfm * 1.3
+                        _sv_tx = info_billboard._tan_x
+                        _sv_ty = info_billboard._tan_y
+                        info_billboard._tan_x = _sv_tx * 0.7
+                        info_billboard._tan_y = _sv_ty * 0.7
                     info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text,
                                          show_cmap=_show_cmap_flag, subtitle_color=_sub_color)
                     if _tracks_intro:
-                        info_billboard._forward_metres = _saved_fwd
+                        info_billboard._tan_x = _sv_tx
+                        info_billboard._tan_y = _sv_ty
             elif info_overlay is not None:
                 info_overlay.set_visible(_panel_vis)
                 if _panel_vis:
+                    if _tracks_intro:
+                        _sv_wf  = info_overlay._width_frac
+                        _sv_hf  = info_overlay._height_frac
+                        _sv_hft = info_overlay._height_frac_text
+                        info_overlay._width_frac        = _sv_wf  * 0.7
+                        info_overlay._height_frac       = _sv_hf  * 0.7
+                        info_overlay._height_frac_text  = _sv_hft * 0.7
+                        try:
+                            info_overlay._reposition(info_overlay._renwin_ref)
+                        except Exception:  # noqa: BLE001
+                            pass
                     info_overlay.update(_sub_text, show_cmap=_show_cmap_flag, subtitle_color=_sub_color)
+                    if _tracks_intro:
+                        info_overlay._width_frac        = _sv_wf
+                        info_overlay._height_frac       = _sv_hf
+                        info_overlay._height_frac_text  = _sv_hft
+                        try:
+                            info_overlay._reposition(info_overlay._renwin_ref)
+                        except Exception:  # noqa: BLE001
+                            pass
 
         # ── Animated panels: sponsors cycle + entrance blink ─────────────
         if _sp_actors:

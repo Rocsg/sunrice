@@ -6030,14 +6030,18 @@ def main(argv: list[str] | None = None) -> int:
                     _ipos = np.asarray(state["camera"]["position"], dtype=float)
                     if _tracks_intro:
                         _sv_tx = info_billboard._tan_x
-                        _sv_ty = info_billboard._tan_y
-                        info_billboard._tan_x = _sv_tx * 0.7
-                        info_billboard._tan_y = _sv_ty * 0.7
+                        info_billboard._tan_x *= 0.7
+                        info_billboard._tan_y *= 0.7
                     info_billboard.update(_ipos, vr_travel_dirs[i], vr_world_up, _sub_text,
                                          show_cmap=_show_cmap_flag, subtitle_color=_sub_color)
                     if _tracks_intro:
+                        # Restore _tan_x to its original value.
+                        # Recompute _tan_y from unscaled _tan_x + the current actual
+                        # tile height (update_image may have changed it if show_cmap
+                        # toggled this frame).
                         info_billboard._tan_x = _sv_tx
-                        info_billboard._tan_y = _sv_ty
+                        _cur_h = info_billboard._importer.GetDataExtent()[3] + 1
+                        info_billboard._tan_y = _sv_tx * _cur_h / max(1, info_billboard.panel_w)
             elif info_overlay is not None:
                 info_overlay.set_visible(_panel_vis)
                 if _panel_vis:

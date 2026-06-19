@@ -1412,10 +1412,14 @@ class InfoPanelOverlay:
         width_frac: float = 0.38,
         height_frac: float = 0.064,
         subtitle_font_scale: float = 1.0,
+        anchor: str = "top",
+        vert_margin: float = 0.008,
     ) -> None:
         self._title       = title
         self._subtitle    = initial_subtitle
         self._speed_text  = ""
+        self._anchor      = anchor        # "top" or "bottom"
+        self._vert_margin = vert_margin   # normalized gap from the anchored edge
         self._width_frac  = width_frac
         self._height_frac_text = height_frac   # text-only portion
         self._height_frac = height_frac        # total (text + cmap); updated by set_cmap_img
@@ -1506,7 +1510,10 @@ class InfoPanelOverlay:
         win_w, win_h = self._renwin_ref.GetSize()
         if win_w > 0 and win_h > 0:
             nx = 0.5 - self.panel_w / (2.0 * win_w)
-            ny = 1.0 - actual_h / float(win_h) - 0.008
+            if self._anchor == "bottom":
+                ny = self._vert_margin
+            else:  # "top"
+                ny = 1.0 - actual_h / float(win_h) - self._vert_margin
             self.image_actor.GetPositionCoordinate().SetValue(nx, ny)
 
     # ------------------------------------------------------------------

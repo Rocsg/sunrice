@@ -2719,6 +2719,7 @@ def _build_scalebar_actor(
     *,
     center_offset: tuple[float, float, float] = (1.0, 0.0, 3.0),
     panel_width_voxels: float = 100.0,
+    vr_mode: str = "off",
 ) -> "vtk.vtkActor | None":
     """Build a static vertical scale-bar actor placed to the left of the sponsors panel.
 
@@ -2779,7 +2780,14 @@ def _build_scalebar_actor(
     half_h_vox = bar_length_vox / 2.0
     tile_w, tile_h = 220, 220
     # ── Scalebar appearance — edit here to retoucher ────────────────────
-    SCALEBAR_BG_COLOR = (164, 168, 174)   # gray background (R, G, B) — 0=black, 255=white
+    # Flat mode: panel has LightingOff() so its texture color is rendered as-is,
+    # while the mesh cortex is dimmed by the single automatic headlight to
+    # ~146,150,155.  VR uses a 3-light world-space rig that brightens the mesh
+    # to ~162-165, closer to the original 164,168,174 value.
+    if vr_mode != "off":
+        SCALEBAR_BG_COLOR = (164, 168, 174)   # VR: strong rig → mesh appears bright
+    else:
+        SCALEBAR_BG_COLOR = (146, 150, 155)   # flat: matches mesh cortex under headlight
     # ───────────────────────────────────────────────────────────────────
     tile = _render_scalebar_tile(label_left, " ",
                                   w=tile_w, h=tile_h, font_size=24,
@@ -5310,8 +5318,10 @@ def main(argv: list[str] | None = None) -> int:
                 plt, "", _init_sub,         # title="" → subtitle-only display
                 opacity=0.72,
                 width_frac=0.38 * 1.05 * 1.2 * 1.15 * 0.9,     # ×1.2 intro fit, ×1.15 mode text, ×0.9 size
-                height_frac=0.064 * 1.2 * 0.9,   # ×1.2 taller for intro, ×0.9 size
+                height_frac=0.064 * 1.2,          # ×1.2 taller for intro (×0.9 removed → subtitle no longer clips)
                 subtitle_font_scale=1.61 * 0.8,   # ×0.8 font (intro text was overflowing)
+                anchor="bottom",
+                vert_margin=0.025,                # 2.5 % gap from bottom edge
             )
             print("      info overlay attached")
     except Exception as exc:  # noqa: BLE001
@@ -5488,7 +5498,8 @@ def main(argv: list[str] | None = None) -> int:
     # placed on the opposite side of the root from the sponsors billboard.
     _sb_actor = None
     try:
-        _sb_actor = _build_scalebar_actor(mesh, meters_per_voxel=args.meters_per_voxel)
+        _sb_actor = _build_scalebar_actor(mesh, meters_per_voxel=args.meters_per_voxel,
+                                               vr_mode=vr_mode)
         if _sb_actor is not None:
             _main_ren_sb = (
                 plt.renderers[0]
@@ -5774,9 +5785,19 @@ def main(argv: list[str] | None = None) -> int:
                         _o_fn  = float(np.linalg.norm(_o_fwd))
                         _o_fwd = (_o_fwd / _o_fn
                                   if _o_fn > 1e-9 else np.array([0.0, 0.0, -1.0]))
-                    _o_wup = (np.asarray(vr_world_up, dtype=float)
-                              if vr_world_up is not None
-                              else np.array([0.0, 1.0, 0.0]))
+                    # VR: use the locked world-up from the first keyframe.
+                    # Flat: use the camera's own view_up at the outro frame so
+                    # the panel aligns with the camera roll — otherwise the
+                    # hardcoded [0,1,0] produces a visible rotation artefact
+                    # when the spline's end tangent carries any roll component.
+                    if vr_world_up is not None:
+                        _o_wup = np.asarray(vr_world_up, dtype=float)
+                    else:
+                        _o_wup = np.asarray(
+                            _o_cam.get("view_up", [0.0, 1.0, 0.0]), dtype=float)
+                    _o_wup_n = float(np.linalg.norm(_o_wup))
+                    _o_wup = (_o_wup / _o_wup_n
+                              if _o_wup_n > 1e-9 else np.array([0.0, 1.0, 0.0]))
                     # Panel right/up: face toward viewer
                     _o_right = np.cross(_o_fwd, _o_wup)
                     _o_rn    = float(np.linalg.norm(_o_right))
@@ -5790,9 +5811,12 @@ def main(argv: list[str] | None = None) -> int:
                     _o_tilt  = math.radians(20.0)
                     _o_up_t  = math.cos(_o_tilt) * _o_up + math.sin(_o_tilt) * _o_fwd
                     _o_up_t  /= (np.linalg.norm(_o_up_t) + 1e-9)
-                    # 3 m half-width → ~60° apparent FOV at 10 m distance
+                    # VR: 3 m half-width tuned for headset immersion.
+                    # Flat: reduce by 40 % (×0.6) — same physical size appears
+                    # much larger on a 2-D flat screen.
+                    _o_size_scale = 1.0 if vr_mode != "off" else 0.6
                     _o_fwd_vox = 10.0 / _o_mpv
-                    _o_half_w  = 3.0  / _o_mpv
+                    _o_half_w  = 3.0 * _o_size_scale / _o_mpv
                     _o_half_h  = _o_half_w * (_o_ih / max(_o_iw, 1))
                     _o_center  = _o_pos + _o_fwd_vox * _o_fwd
                     _outro_actor = _make_image_panel_actor(

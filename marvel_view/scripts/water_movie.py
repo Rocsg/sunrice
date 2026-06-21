@@ -108,13 +108,13 @@ EASE_SEGMENTS = 2     # number of trailing segments over which to ease-out
 EASE_STRENGTH = 3.0   # power of the ease-out curve on the very last segment
 
 # ── VR / stereo equirectangular defaults ────────────────────────────────────
-# Side-by-side stereo equirectangular ("VR180" / "VR360") output.
+# Top-bottom stereo equirectangular ("VR180" / "VR360") output.
 # When ``--vr vr180`` (resp. ``vr360``) is selected, the canvas dimensions
 # below override ``--width`` / ``--height`` unless the user passes them
-# explicitly.  Per-eye image is (width/2, height); the two halves are
-# concatenated horizontally (left|right) into the final frame.
-VR180_SBS_W, VR180_SBS_H = 4096, 2048    # 2048×2048 per eye (1:1 angle 180°)
-VR360_SBS_W, VR360_SBS_H = 8192, 2048    # 4096×2048 per eye (2:1 angle 360°)
+# explicitly.  Per-eye image is (width, height/2); the two halves are
+# concatenated vertically (top=left eye / bottom=right eye) into the final frame.
+VR180_TB_W, VR180_TB_H = 2048, 4096    # 2048×2048 per eye (1:1 angle 180°)
+VR360_TB_W, VR360_TB_H = 4096, 4096    # 4096×2048 per eye (2:1 angle 360°)
 VR_IPD_FRAC = 0.05                       # half-IPD = 2.5 % of cam→focal dist
 VR_CUBE_RESOLUTION = 2048                # internal cube-face size (px) – 2048
                                          # gives noticeably sharper output
@@ -243,7 +243,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # ── stereo VR ─────────────────────────────────────────────────────────
     p.add_argument("--vr", action="store_true",
-                   help="Render as stereo equirectangular side-by-side (SBS) "
+                   help="Render as stereo equirectangular top-bottom (TB) "
                         "for VR headsets (full 360° sphere).  Each frame "
                         "renders twice (left + right eye) and roughly 6× "
                         "slower than mono per eye (panoramic cubemap "
@@ -319,7 +319,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "combine with --stresstest for a ~4-second clip.")
     p.add_argument("--high", action="store_true",
                    help="High-quality render mode.  Sets flat resolution to "
-                        "3840×2160 (4K), VR cube-face to 4096 px (keep SBS "
+                        "3840×2160 (4K), VR cube-face to 4096 px (keep TB "
                         "canvas at default), CRF 16 and preset veryslow "
                         "(unless those are already specified).")
 
@@ -357,7 +357,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "take precedence.")
     p.add_argument("--compromise", action="store_true",
                    help="VR compromise mode for 90 fps playback on Meta Quest. "
-                        "Reduces the SBS canvas from 8192\u00d72048 to 6144\u00d71536 "
+                        "Reduces the TB canvas from 4096\u00d74096 to 3072\u00d73072 "
                         "(3072\u00d71536 per eye, 75%% of normal pixels) to ease "
                         "decoder load, and bumps the cube-face from 2048 to "
                         "3072 px for sharper distant detail.  CRF 16.  "
@@ -367,14 +367,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--compromise-better", action="store_true",
                    help="VR compromise-better mode: slightly larger canvas than "
                         "--compromise but still below normal.  "
-                        "Sets SBS canvas to 7168\u00d71792 (3584\u00d71792 per eye, "
+                        "Sets TB canvas to 3584\u00d73584 (3584\u00d71792 per eye, "
                         "~87%% of normal pixels), cube-face to 3584 px, CRF 14.  "
                         "A good middle ground when --compromise is too soft but "
                         "--normal is too heavy for the Quest decoder.")
     p.add_argument("--compatible-high", action="store_true",
                    help="VR-only quality mode: uses the --high cube-face resolution "
                         "(4096 px) for sharper intermediate rendering, but keeps the "
-                        "normal SBS canvas unchanged so the output file is fully "
+                        "normal TB canvas unchanged so the output file is fully "
                         "compatible with any headset.  Encodes at CRF 20, preset "
                         "medium, and defaults to 60 fps.  Does not affect flat mode.  "
                         "Explicit --crf / --preset / --fps still take precedence.")
@@ -3812,14 +3812,14 @@ def _run_parallel(
 
     # ── VR spatial-media metadata ─────────────────────────────────────────
     if vr_mode != "off":
-        print(f"[5/5] Tagging spatial-media metadata ({vr_mode}, SBS) \u2026")
+        print(f"[5/5] Tagging spatial-media metadata ({vr_mode}, TB) \u2026")
         tagged_ok = _tag_spatial_media(out_path, vr_mode)
         if tagged_ok:
             print("      MP4 is now flagged as stereoscopic equirectangular "
-                  "(left/right).  Ready for YouTube VR & Meta Quest.")
+                  "(top/bottom).  Ready for YouTube VR & Meta Quest.")
         else:
             print("      Could not inject metadata \u2013 the MP4 is still a "
-                  "regular SBS file but won't auto-detect as VR.")
+                  "regular TB file but won't auto-detect as VR.")
 
     _analyse_output_mp4(out_path, total_frames=total_frames,
                         fps=args.fps, vr_mode=vr_mode)
@@ -3892,7 +3892,7 @@ def main(argv: list[str] | None = None) -> int:
     vr_user_set_size = any(f in (argv or sys.argv[1:])
                            for f in ("--width", "--height"))
     if vr_mode != "off" and not vr_user_set_size:
-        args.width, args.height = VR360_SBS_W, VR360_SBS_H
+        args.width, args.height = VR360_TB_W, VR360_TB_H
 
     # ── Fast preview mode (--fast) ─────────────────────────────────────────
     # Downgrades resolution and codec settings for quick iteration.
@@ -3900,7 +3900,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.fast:
         if not vr_user_set_size:
             if vr_mode == "vr360":
-                args.width, args.height = 2048, 512
+                args.width, args.height = 1024, 1024
                 args.vr_cube_resolution = 1024
             else:  # flat
                 args.width, args.height = 960, 540
@@ -3915,7 +3915,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.high:
         if not vr_user_set_size:
             if vr_mode != "off":
-                # SBS canvas stays at default (8192×2048 / 4096×2048);
+                # TB canvas stays at default (4096×4096);
                 # cube-face resolution is the key quality lever for VR.
                 args.vr_cube_resolution = 4096
             else:  # flat → 4K
@@ -3939,7 +3939,7 @@ def main(argv: list[str] | None = None) -> int:
             args.preset = "veryslow"
 
     # ── Compromise mode (--compromise) ──────────────────────────────────
-    # Reduced SBS canvas for 90 fps on Meta Quest: 75 % of normal pixels.
+    # Reduced TB canvas for 90 fps on Meta Quest: 75 % of normal pixels.
     # Cube-face bumped to 3072 px (between normal 2048 and high 4096) to
     # recover sharpness on distant objects without affecting decode load.
     # For an even sharper result at the cost of render time, override with
@@ -3948,7 +3948,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.compromise:
         if not vr_user_set_size:
             if vr_mode != "off":
-                args.width, args.height = 6144, 1536   # 3072×1536 per eye
+                args.width, args.height = 3072, 3072   # 3072×1536 per eye
         # Bump cube-face from default 2048 to 3072 unless the user explicitly
         # chose a different value with --vr-cube-resolution.
         if args.vr_cube_resolution == VR_CUBE_RESOLUTION:
@@ -3962,19 +3962,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.compromise_better:
         if not vr_user_set_size:
             if vr_mode != "off":
-                args.width, args.height = 7168, 1792   # 3584×1792 per eye
+                args.width, args.height = 3584, 3584   # 3584×1792 per eye
         if args.vr_cube_resolution == VR_CUBE_RESOLUTION:
             args.vr_cube_resolution = 3584
         if args.crf is None:
             args.crf = 14
 
     # ── Compatible-high mode (--compatible-high) ────────────────────────────
-    # VR only: high cube-face resolution, normal SBS canvas, CRF 20, medium preset, 60 fps.
+    # VR only: high cube-face resolution, normal TB canvas, CRF 20, medium preset, 60 fps.
     if args.compatible_high:
         if vr_mode != "off":
             if args.vr_cube_resolution == VR_CUBE_RESOLUTION:
                 args.vr_cube_resolution = 4096
-            # SBS canvas intentionally NOT changed → normal output geometry.
+            # TB canvas intentionally NOT changed → normal output geometry.
         if args.crf is None:
             args.crf = 20
         if args.preset is None:
@@ -3987,11 +3987,11 @@ def main(argv: list[str] | None = None) -> int:
         args.fps = FPS
 
     if vr_mode != "off":
-        if args.width % 2 != 0:
-            logger.error("SBS canvas width must be even; got %d.", args.width)
+        if args.height % 2 != 0:
+            logger.error("TB canvas height must be even; got %d.", args.height)
             return 2
-        eye_w = args.width // 2
-        eye_h = args.height
+        eye_w = args.width
+        eye_h = args.height // 2
     else:
         eye_w, eye_h = args.width, args.height
 
@@ -4048,7 +4048,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.preview:
         print(f"  Output MP4       : {out_path}")
     print(f"  Resolution       : {args.width}×{args.height}"
-          + (f"  (SBS, per eye {eye_w}×{eye_h})" if vr_mode != "off" else ""))
+          + (f"  (TB, per eye {eye_w}×{eye_h})" if vr_mode != "off" else ""))
     print(f"  Frame rate       : {args.fps} fps")
     print(f"  Sec / segment    : {args.seconds_per_segment}  "
           f"({frames_per_segment} frames)")
@@ -4058,7 +4058,7 @@ def main(argv: list[str] | None = None) -> int:
           f"strength {args.ease_strength}")
     if vr_mode != "off":
         print(f"  Stereo VR        : {vr_mode}  "
-              f"(equirectangular {vr_angle:.0f}°, parallel SBS)")
+              f"(equirectangular {vr_angle:.0f}°, parallel TB)")
         if args.meters_per_voxel > 0.0:
             _ipd_vox_preview = args.ipd_metres / args.meters_per_voxel
             print(f"  IPD (physical)   : {args.ipd_metres * 1000:.1f} mm / "
@@ -6249,14 +6249,14 @@ def main(argv: list[str] | None = None) -> int:
                     0, 255,
                 ).astype(np.uint8)
 
-            # Stitch side-by-side (left | right).
+            # Stitch top-bottom (top=left eye, bottom=right eye).
             if left_img.shape != right_img.shape:
                 h = min(left_img.shape[0], right_img.shape[0])
                 w = min(left_img.shape[1], right_img.shape[1])
                 left_img  = left_img[:h, :w]
                 right_img = right_img[:h, :w]
-            sbs = np.concatenate([left_img, right_img], axis=1)
-            imageio.imwrite(str(frames_dir / f"frame_{i + args._frame_offset:05d}.png"), sbs)
+            tb = np.concatenate([left_img, right_img], axis=0)
+            imageio.imwrite(str(frames_dir / f"frame_{i + args._frame_offset:05d}.png"), tb)
 
         # ── Outro fade-to-black ─────────────────────────────────────────────────────────
         if _outro_fade_alpha[i] > 0.0:
@@ -6281,7 +6281,7 @@ def main(argv: list[str] | None = None) -> int:
     # Clean up the per-eye scratch PNGs.
     # Always removed unless --debug-eye-frames is explicitly set:
     # when --keep-frames is active we want only the final stitched
-    # frame_XXXXX.png files (full SBS resolution) in the frames dir.
+    # frame_XXXXX.png files (full TB resolution) in the frames dir.
     _keep_eye = getattr(args, "debug_eye_frames", False)
     for p in (left_eye_png, right_eye_png, left_eye_from_png, right_eye_from_png):
         if p.exists() and not _keep_eye:
@@ -6397,14 +6397,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── 5. Spatial-media metadata injection (VR only) ─────────────────────
     if vr_mode != "off":
-        print(f"[5/5] Tagging spatial-media metadata ({vr_mode}, SBS) …")
+        print(f"[5/5] Tagging spatial-media metadata ({vr_mode}, TB) …")
         tagged_ok = _tag_spatial_media(out_path, vr_mode)
         if tagged_ok:
             print("      MP4 is now flagged as stereoscopic equirectangular "
-                  "(left/right).  Ready for YouTube VR & Meta Quest.")
+                  "(top/bottom).  Ready for YouTube VR & Meta Quest.")
         else:
             print("      Could not inject metadata – the MP4 is still a "
-                  "regular SBS file but won't auto-detect as VR.")
+                  "regular TB file but won't auto-detect as VR.")
 
     # ── Final report: size + integrity sanity check ───────────────────────
     _analyse_output_mp4(out_path, total_frames=total_frames,
@@ -6537,12 +6537,12 @@ def _tag_spatial_media(mp4_path: Path, vr_mode: str) -> bool:
     Adds the ``Spherical Video V2`` atoms so YouTube, Meta Quest, DeoVR &
     co. auto-detect the file as a VR video.
 
-    * ``vr360`` → projection ``equirectangular``, stereo ``left-right``,
+    * ``vr360`` → projection ``equirectangular``, stereo ``top-bottom``,
       no crop (full sphere).
-    * ``vr180`` → projection ``equirectangular``, stereo ``left-right``,
+    * ``vr180`` → projection ``equirectangular``, stereo ``top-bottom``,
       with ``bounds`` cropping to the forward hemisphere
       (top=0, bottom=0, left=25 %, right=25 %).  This is the convention
-      used by VR180 SBS content packed into a 2:1 equirect canvas.
+      used by VR180 TB content.
     """
     try:
         from spatialmedia import metadata_utils
@@ -6555,9 +6555,9 @@ def _tag_spatial_media(mp4_path: Path, vr_mode: str) -> bool:
     tagged_path = mp4_path.with_suffix(".tagged.mp4")
 
     metadata = metadata_utils.Metadata()
-    metadata.stereo_mode = "left-right"
+    metadata.stereo_mode = "top-bottom"
     metadata.projection = metadata_utils.generate_spherical_xml(
-        stereo="left-right",
+        stereo="top-bottom",
     )
 
     try:
